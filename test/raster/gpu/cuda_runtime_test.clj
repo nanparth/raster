@@ -35,6 +35,11 @@
     (is (some? bind!) "CUDA must bind a modern ordered KernelCall")
     (when bind!
       (let [operations (atom []) next-address (atom 4096)
+            compile-count (atom 0)
+            compilation-identity {:nvrtc-version [13 2] :virtual-architecture "compute_86"
+                                  :include-paths ["/verified/include"] :virtual-header-version 2
+                                  :compiler-options ["--gpu-architecture=compute_86" "--std=c++17"
+                                                     "--fmad=false" "--include-path=/verified/include"]}
             fake (fn [op args]
                    (swap! operations conj [op args])
                    (case op
@@ -52,7 +57,10 @@
             free! (runtime-var "free-buffer!") register! (runtime-var "register-kernel!")]
         (with-bindings {driver-var fake}
           (with-redefs-fn {state-var (atom {}) registry-var (atom {})
-                          #'nvrtc/compile-artifact-ptx (fn [& _] {:ptx (byte-array [1 0])})}
+                          #'nvrtc/compile-artifact-ptx
+                          (fn [& _]
+                            (swap! compile-count inc)
+                            (assoc compilation-identity :ptx (byte-array [1 0])))}
             (fn []
               (let [input (make-buffer 24 :float)
                     output (make-buffer 17 :float)
@@ -63,6 +71,12 @@
                   (register! (:kernel-name a) a)
                   (let [prepared (bind! (call/make a args))]
                     (try
+                      (is (= compilation-identity (:compilation-identity prepared)))
+                      (let [reused (bind! (call/make a args))]
+                        (try
+                          (is (= compilation-identity (:compilation-identity reused)))
+                          (is (= 1 @compile-count) "the existing per-registration result is reused")
+                          (finally ((runtime-var "destroy-prepared!") reused))))
                       ((runtime-var "launch-registered-bound!") prepared)
                       (let [[_ [function geometry parameters]]
                             (first (filter #(= :launch (first %)) @operations))

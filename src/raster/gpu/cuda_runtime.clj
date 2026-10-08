@@ -340,7 +340,8 @@
              :graph-borrows graph-borrows
              :kernel-call kernel-call :binding-plan plan :kernel-name kernel-name
              :compilation-identity (select-keys compiled [:nvrtc-version :virtual-architecture
-                                                         :include-paths :virtual-header-version])
+                                                         :include-paths :virtual-header-version
+                                                         :compiler-options])
              ::context (:context @(:projection entry))}))
         adopt-cleanup!)))))
 

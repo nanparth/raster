@@ -20,6 +20,12 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"invalid NVRTC compilation request"
                           (nvrtc/compile-ptx "source" "kernel" architecture)))))
 
+(deftest compile-request-rejects-malformed-includes-before-library-access
+  (doseq [includes ["/include" [nil] [""] [23]]]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"invalid NVRTC compilation request"
+                          (nvrtc/compile-ptx "source" "kernel" "compute_80"
+                                             :include-paths includes)))))
+
 (deftest installed-nvrtc-compiles-cuda-preamble-without-a-device
   (if (nvrtc/available?)
     (let [{:keys [ptx nvrtc-version target virtual-header-version]}
@@ -46,3 +52,38 @@
                    nil
                    (catch clojure.lang.ExceptionInfo e e))]
     (is (= :nvrtc-artifact-target (:reason (ex-data error))))))
+
+(deftest executable-options-retain-scalar-rounding-and-complete-identity
+  (if (nvrtc/available?)
+    (let [expected ["--gpu-architecture=compute_80" "--std=c++17" "--fmad=false"]
+          raw (nvrtc/compile-ptx (:source smoke-artifact) "nvrtc_probe" "compute_80")
+          exact (nvrtc/compile-artifact-ptx
+                 (assoc-in smoke-artifact [:attributes :numerics]
+                           {:mode :exact :policy :same-scalar-evaluation-order}) "compute_80")
+          reassociated (nvrtc/compile-artifact-ptx
+                        (assoc-in smoke-artifact [:attributes :numerics]
+                                  {:mode :reassociated :policy :ordered-k-target-contraction
+                                   :rounding :nearest-even :accumulator-dtype :float
+                                   :result-transform {:kind :typed-scalar-region
+                                                      :policy :same-typed-ssa-evaluation-order
+                                                      :input-dtype :float :result-dtype :float}})
+                        "compute_80")
+          bounded (nvrtc/compile-artifact-ptx
+                   (assoc-in smoke-artifact [:attributes :numerics]
+                             {:mode :bounded-error :policy :matrix-approximation
+                              :rounding :nearest-even :accumulator-dtype :float
+                              :error-model {:kind :test-fixture}
+                              :result-transform {:kind :typed-scalar-region
+                                                 :policy :same-typed-ssa-evaluation-order
+                                                 :input-dtype :float :result-dtype :float}})
+                   "compute_80")]
+      (doseq [result [raw exact reassociated bounded]]
+        (is (= expected (:compiler-options result)))
+        (is (= [] (:include-paths result)))
+        (is (= nvrtc/virtual-header-version (:virtual-header-version result))))
+      (let [included (nvrtc/compile-artifact-ptx smoke-artifact "compute_80"
+                                               :include-paths ["/reference/include"])]
+        (is (= (conj expected "--include-path=/reference/include") (:compiler-options included)))
+        (is (not= (:compiler-options raw) (:compiler-options included)))))
+    (when (= "1" (System/getenv "RASTER_REQUIRE_NVRTC"))
+      (is false "NVRTC is required for executable option qualification"))))
