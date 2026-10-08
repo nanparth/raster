@@ -24,8 +24,28 @@
   (is (= :opencl-portable (gpu/kernel-body-c-dialect (atom {:device-id :ocl:0}))))
   (is (= :opencl-portable (gpu/kernel-body-c-dialect (atom {:device-id :ze:0})))))
 
+(deftest cuda-resident-admission-retains-explicit-device-memory
+  (is (= :cuda (backend/backend-type :cuda:0)))
+  (is (= {:namespace 'raster.gpu.cuda-runtime
+          :kernel-body-c-dialect :cuda
+          :memory-space :device
+          :coherence :explicit-transfer
+          :owned-slice? false}
+         (backend/descriptor :cuda:0)))
+  (is (= :cuda (gpu/kernel-body-c-dialect (atom {:device-id :cuda:0})))))
+
+(deftest cuda-admission-rejects-unselectable-session-ordinals
+  (doseq [device-id [:cuda:1 :cuda:17 :cuda-contracts]]
+    (let [error (try (backend/backend-type device-id)
+                     nil
+                     (catch clojure.lang.ExceptionInfo e e))]
+      (is (some? error))
+      (is (= :cuda-runtime-device-unsupported (:reason (ex-data error))))
+      (is (= device-id (:device-id (ex-data error))))
+      (is (= [:cuda:0] (:supported-devices (ex-data error)))))))
+
 (deftest compile-only-targets-do-not-promise-resident-execution
-  (doseq [device-id [:cuda:0 :hip:0]]
+  (doseq [device-id [:hip:0]]
     (testing (str device-id)
       (let [error (try (gpu/backend-type device-id)
                        nil

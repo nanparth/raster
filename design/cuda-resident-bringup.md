@@ -1,10 +1,18 @@
 # CUDA resident bring-up
 
 Raster already emits generated CUDA C++ from verified KernelBody and checks the resulting
-sm_80 PTX with `nvcc` in hardware-free CI. This is **source legality**, not CUDA execution:
-`raster.gpu.core/make-session` currently supports only Level Zero and OpenCL, and CUDA
-hardware detection is a stub. Keep compile-only target descriptors separate from resident
-runtime registration until the following acceptance gates pass.
+sm_80 PTX with `nvcc` in hardware-free CI. Source legality remains separate from execution.
+The initial CUDA Driver API adapter now admits `:cuda:0` through the shared resident backend
+registry, with explicit device memory and borrowed pointer views. Other CUDA ordinals and HIP
+remain unsupported resident routes. Discovery uses the read-only driver probe; creating a
+session rejects a conflicting already-selected CUDA ordinal rather than silently using it.
+
+The initial device tests exercise generated maps, ordered arguments, offset views, changed-input
+replay, events and the public Compiled/LinkPlan path. They do not establish full runtime parity:
+asynchronous range transfers, device copies and broader numerical routes remain subsequent
+gates. Capability queries report asynchronous transfer support as false, and unsupported
+operations raise explicit backend/operation errors rather than falling back or synchronizing.
+Native CUDA Graph capture is not implied by logical graph replay.
 
 ## First device gate
 
@@ -14,8 +22,9 @@ The path must be `deftm → typed SOAC → schedule → KernelBody → CUDA sour
 1. Probe the installed CUDA driver and enumerate a real device, recording device name,
    compute capability, driver version, toolkit/compiler version, and available memory.
    `raster.gpu.cuda-driver-probe/probe` now performs the read-only driver/name/capability
-   part and reports `:no-device` on this laptop; it does not create a session or promise
-   executable CUDA support. Memory and full capability facts remain for the resident adapter.
+   part without creating a context. Its status is a current observation, not a permanent
+   hardware claim. The resident adapter queries memory and launch limits. CUDA driver API
+   compatibility version is named separately from the installed NVIDIA driver build.
    On a CUDA host, run its test with `RASTER_REQUIRE_CUDA_DEVICE=1` so a missing device fails.
 2. Create a resident session; allocate input/output buffers; upload the input through the
    existing typed buffer contract. Compile the generated source, load its module, bind its
@@ -30,15 +39,17 @@ The path must be `deftm → typed SOAC → schedule → KernelBody → CUDA sour
 
 The initial adapter should use the CUDA Driver API for context, memory, module, launch and
 event operations. The hardware-free `raster.gpu.cuda-nvrtc` transport now compiles generated
-CUDA source to PTX in-process; the Driver API load/launch part is still missing. Loading
-PTX or cubin through the driver API will avoid an `nvcc` subprocess on every compilation. Keep
+CUDA source to PTX in-process; `cuda-driver` and `cuda-runtime` load and launch that PTX
+through the Driver API, without an `nvcc` subprocess on each compilation. Keep
 the existing `nvcc` compile gate. Record compilation identity and driver/toolkit compatibility
 in the artifact cache key. A precompiled PTX fixture is acceptable for the *first* transport
 smoke, but the gate above is not complete until Raster compiles its generated source itself.
 NVRTC requires explicit toolkit include paths and uses small virtual C headers for the
 `stdint.h`/`math.h` names in the current CUDA preamble; host glibc headers are not a valid
-substitute. The public equation-first map fixture has compiled to PTX with NVRTC 12.4 on
-this machine, without an NVIDIA device. This is transport evidence only.
+substitute. Runtime initialization accepts explicit `:include-paths`. For ordinary sessions,
+`RASTER_CUDA_INCLUDE_PATHS` supplies paths separated by the platform path separator; otherwise
+an explicitly configured `CUDA_HOME` supplies its `include` directory. Spaces within paths
+are preserved. No toolkit installation path is committed in source.
 An NVRTC-equipped host should run the optional transport test with
 `RASTER_REQUIRE_NVRTC=1` so missing native coverage is a failure, not a skip.
 
@@ -75,3 +86,19 @@ without a GPU; a short opt-in device suite runs on the CUDA host. Avoid renting 
 the first-gate smoke command and driver adapter are ready. At that point, access to a Linux
 host with an NVIDIA GPU, working driver, CUDA toolkit/NVRTC and remote shell is enough;
 record the exact versions rather than assuming an architecture in the compiler.
+
+## Running the initial resident proof
+
+On a configured CUDA host, require actual execution rather than accepting optional skips:
+
+```sh
+RASTER_REQUIRE_CUDA_DEVICE=1 RASTER_REQUIRE_NVRTC=1 clojure -M:test \
+  -n raster.gpu.cuda-runtime-device-test \
+  -n raster.gpu.resident-device-admission-test
+```
+
+Record the exact source revision/diff, toolkit/header options, target architecture, live device
+identity, outcome and skips. Run the same generated paths under Compute Sanitizer with explicit
+memory leak checking. Event timings in a correctness smoke are measurement mechanics, not
+performance evidence. Preserve independent arithmetic references, existing numerical thresholds
+and matrix-specific alignment/stride checks before claiming wider operation support.

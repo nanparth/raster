@@ -3,11 +3,71 @@
             [raster.runtime.hardware :as hw]
             [raster.hardware-fixture :as hardware-fixture]
             [raster.gpu.ocl-runtime :as ocl]
+            [raster.gpu.cuda-driver-probe :as cuda-probe]
             [raster.compiler.core.hardware :as chw]
             [raster.runtime.hardware-catalogue :as catalogue]))
 
 ;; Reset hardware state between tests
 (use-fixtures :each hardware-fixture/isolated)
+
+(deftest cuda-discovery-retains-driver-facts-and-field-provenance
+  (let [detected (with-redefs [cuda-probe/probe
+                              (constantly {:status :ready :driver-api-version 13020
+                                           :devices [{:ordinal 0 :name "NVIDIA A100"
+                                                      :compute-capability [8 6]}
+                                                     {:ordinal 1 :name "other GPU"
+                                                      :compute-capability [9 0]}]})]
+                   (#'hw/detect-cuda-devices))
+        device (first detected)]
+    (is (= [:cuda:0] (mapv :id detected))
+        "discovery must not promise ordinals the session layer cannot select")
+    (is (= :cuda (:type device)))
+    (is (= 0 (:index device)))
+    (is (= 13020 (:driver-api-version device)))
+    (is (nil? (:driver-version device))
+        "CUDA driver API compatibility is not the NVIDIA driver build")
+    (is (= [8 6] (get-in device [:capabilities :compute-capability]))
+        "driver observation wins over the A100 catalogue")
+    (is (= :detected (get-in device [:source :compute-capability])))
+    (is (= 108 (get-in device [:capabilities :sm-count])))
+    (is (= :catalogued (get-in device [:source :sm-count])))
+    (is (= :detected (get-in device [:source :driver-api-version])))))
+
+(deftest cuda-discovery-never-registers-unavailable-or-failed-probes
+  (doseq [status [:unavailable :no-device :driver-error]]
+    (with-redefs [cuda-probe/probe
+                  (constantly {:status status
+                               :devices [{:ordinal 0 :name "invalid observation"}]})]
+      (is (empty? (#'hw/detect-cuda-devices)) (str status))))
+  (with-redefs [cuda-probe/probe
+                (fn [] (throw (ex-info "probe failure" {:reason :cuda-driver-error})))]
+    (is (empty? (#'hw/detect-cuda-devices)))))
+
+(deftest hardware-init-admits-observed-cuda-device-without-runtime-initialization
+  (with-redefs-fn {#'hw/detect-level-zero-devices (constantly [])
+                  #'hw/detect-opencl-devices (constantly [])
+                  #'cuda-probe/probe
+                  (constantly {:status :ready :driver-api-version 13020
+                               :devices [{:ordinal 0 :name "fixture GPU"
+                                          :compute-capability [8 6]}]})}
+    (fn []
+      (hw/init!)
+      (let [device (hw/device :cuda:0)]
+        (is (= "fixture GPU" (:name device)))
+        (is (= [8 6] (get-in device [:capabilities :compute-capability])))
+        (is (= 13020 (:driver-api-version device)))))))
+
+(deftest cuda-driver-api-version-participates-in-calibration-identity
+  (let [signature (fn [api-version]
+                    (with-redefs [cuda-probe/probe
+                                  (constantly {:status :ready :driver-api-version api-version
+                                               :devices [{:ordinal 0 :name "fixture GPU"
+                                                          :compute-capability [8 6]}]})]
+                      (let [device (first (#'hw/detect-cuda-devices))]
+                        (with-redefs [hw/device (constantly device)]
+                          (hw/device-signature :cuda:0)))))]
+    (is (not= (signature 13010) (signature 13020)))
+    (is (= (signature 13020) (signature 13020)))))
 
 ;; ================================================================
 ;; CPU detection

@@ -106,7 +106,7 @@
                                 (v/->device (float-array 2) :ze:0 {:shape [3]})))
           (is (= [buffer] @freed))))))
   (testing "unknown backend fails loud"
-    (is (thrown? clojure.lang.ExceptionInfo (v/->device (float-array 3) :cuda:0)))))
+    (is (thrown? clojure.lang.ExceptionInfo (v/->device (float-array 3) :unknown:0)))))
 
 (deftest a2-device-alias-downloads-only-its-view
   (if-not @gp/gpu-available?

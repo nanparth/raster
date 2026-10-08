@@ -2,7 +2,7 @@
   "Hardware registry with auto-detection and capability queries.
 
   Auto-detects CPU capabilities on startup (cores, SIMD width, cache sizes).
-  GPU detection is conditional on ClojureCUDA availability.
+  GPU detection uses optional native driver probes.
   Predefined catalogue fills gaps for cross-compilation scenarios.
 
   Device data model:
@@ -64,7 +64,7 @@
   (let [d (device device-id)
         caps (:capabilities d)]
     (pr-str [(:type d) (:name d) (:driver-version d)
-             (select-keys caps [:vendor :device-id-hex :driver-version
+             (select-keys caps [:vendor :device-id-hex :driver-version :driver-api-version
                                 :cores :arch :gfx-arch :simd-width :subgroup-sizes
                                 :total-eus :threads-per-eu :sm-count :compute-capability
                                 :global-memory-bytes :global-mem-bytes :matrix])
@@ -214,21 +214,40 @@
               :cache (if (seq caches) :detected :unavailable)}}))
 
 ;; ================================================================
-;; GPU detection (conditional on ClojureCUDA)
+;; CUDA device detection
 ;; ================================================================
 
-(defn- clojurecuda-available?
-  "Check if CUDA device detection is available.
-  Currently returns false — CUDA support will be reimplemented
-  via the native CUDA driver API when targeted."
-  []
-  false)
-
 (defn- detect-cuda-devices
-  "Detect CUDA devices. Currently a stub — CUDA support will be
-  reimplemented via the native CUDA driver API when targeted."
+  "Discover the default CUDA device without creating a runtime context.
+   Only ordinal zero is admitted by the resident session contract. Catalogue
+   estimates retain their provenance; driver observations override them."
   []
-  [])
+  (try
+    (require 'raster.gpu.cuda-driver-probe)
+    (let [probe ((resolve 'raster.gpu.cuda-driver-probe/probe))]
+      (if (= :ready (:status probe))
+        (mapv (fn [dev-info]
+                (let [dev-name (:name dev-info)
+                      catalogue-spec (catalogue/find-gpu-spec dev-name)
+                      probed (into {} (remove (comp nil? val))
+                                   {:compute-capability (:compute-capability dev-info)
+                                    :driver-api-version (:driver-api-version probe)})
+                      caps (merge catalogue-spec probed)
+                      source (merge
+                              (into {} (map (fn [k] [k :catalogued])) (keys catalogue-spec))
+                              (into {} (map (fn [k] [k :detected])) (keys probed)))]
+                  {:id :cuda:0 :type :cuda :index 0 :name dev-name
+                   :driver-api-version (:driver-api-version probe)
+                   :capabilities caps :source source}))
+              (filter #(= 0 (:ordinal %)) (:devices probe)))
+        (do
+          (when (and (= :driver-error (:status probe)) (System/getenv "ROMEO_DEBUG"))
+            (println "CUDA detection failed:" (select-keys probe [:status :init-code])))
+          [])))
+    (catch Exception e
+      (when (System/getenv "ROMEO_DEBUG")
+        (println "CUDA detection failed:" (.getMessage e)))
+      [])))
 
 ;; ================================================================
 ;; Level Zero device detection
@@ -329,14 +348,12 @@
 
 (defn init!
   "Initialize the hardware registry. Called lazily on first use.
-  Detects CPU capabilities and, if available, GPU devices (CUDA and Level Zero).
+  Detects CPU capabilities and available CUDA, Level Zero and OpenCL devices.
   Safe to call multiple times (idempotent)."
   []
   (when (compare-and-set! initialized? false true)
     (let [cpu (detect-cpu)
-          cuda-gpus (if (clojurecuda-available?)
-                      (detect-cuda-devices)
-                      [])
+          cuda-gpus (detect-cuda-devices)
           ze-gpus (detect-level-zero-devices)
           ocl-gpus (detect-opencl-devices)]
       (swap! device-registry merge
