@@ -4,6 +4,8 @@
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.kernel-body-fixtures :as fixtures]
             [raster.compiler.backend.gpu.kernel-body-opencl :as opencl]
+            [raster.compiler.backend.gpu.kernel-body-target :as target]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -955,3 +957,36 @@
         (let [{:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
                                            "-fsyntax-only" "-" :in opencl-source)]
           (is (zero? exit) err))))))
+
+(deftest emitted-artifacts-retain-separate-rounding-and-explicit-fma
+  (let [kernel (body/make
+                {:id :retained-rounding
+                 :parameters [(body/->KernelParameter 'a :scalar :float [] nil nil :input)
+                              (body/->KernelParameter 'b :scalar :float [] nil nil :input)
+                              (body/->KernelParameter 'c :scalar :float [] nil nil :input)
+                              (body/->KernelParameter 'out :output :float [2] :global
+                                                      (layout/row-major [2] :float) :result)]
+                 :operations [(body/->ScalarCompute (body/value 'product :float)
+                                                    (body/scalar-expression :* :float ['a 'b]))
+                              (body/->ScalarCompute (body/value 'separate :float)
+                                                    (body/scalar-expression :+ :float ['product 'c]))
+                              (body/->ScalarCompute (body/value 'fused :float)
+                                                    (body/scalar-expression :fma :float ['a 'b 'c]))
+                              (body/->ScalarStore 'out [0] 'separate nil)
+                              (body/->ScalarStore 'out [1] 'fused nil)]
+                 :launch (launch/spec {:workgroup-size [1] :group-count [1]})})
+        refinement (scheduled/make
+                    {:source :retained-rounding :body kernel :arguments '[a b c out]
+                     :effects {:kind :rounding-control
+                               :uses (scheduled/derive-uses kernel '[a b c out])}
+                     :legality {:kind :fixture}
+                     :numerics {:mode :exact :policy :retained-rounding}})]
+    (doseq [dialect [:opencl-portable :opencl-intel :cuda :hip]]
+      (let [artifact (target/emit-artifact "retained_rounding" refinement dialect)
+            source (:source artifact)]
+        (is (str/includes? source "fma("))
+        (is (str/includes? source "rstr_product"))
+        (if (contains? #{:opencl-portable :opencl-intel} dialect)
+          (do (is (str/starts-with? source "#pragma OPENCL FP_CONTRACT OFF\n"))
+              (is (= 1 (count (re-seq #"#pragma OPENCL FP_CONTRACT OFF" source)))))
+          (is (not (str/includes? source "#pragma OPENCL"))))))))

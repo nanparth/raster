@@ -42,6 +42,8 @@
         artifact (body-target/emit-artifact "intel_surface" scheduled :opencl-intel)
         args (fn [m n k] [{:id :a :alignment 64} {:id :b :alignment 64} {:id :c}
                           {:type :int :value m} {:type :int :value n} {:type :int :value k}])]
+    (is (clojure.string/starts-with? (:source artifact) "#pragma OPENCL FP_CONTRACT OFF\n"))
+    (is (clojure.string/includes? (:source artifact) "intel_sub_group_f16_f16_matrix_mad_k16"))
     (is (= [64 64 nil] (mapv :alignment (take 3 (:abi artifact)))))
     (is (seq (:preconditions artifact)))
     (is (kernel-call/kernel-call? (kernel-call/make artifact (args 17 40 48))))

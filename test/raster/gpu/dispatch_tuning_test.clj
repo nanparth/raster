@@ -39,6 +39,16 @@
     (is (= (tuning/executable-signature reference)
            (tuning/executable-signature (assoc-in reference [:attributes :compilation] {}))))))
 
+(deftest source-rounding-policy-invalidates-existing-executable-identity
+  (let [changed (update reference :source #(str "#pragma OPENCL FP_CONTRACT OFF\n" %))
+        before (tuning/executable-signature reference)
+        after (tuning/executable-signature changed)]
+    (is (not= (:source-hash before) (:source-hash after)))
+    (is (= (:abi-hash before) (:abi-hash after)))
+    (is (= (:arguments-hash before) (:arguments-hash after)))
+    (is (= (:arguments reference) (:arguments changed)))
+    (is (= (:launch reference) (:launch changed)))))
+
 (def ^:private dispatch
   (kdispatch/make
    {:id "dispatch-tuning-test"

@@ -258,6 +258,7 @@
                                           {:accumulator (acc-id m n)})
                                 (str "        acc" m n " = intel_sub_group_f16_f16_matrix_mad_k16(sa" m ", bp" n ", acc" m n ");\n"))))))]
     (str
+     (c-dialect/preamble (c-dialect/resolve! :opencl-intel) {})
      "#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable\n"
      "#pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable\n\n"
      "// Tiled GEMM (parametric): WG " block-m "x" block-n ", SG " sg-m "x" sg-n

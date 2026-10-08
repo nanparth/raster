@@ -168,7 +168,10 @@
 (defn preamble
   [dialect {:keys [uses-half? uses-double? uses-subgroups?]}]
   (if (opencl? dialect)
-    (str (when uses-half? "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n")
+    ;; Separate scheduled operations retain their rounding boundaries. Explicit fma and matrix
+    ;; intrinsics remain explicit; source policy participates in the existing artifact identity.
+    (str "#pragma OPENCL FP_CONTRACT OFF\n"
+         (when uses-half? "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n")
          (when uses-double? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
          ;; Materialize the source precision before narrowing. Intel's native optimizer can
          ;; otherwise replace double division followed by convert_float_rte with multiplication
