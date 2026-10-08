@@ -11,6 +11,7 @@
             [raster.compiler.ir.kernel-call :as call]
             [raster.gpu.cuda-driver :as driver]
             [raster.gpu.cuda-execution :as execution]
+            [raster.gpu.cuda-transfer :as transfer]
             [raster.gpu.cuda-nvrtc :as nvrtc]
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.gpu.runtime-root :as root])
@@ -340,9 +341,12 @@
 (defn submit-graph! [graph]
   (doseq [prepared (:prepareds graph)] (assert-prepared-live! prepared))
   (execution/submit-graph! state graph native!))
-(defn event-complete? [token] (execution/event-complete? token native!))
-(defn await-event! [token] (execution/await-event! token native!))
-(defn release-event! [token] (execution/release-event! token))
+(defn event-complete? [token]
+  (if (:transfer? token) (transfer/event-complete? token native!) (execution/event-complete? token native!)))
+(defn await-event! [token]
+  (if (:transfer? token) (transfer/await-event! token native!) (execution/await-event! token native!)))
+(defn release-event! [token]
+  (if (:transfer? token) (transfer/release-event! token) (execution/release-event! token)))
 (defn destroy-graph! [graph] (execution/destroy-graph! graph))
 (defn reset-graph-events! [graph] (execution/reset-graph-events! graph))
 (defn read-graph-timestamps! [graph] (execution/read-graph-timestamps! graph native!))
@@ -351,10 +355,10 @@
     (try (await-event! token) (finally (release-event! token)))))
 (defn synchronize-async! [] (ensure-init!) (native! :stream-sync [(:stream @state)]))
 (defn transfer-capabilities []
-  {:submission :unsupported :host-staging :runtime-owned-native
+  {:submission :device-event :host-staging :runtime-owned-native :staging-memory :pinned
    :independent-physical-queue? false :queue-ordering :in-order
-   :async-h2d? false :async-d2h? false :peer-transfer? false :peer-mechanisms []
-   :event-semantics :device-completion :host-lease-until-await? false
+   :async-h2d? true :async-d2h? true :peer-transfer? false :peer-mechanisms []
+   :event-semantics :device-completion :host-lease-until-await? true
    :host-memory :any :physically-serialized? true})
 
 (defn- unsupported! [operation]
@@ -365,7 +369,10 @@
 (defn bind-registered-map-void-kernel [& _] (unsupported! :bind-registered-map-void-kernel))
 (defn register-kernel-dispatch! [& _] (unsupported! :register-kernel-dispatch!))
 (defn kernel-dispatch-registry-entry [& _] (unsupported! :kernel-dispatch-registry-entry))
-(defn submit-range-batch! [& _] (unsupported! :submit-range-batch!))
+(defn submit-range-batch!
+  ([entries direction] (submit-range-batch! entries direction {}))
+  ([entries direction opts]
+   (transfer/submit-range-batch! state entries direction opts native! assert-buffer-live! plan-range)))
 (defn copy-buffer-range! [& _] (unsupported! :copy-buffer-range!))
 (defn shutdown! [] (root/shutdown-construction! state))
 (defn reset! [] (shutdown!))

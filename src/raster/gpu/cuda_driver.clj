@@ -104,6 +104,8 @@
                          (raw! "cuDevicePrimaryCtxRelease_v2" [I32] [device]))
       :allocate (output! arena I64 "cuMemAlloc_v2" [I64] [(long (first args))])
       :free (raw! "cuMemFree_v2" [I64] [(long (first args))])
+      :host-allocate (output! arena PTR "cuMemHostAlloc" [I64 I32] [(long (first args)) (int 0)])
+      :host-free (raw! "cuMemFreeHost" [PTR] args)
       :module-load (let [bytes (first args) data (.allocate arena (long (alength bytes)))]
                      (MemorySegment/copy (MemorySegment/ofArray bytes) (long 0) data (long 0) (long (alength bytes)))
                      (output! arena PTR "cuModuleLoadData" [PTR] [data]))
@@ -122,6 +124,10 @@
                 (raw! "cuMemcpyHtoD_v2" [I64 PTR I64] [(long pointer) segment (long bytes)]))
       :download (let [[pointer segment bytes] args]
                   (raw! "cuMemcpyDtoH_v2" [PTR I64 I64] [segment (long pointer) (long bytes)]))
+      :upload-async (let [[pointer segment bytes stream] args]
+                      (raw! "cuMemcpyHtoDAsync_v2" [I64 PTR I64 PTR] [(long pointer) segment (long bytes) stream]))
+      :download-async (let [[pointer segment bytes stream] args]
+                        (raw! "cuMemcpyDtoHAsync_v2" [PTR I64 I64 PTR] [segment (long pointer) (long bytes) stream]))
       :copy (let [[dst src bytes stream] args]
               (raw! "cuMemcpyDtoDAsync_v2" [I64 I64 I64 PTR] [(long dst) (long src) (long bytes) stream]))
       :event-create (output! arena PTR "cuEventCreate" [I32] [(int 0)])

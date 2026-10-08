@@ -8,10 +8,12 @@ remain unsupported resident routes. Discovery uses the read-only driver probe; c
 session rejects a conflicting already-selected CUDA ordinal rather than silently using it.
 
 The initial device tests exercise generated maps, ordered arguments, offset views, changed-input
-replay, events and the public Compiled/LinkPlan path. They do not establish full runtime parity:
-asynchronous range transfers, device copies and broader numerical routes remain subsequent
-gates. Capability queries report asynchronous transfer support as false, and unsupported
-operations raise explicit backend/operation errors rather than falling back or synchronizing.
+replay, events and the public Compiled/LinkPlan path. Asynchronous range transfers now use
+private pinned host staging and CUDA device events on the existing in-order stream. Capability
+queries report asynchronous H2D/D2H support, with no independent physical transfer queue or
+overlap claim. Device copies, asynchronous prepared calls and broader numerical routes remain
+subsequent gates; unsupported operations raise explicit backend/operation errors rather than
+falling back or synchronizing.
 Native CUDA Graph capture is not implied by logical graph replay.
 
 ## First device gate
@@ -102,3 +104,27 @@ identity, outcome and skips. Run the same generated paths under Compute Sanitize
 memory leak checking. Event timings in a correctness smoke are measurement mechanics, not
 performance evidence. Preserve independent arithmetic references, existing numerical thresholds
 and matrix-specific alignment/stride checks before claiming wider operation support.
+
+## Asynchronous range transfer proof
+
+`submit-upload-ranges!` validates the entire batch and snapshots all sources into runtime-owned
+pinned memory before returning. `submit-download-ranges!` copies into private pinned staging;
+even a completed `event-complete?` poll leaves caller destinations unchanged. Awaiting or
+releasing establishes completion and publishes downloads. Session close drains outstanding
+transfers through the same cleanup owners. Public await returns the submitted buffer/host values;
+`event-measurement` supplies device-event timing and byte provenance separately.
+
+Native events, staging, buffer pins and root leases remain retained when enqueue, completion or
+destruction has an uncertain outcome. A host publication error after known completion remains
+an operation failure while completed native resources retire. Cleanup retries only resources
+whose failed destruction explicitly permits a retry.
+
+```sh
+RASTER_REQUIRE_CUDA_DEVICE=1 clojure -M:test \
+  -n raster.gpu.cuda-transfer-device-test
+```
+
+This proof uses uneven 257-element float and encoded-half storage, nonzero resident offsets,
+source mutation after submit, polling sentinels, changed-input replay, release without await,
+zero extents, invalid final batch entries and session-close visibility. Transfers share the
+existing stream with graph work; this does not establish concurrent copy/compute execution.
