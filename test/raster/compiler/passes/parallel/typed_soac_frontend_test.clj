@@ -2705,3 +2705,36 @@
                           [:attributes :attributes :stable-array-captures]))))
       (is (not-any? #(and (seq? %) (contains? #{'loop 'loop*} (first %)))
                     expressions)))))
+
+(deftest rank-zero-contract-retains-independent-backing-storage
+  (let [source (frontend/normalize-source
+                 '(let* [result (raster.par/contract out [] [[i n]]
+                                  (* (aget x i) (aget y i)) :init (float 0.0))]
+                    result))
+        values (into {} (map (fn [id]
+                               [id (av/tensor {:dtype :float :shape [(list 'extent id)]})]))
+                     '[x y out])
+        options {:dtype :float :array-types {'x :float 'y :float 'out :float}
+                 :scalar-types {'n :long} :values values :segmented-plans? true}
+        program (frontend/form->program source options)
+        equation (first (dialect/equations program))
+        parts (dialect/operation-parts equation)]
+    (is (some? program))
+    (is (= program (dialect/validate! program)))
+    (is (= 'segmented-reduce (:kind parts)))
+    (is (= [] (get-in parts [:attributes :segment-axes])))
+    (is (= 'n (get-in parts [:attributes :extent])))
+    (is (empty? (:arrays parts)) "a reduction traversal does not retype backing capacity")
+    (is (= '[x y] (get-in parts [:attributes :attributes :stable-array-captures])))
+    (doseq [id '[x y out]]
+      (is (= [(list 'extent id)] (get-in (dialect/facts program) [:values id :shape]))))
+    (is (= 'out (get-in (dialect/facts program) [:equations 0 :attributes :result-storage 0 :destination])))
+    (is (= 'out (get-in (dialect/facts program) [:equations 0 :aliases (first (nth equation 2))])))
+    (let [failure (try
+                    (frontend/form->program source
+                                            (assoc-in options [:values 'x]
+                                                      (av/tensor {:dtype :double :shape '[(extent x)]})))
+                    nil
+                    (catch clojure.lang.ExceptionInfo error error))]
+      (is (= :source-value-conflict (:reason (ex-data failure)))
+          "a contradictory storage dtype remains a certified conflict"))))

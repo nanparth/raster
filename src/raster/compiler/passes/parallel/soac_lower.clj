@@ -629,11 +629,11 @@
   (let [{:keys [equation-id physical-results segment-axes reduced-index reduced-extent
                 operator inputs scalars output-dtype contraction? operation]}
         (project-typed-segmented-reduce program :dtype dtype)
-        planned-grid (when contraction?
+        planned-grid (when (and contraction? (seq segment-axes))
                        (phase-grid :reduce device-id reduced-extent output-dtype
                                    target-descriptor))
         contraction-schedule
-        (when contraction?
+        (when (and contraction? (seq segment-axes))
           (let [workgroup-size (:block-size planned-grid)
                 candidates (filterv #(<= % workgroup-size) [32 64 128 256 512 1024])]
             (reduction/schedule
@@ -879,8 +879,8 @@
       (recur (* 2 power))
       power)))
 
-(defn- product-grid
-  "Constrain a product reduction's workgroup by both the target's thread limit and its SLM
+(defn- reduction-tree-grid
+  "Constrain a scalar or product reduction's workgroup by both the target's thread limit and its SLM
    budget. A statically known reduction extent also caps the group at the smallest covering
    power of two: idle lanes above that size cannot contribute to the tree. Each component has an
    independent local array, so charging only the primary dtype would make mixed products legal
@@ -891,8 +891,14 @@
         slm-budget (long (or (get-in descriptor [:cache :slm])
                              (:shared-memory-per-block descriptor)
                              65536))
-        max-by-slm (max 1 (quot slm-budget bytes-per-lane))
         max-workgroup (long (:max-workgroup-size descriptor 1024))
+        _ (when (or (not (pos? max-workgroup)) (< slm-budget bytes-per-lane))
+            (throw (ex-info "target limits cannot hold one reduction tree lane"
+                            {:reason :reduction-tree-target-limits
+                             :max-workgroup-size max-workgroup
+                             :shared-memory-bytes slm-budget
+                             :bytes-per-lane bytes-per-lane})))
+        max-by-slm (quot slm-budget bytes-per-lane)
         static-cap (when (and (integer? bound) (not (neg? bound)))
                      (ceiling-power-of-two (max 1 bound)))
         workgroup-size (floor-power-of-two
@@ -900,8 +906,10 @@
                                     max-workgroup
                                     max-by-slm
                                     (or static-cap Long/MAX_VALUE))))]
-    {:grid (segop/->KernelGrid (:num-blocks planned)
-                               workgroup-size
+    {:grid (segop/->KernelGrid
+            (segred-body/capped-group-count (* 4 (hardware/fill-workgroups descriptor workgroup-size))
+                                           bound workgroup-size)
+            workgroup-size
                                (* workgroup-size bytes-per-lane))
      :slm-budget slm-budget
      :bytes-per-lane bytes-per-lane}))
@@ -1021,10 +1029,9 @@
                            (:segment-axes description))
                      {:name idx :bound bound}))
         planned-grid (phase-grid :reduce device-id bound dtype target-descriptor)
-        product-grid-info (when product?
-                            (product-grid device-id planned-grid reduction bound
-                                          target-descriptor))
-        grid-1 (cond-> (or (:grid product-grid-info) planned-grid)
+        tree-grid-info (reduction-tree-grid device-id planned-grid reduction bound
+                                           target-descriptor)
+        grid-1 (cond-> (:grid tree-grid-info)
                  ;; Product schedules own one workgroup per segment, or one uniformly guarded
                  ;; group for an empty domain. The scalar grid only seeds workgroup sizing.
                  product? (assoc :num-blocks
@@ -1044,8 +1051,8 @@
                                            [:order :reassociation :overflow])
               :attributes {:scratch :workgroup-local
                            :component-dtypes (reduction/dtypes reduction)
-                           :scratch-bytes-per-lane (:bytes-per-lane product-grid-info)
-                           :slm-budget (:slm-budget product-grid-info)}})))
+                           :scratch-bytes-per-lane (:bytes-per-lane tree-grid-info)
+                           :slm-budget (:slm-budget tree-grid-info)}})))
         _ (when product? (reduction/validate-product-tree! reduction product-schedule))
         execution (execution-plan/reduce-execution bound grid-1)]
     (if product?

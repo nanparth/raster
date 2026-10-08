@@ -30,6 +30,7 @@
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]
+            [raster.compiler.passes.parallel.full-reduction-device-test :as full-reduction]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.parallel-program :as program-runtime]
             [raster.core :refer [deftm]]
@@ -2111,3 +2112,61 @@
     (is (= :kernel-graph-executable-targets (:reason failure))
         "the executable graph rejects a mixed target before its enclosing program must")
     (is (= #{:cuda-c :hip-cpp} (:targets failure)))))
+
+
+(deftest rank-zero-reduction-retains-a-scalar-prefix-of-caller-state
+  (let [output (float-array [123 456])
+        compilation (equation-first/compile #'full-reduction/dot-into!
+                                            {:target cuda-target :dtype :float})
+        linked (equation-first/lower compilation
+                                    [(float-array 8) (float-array 8) output (long 8)])
+        call (:call (first (:instances linked)))
+        result (first (get-in call [:steps 0 :equation :results]))
+        prefix (get (:buffers call) result)
+        base (get (:buffers call) 'out)
+        reason (fn [plan] (try (link-plan/validate! plan) nil
+                              (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))]
+    (is (not= base prefix))
+    (is (= [] (get-in linked [:nodes prefix :view :shape])))
+    (is (= [2] (get-in linked [:nodes base :view :shape])))
+    (is (= 4 (get-in linked [:nodes prefix :view :byte-length])))
+    (is (= 8 (get-in linked [:nodes base :view :byte-length])))
+    (is (= (get-in linked [:nodes base :view :allocation])
+           (get-in linked [:nodes prefix :view :allocation])))
+    (is (identical? output (get-in linked [:nodes base :source])))
+    (is (= {result 'out} (get-in call [:steps 0 :result-views])))
+    (is (nil? (reason linked)))
+    (let [fresh (-> linked
+                    (assoc-in [:nodes base :source] nil)
+                    (assoc-in [:nodes base :role] :internal)
+                    (assoc :outputs [prefix]))
+          contract (link-plan/initialization-contract fresh)]
+      (is (nil? (reason fresh)))
+      (is (contains? (:produces contract) prefix))
+      (is (not (contains? (:produces contract) base))
+          "the scalar store does not initialize the backing tail")
+      (is (= :link-unproduced-output (reason (assoc fresh :outputs [base])))))
+    (is (= :program-link-result-view
+           (reason (assoc-in linked [:nodes prefix :view :byte-offset] 4))))
+    (let [binds (atom 0)
+          executor {:bind! (fn [& _] (swap! binds inc)) :run! identity :release! identity}
+          failure-reason (fn [f] (try (f) nil
+                                     (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))]
+      (doseq [slot [0 1]]
+        (is (= :program-link-graph-range
+               (failure-reason
+                 #(equation-first/lower
+                    compilation (assoc [(float-array 8) (float-array 8) output (long 8)]
+                                       slot (float-array 7)))))
+            "independent backing capacities still bound every reduction read before allocation"))
+      (is (= :parallel-program-result-view-resolver
+             (failure-reason #(program-runtime/prepare-with! call executor))))
+      (is (= :parallel-program-result-view-shape
+             (failure-reason
+               #(program-runtime/prepare-with!
+                  call (assoc executor :buffer-view
+                              (fn [token]
+                                (if (= token prefix)
+                                  (bview/subview (get-in linked [:nodes base :view]) {:shape [2]})
+                                  (get-in linked [:nodes token :view]))))))))
+      (is (zero? @binds) "missing resolver and wrong logical shape fail before binding"))))

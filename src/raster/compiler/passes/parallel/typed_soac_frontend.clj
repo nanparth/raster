@@ -5055,12 +5055,13 @@
 
 (defn- segmented-reduce-equation
   [{:keys [id segment-axes reduce-index reduce-extent inputs scalars product results
-           result-transform output-dtype source-arithmetic]}]
+           result-transform output-dtype source-arithmetic storage-inputs]}]
   (let [component (first (:components product))
         expressions (:results (reduction/fold-region product))
         arrays (if (empty? segment-axes)
                  (vec (sort-by pr-str
-                               (filter #(pointwise-input? expressions % reduce-index) inputs)))
+                               (filter #(and (not (contains? storage-inputs %))
+                                             (pointwise-input? expressions % reduce-index)) inputs)))
                  [])
         elements (element-symbols (count arrays))
         stable (vec (sort-by pr-str (set/difference (set inputs) (set arrays))))
@@ -5078,7 +5079,8 @@
                 {:segment-axes segment-axes
                  :index reduce-index :extent reduce-extent
                  :attributes {:stable-array-captures stable
-                              :source-operation :raster.par/contract}
+                              :source-operation :raster.par/contract
+                              :pointwise-storage-inputs (vec (sort-by pr-str storage-inputs))}
                  :accumulators [(:accumulator component)]
                  :identities [(:neutral component)]
                  :dtypes [(:dtype component)]
@@ -5657,10 +5659,13 @@
      (reduce
       (fn [{:keys [shapes] :as state}
            {:keys [kind extent inputs locals bodies body product index results] :as description}]
-        (if-not (contains? #{:map :reduce :scan} kind)
+        (if-not (or (contains? #{:map :reduce :scan} kind)
+                    (and (= :segmented-reduce kind) (empty? (:segment-axes description))))
           (update state :descriptions conj description)
-          (let [expressions (case kind
-                              :reduce (:results (reduction/fold-region product))
+          (let [extent (if (= :segmented-reduce kind) (:reduce-extent description) extent)
+                index (if (= :segmented-reduce kind) (:reduce-index description) index)
+                expressions (case kind
+                              (:reduce :segmented-reduce) (:results (reduction/fold-region product))
                               :scan [body]
                               (into (mapv :init locals) bodies))
                 pointwise (filter #(pointwise-input? expressions % index) inputs)
@@ -5682,7 +5687,7 @@
                                    known (assoc known id [extent])))
                                shapes pointwise)]
             (-> state
-                (assoc :shapes (reduce #(assoc %1 %2 (if (= :reduce kind) [] [extent])) shapes results))
+                (assoc :shapes (reduce #(assoc %1 %2 (if (contains? #{:reduce :segmented-reduce} kind) [] [extent])) shapes results))
                 (update :descriptions conj
                         (assoc description :storage-inputs storage-inputs))))))
       {:descriptions [] :shapes (into {} (map (juxt key (comp :shape val))) values)}

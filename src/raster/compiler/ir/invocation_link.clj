@@ -378,7 +378,8 @@
                  producer (when (soac/program-form? (:algorithm emitted))
                             (some #(when (some #{result} (nth % 2)) %)
                                   (soac/equations (:algorithm emitted))))]
-             (if (and prefix? producer (contains? '#{contract map} (soac/operation-kind producer)))
+             (if (and prefix? producer
+                      (program-call/prefix-producing-result? (:algorithm emitted) result))
                (let [view-token (storage-id invocation-id :result-view result)]
                  (-> state
                      (add-storage view-token result logical shape nil :unspecified)

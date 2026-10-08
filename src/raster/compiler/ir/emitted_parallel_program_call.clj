@@ -175,6 +175,22 @@
         ;; immutable boundary's projection may be reused; every call/binding check still runs.
     (validate-equation-call-against-boundary! call boundary physical-results candidates)))
 
+(defn prefix-producing-result?
+  "Whether an already validated retained result has an admitted dense prefix storage relation."
+  [algorithm result]
+  (when (soac/program-form? algorithm)
+    (when-let [producer (some #(when (some #{result} (nth % 2)) %) (soac/equations algorithm))]
+      (let [{:keys [kind attributes]} (soac/operation-parts producer)
+            storage (soac/result-storage algorithm (second producer))]
+        (or (contains? '#{contract map} kind)
+            (and (= 'segmented-reduce kind)
+                 (= [] (:segment-axes attributes))
+                 (= [result] (nth producer 2))
+                 (= [] (soac/dense-functional-result-shape algorithm producer result))
+                 (= 1 (count storage))
+                 (= (:destination (first storage))
+                    (get-in (soac/facts algorithm) [:equations (second producer) :aliases result]))))))))
+
 (defn- validate-result-views!
   [equation boundary physical result-views]
   (when-not (map? result-views)
@@ -186,7 +202,7 @@
         (when-not (and (some #{result} (:results equation))
                        (= destination (get physical result))
                        producer
-                       (contains? '#{contract map} (soac/operation-kind producer)))
+                       (prefix-producing-result? algorithm result))
           (fail! :emitted-program-result-view
                  "result view must retain a prefix-producing physical storage relation"
                  {:equation (:id equation) :result result :destination destination}))))

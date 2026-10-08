@@ -294,7 +294,11 @@
                                 (dtype/known? (:dtype value))
                                 (contraction-closure/plain-storage? value)))) reads))
       (reduce (fn [requirements {:keys [sym map]}]
-                (let [minimum (apply launch/product (axis-map/shape map))]
+                (let [shape (axis-map/shape map)
+                      minimum (case (count shape)
+                                0 1
+                                1 (first shape)
+                                (apply launch/product shape))]
                   (update requirements sym
                           (fn [prior]
                             (cond (nil? prior) minimum
