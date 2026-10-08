@@ -31,6 +31,7 @@
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.typed-contraction-context :as contraction-context]
             [raster.compiler.passes.parallel.full-reduction-device-test :as full-reduction]
+            [raster.compiler.passes.parallel.gemm-epilogue-device-test :as gemm]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.parallel-program :as program-runtime]
             [raster.core :refer [deftm]]
@@ -2113,6 +2114,102 @@
         "the executable graph rejects a mixed target before its enclosing program must")
     (is (= #{:cuda-c :hip-cpp} (:targets failure)))))
 
+
+(deftest rank-positive-contraction-retains-its-dense-prefix-of-caller-state
+  (let [output (float-array 18)
+        compilation (equation-first/compile
+                     #'gemm/accumulate-gemm!
+                     {:target cuda-target :dtype :float
+                      :schedule {:precision :f32-scalar}
+                      :values {'C (av/tensor {:dtype :float :shape [18]})}})
+        program (:emitted compilation)
+        equation (first (:equations program))
+        boundary (first (:operations equation))
+        algorithm (:algorithm boundary)
+        producer (first (soac/equations algorithm))
+        result (first (:results equation))
+        storage (first (soac/result-storage algorithm (second producer)))
+        linked (try {:plan (equation-first/lower
+                           compilation [(float-array 12) (float-array 20) output
+                                        (long 3) (long 4) (long 5)])}
+                    (catch clojure.lang.ExceptionInfo error {:error (ex-data error)}))]
+    (is (= program (emitted-program/validate! program))
+        "emitted graph is independently rederived from its retained scheduled body")
+    (is (= 'segmented-reduce (soac/operation-kind producer)))
+    (is (= :raster.par/contract (get-in (soac/operation-parts producer)
+                                      [:attributes :attributes :source-operation])))
+    (is (= '[m n] (soac/dense-functional-result-shape algorithm producer result)))
+    (is (= 'C (:destination storage)))
+    (is (= :read-write (:access storage)) "beta=1 retains initialized C")
+    (is (= 'C (get-in (soac/facts algorithm) [:equations (second producer) :aliases result])))
+    (is (program-call/prefix-producing-result? algorithm result)
+        "a checked dense NN result must retain its separate physical destination")
+    ;; Predicate mutation controls are rejection probes, not validated new algorithms.
+    (let [facts (soac/facts algorithm)
+          replace-facts #(list 'soac-program % (soac/equations algorithm) (soac/outputs algorithm))
+          producer-operation (nth producer 3)
+          ordinary-operation (list* (first producer-operation)
+                                    (update (second producer-operation) :attributes
+                                            dissoc :source-operation)
+                                    (drop 2 producer-operation))
+          ordinary-producer (apply list (assoc (vec producer) 3 ordinary-operation))
+          ordinary (list 'soac-program facts [ordinary-producer] (soac/outputs algorithm))]
+      (is (not (program-call/prefix-producing-result? ordinary result))
+          "an arbitrary segmented reduction does not inherit contraction prefix admission")
+      (is (not (program-call/prefix-producing-result?
+                (list 'soac-program facts
+                      [(apply list (assoc (vec producer) 2 [result :unrelated-result]))]
+                      (soac/outputs algorithm)) result))
+          "multiple-result producers require a separate proven storage contract")
+      (doseq [invalid [(assoc-in facts [:values result :logical-layout] {:kind :strided})
+                       (assoc-in facts [:values 'C :logical-layout] {:kind :strided})
+                       (assoc-in facts [:equations (second producer) :attributes :result-storage] [])
+                       (assoc-in facts [:equations (second producer) :aliases result] 'A)]]
+        (is (not (program-call/prefix-producing-result? (replace-facts invalid) result)))))
+    (is (nil? (:error linked)) "logical15/physical18 must be linked through a certified prefix")
+    (when-let [plan (:plan linked)]
+      (let [call (:call (first (:instances plan)))
+            prefix (get (:buffers call) result)
+            base (get (:buffers call) 'C)
+            reason (fn [candidate]
+                     (try (link-plan/validate! candidate) nil
+                          (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+            contract (link-plan/initialization-contract plan)]
+        (is (not= base prefix))
+        (is (= [3 5] (get-in plan [:nodes prefix :view :shape])))
+        (is (= [18] (get-in plan [:nodes base :view :shape])))
+        (is (= 60 (get-in plan [:nodes prefix :view :byte-length])))
+        (is (= 72 (get-in plan [:nodes base :view :byte-length])))
+        (is (= (get-in plan [:nodes base :view :allocation])
+               (get-in plan [:nodes prefix :view :allocation])))
+        (is (contains? (:produces contract) prefix))
+        (is (contains? (:complete-writes contract) prefix))
+        (is (not (contains? (:complete-writes contract) base)) "the untouched tail is not a whole write")
+        (is (contains? (:reads contract) base) "beta=1 reads initial C")
+        (is (contains? (:initializers contract) base) "the C host source initializes the tail")
+        (let [without-source (assoc-in plan [:nodes base :source] nil)]
+          (is (= :link-read-before-write
+                 (reason (assoc-in without-source [:nodes base :role] :internal))))
+          (is (contains? (:requires (link-plan/initialization-contract
+                                    (assoc-in without-source [:nodes base :role] :state))) base)))
+        (is (nil? (reason plan)))
+        (is (= :program-link-result-view
+               (reason (assoc-in plan [:nodes prefix :view :byte-offset] 4))))
+        (let [binds (atom 0)
+              executor {:bind! (fn [& _] (swap! binds inc)) :run! identity :release! identity}
+              failure-reason #(try (%1) nil
+                                   (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))]
+          (is (= :parallel-program-result-view-resolver
+                 (failure-reason #(program-runtime/prepare-with! call executor))))
+          (is (= :parallel-program-result-view-shape
+                 (failure-reason
+                  #(program-runtime/prepare-with!
+                    call (assoc executor :buffer-view
+                                (fn [token]
+                                  (if (= token prefix)
+                                    (bview/subview (get-in plan [:nodes base :view]) {:shape [18]})
+                                    (get-in plan [:nodes token :view]))))))))
+          (is (zero? @binds)))))))
 
 (deftest rank-zero-reduction-retains-a-scalar-prefix-of-caller-state
   (let [output (float-array [123 456])

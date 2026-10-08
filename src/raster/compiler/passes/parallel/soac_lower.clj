@@ -50,6 +50,7 @@
 (declare lower-scan-description)
 (declare scan-kernel-graph-description)
 (declare phase-grid)
+(declare contraction-candidate-grid)
 
 (defn- materialize-region-locals
   [locals body]
@@ -630,8 +631,11 @@
                 operator inputs scalars output-dtype contraction? operation]}
         (project-typed-segmented-reduce program :dtype dtype)
         planned-grid (when (and contraction? (seq segment-axes))
-                       (phase-grid :reduce device-id reduced-extent output-dtype
-                                   target-descriptor))
+                       (contraction-candidate-grid
+                        device-id
+                        (phase-grid :reduce device-id reduced-extent output-dtype
+                                    target-descriptor)
+                        reduced-extent output-dtype target-descriptor))
         contraction-schedule
         (when (and contraction? (seq segment-axes))
           (let [workgroup-size (:block-size planned-grid)
@@ -878,6 +882,33 @@
     (if (< power n)
       (recur (* 2 power))
       power)))
+
+(defn- contraction-candidate-grid
+  "Legalize the candidate envelope without applying a scalar tree's static extent cap.
+   Matrix, register-tiled and portable selection remains downstream. Recompute both the
+   grid cap and scratch charge for the legal width rather than retaining occupancy geometry
+   from a non-power-of-two planned width."
+  [device-id planned bound output-dtype target-descriptor]
+  (let [descriptor (or target-descriptor (hardware/descriptor-for device-id))
+        bytes-per-lane (dtype/bytes-of output-dtype)
+        slm-budget (long (or (get-in descriptor [:cache :slm])
+                             (:shared-memory-per-block descriptor) 65536))
+        max-workgroup (long (:max-workgroup-size descriptor 1024))
+        planned-width (long (:block-size planned))
+        _ (when (or (not (pos? planned-width)) (not (pos? max-workgroup))
+                    (< slm-budget bytes-per-lane))
+            (throw (ex-info "target limits cannot hold one contraction candidate lane"
+                            {:reason :contraction-candidate-target-limits
+                             :planned-workgroup-size planned-width
+                             :max-workgroup-size max-workgroup
+                             :shared-memory-bytes slm-budget
+                             :bytes-per-lane bytes-per-lane})))
+        width (floor-power-of-two
+               (min planned-width max-workgroup (quot slm-budget bytes-per-lane)))]
+    (segop/->KernelGrid
+     (segred-body/capped-group-count (* 4 (hardware/fill-workgroups descriptor width))
+                                    bound width)
+     width (* width bytes-per-lane))))
 
 (defn- reduction-tree-grid
   "Constrain a scalar or product reduction's workgroup by both the target's thread limit and its SLM

@@ -181,14 +181,25 @@
   (when (soac/program-form? algorithm)
     (when-let [producer (some #(when (some #{result} (nth % 2)) %) (soac/equations algorithm))]
       (let [{:keys [kind attributes]} (soac/operation-parts producer)
-            storage (soac/result-storage algorithm (second producer))]
+            storage (soac/result-storage algorithm (second producer))
+            shape (soac/dense-functional-result-shape algorithm producer result)
+            destination (:destination (first storage))
+            physical (get-in (soac/facts algorithm) [:values destination])]
         (or (contains? '#{contract map} kind)
             (and (= 'segmented-reduce kind)
-                 (= [] (:segment-axes attributes))
+                 (or (and (= [] (:segment-axes attributes)) (= [] shape))
+                     ;; Canonicalized contractions retain a dense row-major result domain.
+                     ;; Do not promote arbitrary positive-rank segmented reductions, indexed
+                     ;; layouts or a different physical alias into this prefix relation.
+                     (and (seq (:segment-axes attributes))
+                          (= :raster.par/contract
+                             (get-in attributes [:attributes :source-operation]))
+                          (= (mapv second (:segment-axes attributes)) shape)
+                          (= {:kind :plain} (:representation physical))
+                          (nil? (:logical-layout physical))))
                  (= [result] (nth producer 2))
-                 (= [] (soac/dense-functional-result-shape algorithm producer result))
                  (= 1 (count storage))
-                 (= (:destination (first storage))
+                 (= destination
                     (get-in (soac/facts algorithm) [:equations (second producer) :aliases result]))))))))
 
 (defn- validate-result-views!
