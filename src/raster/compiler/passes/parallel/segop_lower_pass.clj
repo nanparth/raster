@@ -9,6 +9,8 @@
    - Lowering decides phase decomposition, launch params, accumulator count
    - Backend translates SegOp to target code (SIMD, OpenCL, scalar)"
   (:require [raster.compiler.core.util :as util]
+            [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.runtime.hardware :as hardware]
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
@@ -337,6 +339,31 @@
               (soac-dialect/equations algorithm))]
     (mapv producers (soac-dialect/outputs algorithm))))
 
+(defn- check-host-scalar-schedule!
+  "A retained GPU buffer read needs an executable schedule, not host token evaluation."
+  [algorithm equation device-id]
+  (when (contains? #{:cuda :ocl :ze :hip} (hardware/device-type device-id))
+    (let [operation (first (soac-dialect/equations algorithm))
+          {:keys [captures lambda]} (soac-dialect/operation-parts operation)
+          {:keys [parameters locals body-results]} (soac-dialect/lambda-parts lambda)
+          values (:values (soac-dialect/facts algorithm))
+          tensor-parameters (into {}
+                                  (keep (fn [[parameter capture]]
+                                          (when (seq (:shape (get values capture)))
+                                            [parameter capture])))
+                                  (map vector parameters captures))
+          expressions (concat (map :init locals) body-results)
+          read-buffers (set (keep (fn [form]
+                                   (when (descriptor/aget-call? form)
+                                     (get tensor-parameters (descriptor/aget-array-sym form))))
+                                 (tree-seq coll? seq expressions)))
+          buffers (filterv read-buffers captures)]
+      (when (seq buffers)
+        (throw (ex-info "retained device scalar buffer read has no executable schedule"
+                        {:reason :unsupported-device-scalar-read :ir :segop
+                         :equation (:id equation) :device device-id
+                         :captured-buffers buffers}))))))
+
 (defn segop-lower-pass
   "Pipeline pass: convert par forms in let* bindings to SegOp records.
 
@@ -372,7 +399,8 @@
                     kind (soac-dialect/operation-kind
                           (first (soac-dialect/equations scheduling-algorithm)))
                     lowered (case kind
-                              scalar {:operations []}
+                              scalar (do (check-host-scalar-schedule! scheduling-algorithm equation device-id)
+                                         {:operations []})
                               contract {:operations (soac-lower/lower-typed-contract
                                                       scheduling-algorithm device-id)}
                               map {:operations (soac-lower/lower-typed-map

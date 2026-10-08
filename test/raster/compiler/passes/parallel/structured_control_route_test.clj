@@ -734,6 +734,50 @@
         "program shape facts remain available when a later kernel has no ABI use for them")
     (is (= 0 (get-in linked-plan [:attributes :driver-allocations])))))
 
+(deftest uniform-buffer-reads-remain-device-equations-at-the-public-invocation-boundary
+  (let [source '(let* [scale (clojure.core/double
+                             (clojure.core/aget params (clojure.core/long 0)))
+                       effect (raster.par/map-void! i n
+                                                    (clojure.core/aset out i
+                                                                      (clojure.core/* scale 2.0)))]
+                      effect)
+        options {:dtype :double :public-parameters '[params out n]
+                 :array-types {'params :double 'out :double}
+                 :scalar-types {'n :long 'scale :double}}
+        parallel (:program (typed-route/attempt source :double (:array-types options)
+                                                {:scalar-types (:scalar-types options)}))
+        result (try {:promoted (route/promote-program parallel options)}
+                    (catch clojure.lang.ExceptionInfo e {:error (ex-data e)}))]
+    (is (some? parallel) "the original source is admitted before public-role promotion")
+    (is (nil? (:error result))
+        "a resident array element cannot be materialized by a host-only ScalarCompute")
+    (when-let [promoted (:promoted result)]
+      (let [plan (get-in promoted [:attributes :invocation-plan])]
+        (is (= '[scalar map]
+               (mapv #(soac/operation-kind (first (soac/equations (:algorithm %))))
+                     (:equations promoted))))
+        (is (not-any? #(= 'scale (:symbol %)) (:steps plan)))
+        (is (some #{'params} (:inputs promoted)))
+        (is (= :double (get-in promoted [:values 'scale :dtype])))
+        (is (= plan (invocation/validate! plan)))))))
+
+(deftest scalar-arithmetic-and-buffer-length-retain-their-host-invocation-roles
+  (let [source '(let* [scale (clojure.core/* alpha 2.0)
+                       rows (clojure.core/long (clojure.core/alength params))
+                       effect (raster.par/map-void! i rows
+                                                    (clojure.core/aset out i scale))]
+                      effect)
+        options {:dtype :double :public-parameters '[params out alpha]
+                 :array-types {'params :double 'out :double}
+                 :scalar-types {'alpha :double 'scale :double 'rows :long}}
+        parallel (:program (typed-route/attempt source :double (:array-types options)
+                                                {:scalar-types (:scalar-types options)}))
+        promoted (route/promote-program parallel options)
+        plan (get-in promoted [:attributes :invocation-plan])]
+    (is (invocation/scalar-compute? (first (filter #(= 'scale (:symbol %)) (:steps plan)))))
+    (is (invocation/shape-projection? (first (filter #(= 'rows (:symbol %)) (:steps plan)))))
+    (is (= plan (invocation/validate! plan)))))
+
 (deftest allocation-shape-definition-remains-an-ordered-host-equation
   (let [source '(let* [size (clojure.core/* nrows width)
                        out (clojure.core/float-array size)

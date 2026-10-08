@@ -241,11 +241,16 @@
         expression))))
 
 (defn- host-invocation-equation?
-  [available program-outputs required-shape-scalars source-prefix? equation]
+  [values available program-outputs required-shape-scalars source-prefix? equation]
   (let [expression (scalar-equation-expression equation)]
     (and expression
          (not-any? (set (:results equation)) program-outputs)
          (set/subset? (set (:operands equation)) available)
+         ;; A uniform buffer read is still a device computation: public inputs can be resident
+         ;; buffers and invocation ScalarCompute deliberately accepts only scalar operands.
+         ;; Array length is metadata, so retain its existing checked host ShapeProjection route.
+         (or (shape-projection-source expression)
+             (every? #(scalar-value? (get values %)) (:operands equation)))
          ;; Invocation-prefix construction is dependency-pruned and executes before all device
          ;; equations. Even a shape projection may not cross that boundary when a checked cast
          ;; still carries exceptional control. A checked scalar which really precedes device work
@@ -289,7 +294,7 @@
                         required-shape? (some shape-scalars (:results equation))
                         exceptional-shape? (and required-shape?
                                                 (not (effects/removable-expr? expression)))
-                        host? (host-invocation-equation? available program-outputs
+                        host? (host-invocation-equation? (:values parallel-program) available program-outputs
                                                            shape-scalars source-prefix?
                                                            equation)
                         ;; Required shape membership authorizes the exceptional one-shot branch;

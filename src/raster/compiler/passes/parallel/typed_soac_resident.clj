@@ -8,6 +8,8 @@
    value is reconstructed or synchronized through host scalar control."
   (:require [clojure.set :as set]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.scalar-conversion :as conversion]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]))
@@ -184,26 +186,46 @@
       info
       (rewrite-lambda-consumer info values scalar-defs dependent roots))))
 
+(defn- identity-load-operand
+  "See through checked identity casts only; retain the original expression for substitution."
+  [expression input-dtype]
+  (if-let [{:keys [attributes operand]} (conversion/canonical-parts expression)]
+    (when (and (= input-dtype (:source-dtype attributes) (:target-dtype attributes))
+               (= [:exact :exact] [(:rounding attributes) (:overflow attributes)]))
+      (identity-load-operand operand input-dtype))
+    (if (and (seq? expression) (descriptor/cast-op? (first expression)))
+      (when (and (= 2 (count expression))
+                 (= input-dtype (some-> (first expression) descriptor/cast-result-tag
+                                       dtype/dtype-for-scalar-tag dtype/canon))
+                 (= [:exact :exact] (conversion/policy input-dtype input-dtype)))
+        (identity-load-operand (second expression) input-dtype))
+      expression)))
+
 (defn- uniform-input-load
-  "Recognize an ordered scalar equation that reads one immutable program input.
-   A launch extent or host-visible result is never a candidate for this transformation."
+  "Recognize one immutable input load, optionally inside checked identity casts."
   [info input-values values]
   (let [{:keys [kind results captures parameters locals body-results]} info
         expression (first body-results)
-        arguments (when (descriptor/aget-call? expression)
-                    (vec (descriptor/call-args expression)))
         array (first captures)
-        index (second arguments)]
+        load (identity-load-operand expression (:dtype (get values array)))
+        arguments (when (descriptor/aget-call? load)
+                    (vec (descriptor/call-args load)))
+        index-form (second arguments)
+        index (descriptor/unwrap-int-cast index-form)
+        index-limit (if (and (seq? index-form)
+                             (contains? #{'int 'clojure.core/int} (first index-form)))
+                      Integer/MAX_VALUE Long/MAX_VALUE)]
     (when (and (= :scalar kind) (= 1 (count results)) (= 1 (count captures))
                (= 1 (count parameters)) (empty? locals) (= 1 (count body-results))
                (= 2 (count arguments)) (= (first arguments) (first parameters))
-               (integer? index) (not (neg? index))
+               (integer? index) (<= 0 index index-limit)
                (contains? input-values array)
                (seq (:shape (get values array))))
-      {:result (first results) :array array :index index})))
+      {:result (first results) :array array
+       :expression (util/subst-syms {(first parameters) array} expression)})))
 
 (defn inline-uniform-input-loads
-  "Move a single-use uniform input load into its resident map/effect-map consumer.
+  "Move an immutable uniform input load into every eligible resident map/effect-map consumer.
 
    The input remains a stable, no-write-alias array capture. This is a device-side read of the
    currently bound buffer, not a host-side download or a cached copy of allocation-time data.
@@ -231,10 +253,12 @@
                         (let [sites (get uses result)]
                           (when (and (not (contains? outputs result))
                                      (not (contains? written array))
-                                     (= 1 (count sites))
-                                     (= :capture (get-in (first sites) [1 :role]))
-                                     (contains? #{:map :effect-map}
-                                                (get kinds (get-in (first sites) [1 :equation]))))
+                                     (seq sites)
+                                     (every? (fn [[_ site]]
+                                               (and (= :capture (:role site))
+                                                    (contains? #{:map :effect-map}
+                                                               (get kinds (:equation site)))))
+                                             sites))
                             [result load])))))
               infos)]
     (if (empty? candidates)
@@ -248,8 +272,8 @@
                                   (some removed (:captures info)))
                            (let [loads (keep candidates (:captures info))
                                  replacements (into {}
-                                                    (map (fn [{:keys [result array index]}]
-                                                           [result (list 'clojure.core/aget array index)]))
+                                                    (map (fn [{:keys [result expression]}]
+                                                           [result expression]))
                                                     loads)
                                  stable (set (map :array loads))]
                              (rewrite-lambda-captures info (:values facts) replacements stable))

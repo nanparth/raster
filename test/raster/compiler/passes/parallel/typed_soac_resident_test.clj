@@ -32,6 +32,64 @@
     (is (not (some #{'alpha} (:captures effect))))
     (is (= result (dialect/validate! result)))))
 
+(deftest cast-uniform-input-load-keeps-all-consumers-resident
+  (let [source '(let* [alpha (double (clojure.core/aget params (long 0)))
+                       first-pass (raster.par/map-void! i n
+                                    (clojure.core/aset out i alpha))
+                       second-pass (raster.par/map-void! j n
+                                     (clojure.core/aset other j alpha))]
+                  second-pass)
+        program (frontend/form->program source
+                                        {:dtype :double
+                                         :array-types {'params :double 'out :double 'other :double}
+                                         :scalar-types {'n :long 'alpha :double}})
+        [result stats] (resident/inline-uniform-input-loads program)
+        infos (mapv fusion/equation-info (dialect/equations result))
+        consumers (filter #(contains? #{:map :effect-map} (:kind %)) infos)]
+    (is (= 1 (:resident-uniform-input-loads stats)))
+    (is (= 2 (count consumers)))
+    (is (not-any? #(some #{'alpha} (:results %)) infos))
+    (doseq [consumer consumers]
+      (is (some #{'params} (:captures consumer)))
+      (is (some #{'params} (get-in consumer [:attributes :attributes :stable-array-captures])))
+      (is (not (some #{'alpha} (:captures consumer))))
+      (is (= (list 'double (list 'clojure.core/aget (first (:parameters consumer))
+                                (list 'long 0)))
+             (first (:body-results consumer)))))
+    (is (= result (dialect/validate! result)))))
+
+(deftest uniform-input-fusion-does-not-broaden-casts-or-arithmetic
+  (doseq [[expression input-type result-type]
+          [['(int (clojure.core/aget params 0)) :long :int]
+           ['(double (+ (clojure.core/aget params 0) 1.0)) :double :double]
+           ['(clojure.core/aget params (int 2147483648)) :double :double]]]
+    (let [source (list 'let* ['alpha expression
+                              'result '(raster.par/map-void! i n
+                                         (clojure.core/aset out i alpha))]
+                       'result)
+          program (frontend/form->program source
+                                          {:dtype result-type
+                                           :array-types {'params input-type 'out result-type}
+                                           :scalar-types {'n :long 'alpha result-type}})
+          [result stats] (resident/inline-uniform-input-loads program)]
+      (is (zero? (:resident-uniform-input-loads stats)) (pr-str expression))
+      (is (some #(some #{'alpha} (nth % 2)) (dialect/equations result)))
+      (is (= result (dialect/validate! result))))))
+
+(deftest uniform-input-fusion-requires-every-use-to-be-a-map-capture
+  (let [source '(let* [alpha (double (clojure.core/aget params (long 0)))
+                       beta (+ alpha 1.0)
+                       result (raster.par/map-void! i n
+                                (clojure.core/aset out i (+ alpha beta)))]
+                  result)
+        program (frontend/form->program source
+                                        {:dtype :double :array-types {'params :double 'out :double}
+                                         :scalar-types {'n :long 'alpha :double 'beta :double}})
+        [result stats] (resident/inline-uniform-input-loads program)]
+    (is (zero? (:resident-uniform-input-loads stats)))
+    (is (some #(some #{'alpha} (nth % 2)) (dialect/equations result)))
+    (is (= result (dialect/validate! result)))))
+
 (deftest resident-uniform-load-never-moves-a-launch-extent
   (let [source '(let* [^long n (clojure.core/aget dims 0)
                        result (raster.par/map-void! i n

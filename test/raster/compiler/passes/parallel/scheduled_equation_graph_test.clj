@@ -295,6 +295,42 @@
     (is (= :scheduled-equation-region
            (reason-of #(equation-graph/make-for-equations scheduled []))))))
 
+(deftest unscheduled-device-buffer-scalar-read-declines-explicitly
+  (let [source '(let* [alpha (double (+ (clojure.core/aget params (long 0)) 1.0))
+                       result (raster.par/map-void! i n (clojure.core/aset out i alpha))]
+                  result)
+        options {:dtype :double :target-device :ocl:0
+                 :array-types {'params :double 'out :double}
+                 :scalar-types {'n :long 'alpha :double}}
+        typed (frontend/form->program source options)
+        envelope (route/program-envelope typed)
+        scalar (first (:equations envelope))
+        error (try (segop-lower/segop-lower-pass envelope options) nil
+                   (catch clojure.lang.ExceptionInfo t t))]
+    (is (= :unsupported-device-scalar-read (:reason (ex-data error))))
+    (is (= :segop (:ir (ex-data error))))
+    (is (= :ocl:0 (:device (ex-data error))))
+    (is (= (:id scalar) (:equation (ex-data error))))
+    (is (= '[params] (:captured-buffers (ex-data error))))))
+
+(deftest scalar-scheduling-keeps-host-metadata-and-cpu-array-behaviour
+  (doseq [[source device arrays scalars]
+          [['(let* [alpha (* scale 2.0)
+                     result (raster.par/map-void! i n (clojure.core/aset out i alpha))] result)
+            :ocl:0 {'out :double} {'scale :double 'alpha :double 'n :long}]
+           ['(let* [width (long (clojure.core/alength params))
+                     result (raster.par/map-void! i n (clojure.core/aset out i (double width)))] result)
+            :ocl:0 {'params :double 'out :double} {'width :long 'n :long}]
+           ['(let* [alpha (double (+ (clojure.core/aget params (long 0)) 1.0))
+                     result (raster.par/map-void! i n (clojure.core/aset out i alpha))] result)
+            :cpu:0 {'params :double 'out :double} {'alpha :double 'n :long}]]]
+    (let [options {:dtype :double :target-device device :array-types arrays :scalar-types scalars}
+          typed (frontend/form->program source options)
+          scheduled (:form (segop-lower/segop-lower-pass (route/program-envelope typed) options))]
+      (is (true? (get-in scheduled [:equations 0 :attributes :host-only])) (pr-str source))
+      (is (empty? (get-in scheduled [:equations 0 :operations])))
+      (is (seq (get-in scheduled [:equations 1 :operations]))))))
+
 (deftest pure-scalar-gap-is-hoisted-into-the-region-proof-prefix
   (let [scheduled (scheduled-scalar-gap)
         numerical (filterv (comp seq :operations) (:equations scheduled))
