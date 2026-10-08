@@ -11,8 +11,9 @@ The initial device tests exercise generated maps, ordered arguments, offset view
 replay, events and the public Compiled/LinkPlan path. Asynchronous range transfers now use
 private pinned host staging and CUDA device events on the existing in-order stream. Capability
 queries report asynchronous H2D/D2H support, with no independent physical transfer queue or
-overlap claim. Device copies, asynchronous prepared calls and broader numerical routes remain
-subsequent gates; unsupported operations raise explicit backend/operation errors rather than
+overlap claim. Direct synchronous resident range copies and asynchronous prepared calls now
+have device proof within the contracts below. Broader numerical routes remain subsequent
+gates; unsupported operations raise explicit backend/operation errors rather than
 falling back or synchronizing.
 Native CUDA Graph capture is not implied by logical graph replay.
 
@@ -128,3 +129,37 @@ This proof uses uneven 257-element float and encoded-half storage, nonzero resid
 source mutation after submit, polling sentinels, changed-input replay, release without await,
 zero extents, invalid final batch entries and session-close visibility. Transfers share the
 existing stream with graph work; this does not establish concurrent copy/compute execution.
+
+## Resident copies and prepared asynchronous calls
+
+`copy-range!` preserves checked resident view offsets, storage dtype, session membership and
+capacity, then performs direct D2D work without host materialization. It returns the identical
+destination and waits before return. Zero extent validates first and performs no copy.
+Every positive overlapping range in one allocation, including an exact self-range, rejects
+before driver contact. Disjoint views of one allocation remain supported; no memmove behavior
+is implied. Failed uncertain enqueue/completion retains both buffers and a root cleanup owner.
+
+`prepare!` with `:async? true` binds the existing ordered KernelCall. `invoke-bound!` submits
+without stream synchronization; `sync!` establishes completion for multiple calls/bindings on
+the existing stream. Canonical prepared cleanup, replacement, release and session close drain
+pending use before retiring parameters, modules or buffer pins. Direct await/synchronization
+and cleanup share uncertain completion outcomes, so an unclassified failed wait is not retried.
+Only an explicitly retry-safe failure permits another attempt. Graph GPUEvents remain distinct
+from this prepared invocation interface.
+
+The retained completion outcome also governs ordinary whole/ranged upload/download, graph
+and async-range admission, and native stream/event waits. An indeterminate completion rejects
+new queue work and allocations before native contact. Canonical destruction of resources
+whose use already completed remains permitted; pending use retains its owners and debt.
+
+```sh
+RASTER_REQUIRE_CUDA_DEVICE=1 RASTER_REQUIRE_NVRTC=1 clojure -M:test \
+  -n raster.gpu.cuda-copy-prepared-device-test
+```
+
+The native fixture checks float/raw half copies and a generated uneven 259-element map with
+independent direct `2*x` arithmetic, offset views, multiple pending calls, changed-input replay,
+replacement and canonical retirement. It explicitly installs an existing equation-generated
+shared artifact into a session to test public prepare/invoke/sync. This is prepared runtime
+qualification, not historical `compile!` or broader application qualification. A forwarding
+Driver spy records submission/completion calls while executing the real native transport.

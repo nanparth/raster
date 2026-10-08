@@ -11,6 +11,7 @@
             [raster.compiler.ir.kernel-call :as call]
             [raster.gpu.cuda-driver :as driver]
             [raster.gpu.cuda-execution :as execution]
+            [raster.gpu.cuda-prepared-execution :as prepared-execution]
             [raster.gpu.cuda-transfer :as transfer]
             [raster.gpu.cuda-nvrtc :as nvrtc]
             [raster.gpu.resource-cleanup :as cleanup]
@@ -32,8 +33,22 @@
     (if (seq (get env "CUDA_HOME")) [(str (get env "CUDA_HOME") "/include")] [])))
 
 (defn- native! [operation arguments]
-  (binding [driver/*context* (:context @state)]
-    (driver/invoke! operation arguments)))
+  (let [ledger (:prepared-execution @state)
+        invoke #(binding [driver/*context* (:context @state)]
+                  (driver/invoke! operation arguments))]
+    (if (and ledger (contains? #{:stream-sync :event-sync} operation))
+      ;; Graphs, transfers and prepared calls share the physical stream. A failed
+      ;; completion cannot be retried through a different public adapter path.
+      (prepared-execution/complete! ledger invoke)
+      (if (and ledger (contains? #{:launch :copy :upload :download :upload-async :download-async
+                                  :allocate :host-allocate :module-load :module-function
+                                  :event-create :event-record :event-query :event-elapsed} operation))
+        (locking (:lock ledger)
+          (prepared-execution/assert-admitted! ledger)
+          (invoke))
+        ;; Destruction stays under its canonical completion dependencies; unrelated
+        ;; resources whose use already completed may still retire after poison.
+        (invoke)))))
 
 (defn initialize!
   "Initialize the shared process root. Toolkit include paths are explicit configuration,
@@ -55,10 +70,14 @@
                                      (driver/invoke! :destroy-runtime [%]))}]
       (fn [entry]
         (assoc (root/acquire! entry :runtime #(driver/invoke! :initialize [device-ordinal]))
-               :include-paths include-paths :device-ordinal device-ordinal))))
+               :include-paths include-paths :device-ordinal device-ordinal
+               :prepared-execution (prepared-execution/ledger state)))))
    nil)))
 
-(defn ensure-init! [] (when-not (:initialized? @state) (initialize!)) (root/assert-live! state))
+(defn ensure-init! []
+  (when-not (:initialized? @state) (initialize!))
+  (root/assert-live! state)
+  (prepared-execution/assert-admitted! (:prepared-execution @state)))
 
 (defn execution-device-info []
   (ensure-init!)
@@ -78,6 +97,7 @@
     (throw (ex-info "CUDA requires a resident buffer" {:reason :cuda-buffer-type})))
   (cleanup/assert-live! (owner! buffer))
   (root/assert-live! state)
+  (prepared-execution/assert-admitted! (:prepared-execution @state))
   (when-not (identical? (::context buffer) (:context @state))
     (throw (ex-info "CUDA buffer belongs to another context generation"
                     {:reason :runtime-generation-mismatch})))
@@ -109,6 +129,7 @@
                                               "CUDA buffer is retained by a prepared call")
                           (cleanup/release-native! slot (fn [p] (native! :free [p]))))}]
       (fn [owner entry]
+        (prepared-execution/assert-admitted! (:prepared-execution @state))
         (when retain-owner! (retain-owner! owner))
         (let [p (cleanup/acquire-native! slot #(native! :allocate [(max 1 bytes)]))
               allocation (view/allocation {:id (random-uuid) :byte-size bytes
@@ -173,7 +194,7 @@
     (with-open [arena (Arena/ofConfined)]
       (let [staging (.allocate arena (long n-bytes))]
         ;; Synchronous host copies also order against previous launches on this stream.
-        (native! :stream-sync [(:stream @state)])
+        (prepared-execution/synchronize! (:prepared-execution @state) (:stream @state) native!)
         (when (= :upload direction)
           (MemorySegment/copy host-seg (long host-off) staging (long 0) (long n-bytes)))
         (native! direction [(+' (:device-pointer buffer) buf-off) staging n-bytes])
@@ -272,10 +293,7 @@
 (defn bind-kernel-call
   ([kernel-call] (bind-kernel-call kernel-call {}))
   ([kernel-call {:keys [adopt-cleanup! async?]}]
-   (when async?
-     (throw (ex-info "CUDA asynchronous prepared calls are unsupported"
-                     {:reason :cuda-unsupported-operation :backend :cuda
-                      :operation :bind-kernel-call :async? true})))
+   (prepared-execution/assert-admitted! (:prepared-execution @state))
    (let [{:keys [kernel-name abi pairs pointer-pairs] :as plan} (call/binding-plan kernel-call)
          registered (or (get @kernel-registry kernel-name)
                         (throw (ex-info "Kernel not registered" {:kernel-name kernel-name})))
@@ -289,20 +307,25 @@
          _ (abi/validate-physical-pointer-dtypes! abi (mapv :dtype buffers))
          _ (call/validate-resident-output-capacities! kernel-call plan registered (fn [b _] (:n-elements b)))
          arena-slot (cleanup/acquisition-slot) module-slot (cleanup/acquisition-slot) token (random-uuid)
-         pinned (atom []) graph-borrows (atom #{})]
+         pinned (atom []) graph-borrows (atom #{})
+         pending (prepared-execution/binding-state)]
      (cleanup/with-registry-use kernel-registry
        (cleanup/assert-registration-current! kernel-registry kernel-name registered)
        (root/construct-child!
-        state [{:id :parameter-arena
+        state [{:id :pending-completion
                 :release #(do
                             (assert-unborrowed! graph-borrows :cuda-prepared-in-use
                                                 "CUDA prepared call is retained by a graph")
-                            (cleanup/release-native! arena-slot (fn [a] (.close a))))}
+                            (prepared-execution/drain! (:prepared-execution @state) pending
+                                                       (:stream @state) native!))}
+               {:id :parameter-arena :after #{:pending-completion}
+                :release #(cleanup/release-native! arena-slot (fn [a] (.close a)))}
                {:id :module :after #{:parameter-arena}
                 :release #(cleanup/release-native! module-slot (fn [m] (native! :module-unload [m])))}
                {:id :bindings :after #{:module}
                 :release #(doseq [borrow @pinned] (swap! borrow disj token))}]
         (fn [_ entry]
+          (prepared-execution/assert-admitted! (:prepared-execution @state))
           (let [compiled (compiled! registered)
                 module (cleanup/acquire-native! module-slot #(native! :module-load [(:ptx compiled)]))
                 function (native! :module-function [module kernel-name])
@@ -313,6 +336,7 @@
             (doseq [[index [slot value]] (map-indexed vector pairs)]
               (.set parameters ValueLayout/ADDRESS (long (* index 8)) (parameter! arena slot value)))
             {:function function :parameters parameters :geometry (:geometry kernel-call)
+             :async? (boolean async?) :pending pending
              :graph-borrows graph-borrows
              :kernel-call kernel-call :binding-plan plan :kernel-name kernel-name
              :compilation-identity (select-keys compiled [:nvrtc-version :virtual-architecture
@@ -326,9 +350,11 @@
   prepared)
 
 (defn launch-registered-bound! [prepared]
-  (assert-prepared-live! prepared)
-  (native! :launch [(:function prepared) (:geometry prepared) (:parameters prepared) (:stream @state)])
-  (native! :stream-sync [(:stream @state)]))
+  (prepared-execution/submit!
+   (:prepared-execution @state) (:pending prepared) (:stream @state) native!
+   #(assert-prepared-live! prepared)
+   :launch [(:function prepared) (:geometry prepared) (:parameters prepared) (:stream @state)]
+   (:async? prepared)))
 
 (defn destroy-prepared! [prepared]
   (assert-unborrowed! (:graph-borrows prepared) :cuda-prepared-in-use "CUDA prepared call is retained by a graph")
@@ -353,7 +379,9 @@
 (defn replay-graph! [graph]
   (let [token (submit-graph! graph)]
     (try (await-event! token) (finally (release-event! token)))))
-(defn synchronize-async! [] (ensure-init!) (native! :stream-sync [(:stream @state)]))
+(defn synchronize-async! []
+  (ensure-init!)
+  (prepared-execution/synchronize! (:prepared-execution @state) (:stream @state) native!))
 (defn transfer-capabilities []
   {:submission :device-event :host-staging :runtime-owned-native :staging-memory :pinned
    :independent-physical-queue? false :queue-ordering :in-order
@@ -372,7 +400,46 @@
 (defn submit-range-batch!
   ([entries direction] (submit-range-batch! entries direction {}))
   ([entries direction opts]
-   (transfer/submit-range-batch! state entries direction opts native! assert-buffer-live! plan-range)))
-(defn copy-buffer-range! [& _] (unsupported! :copy-buffer-range!))
+   (locking state
+     (prepared-execution/assert-admitted! (:prepared-execution @state))
+     (transfer/submit-range-batch! state entries direction opts native! assert-buffer-live! plan-range))))
+(defn copy-buffer-range! [src dst src-element dst-element elements]
+  (assert-buffer-live! src) (assert-buffer-live! dst)
+  (when-not (= (:dtype src) (:dtype dst))
+    (throw (ex-info "CUDA resident copy requires matching storage dtypes" {:reason :cuda-copy-dtype})))
+  (when-not (and (every? #(and (integer? %) (<= 0 % Long/MAX_VALUE)) [src-element dst-element elements])
+                 (<= (+' src-element elements) (:n-elements src))
+                 (<= (+' dst-element elements) (:n-elements dst)))
+    (throw (ex-info "CUDA resident copy range is invalid" {:reason :cuda-copy-range})))
+  (let [width (dtype/bytes-of (:dtype src)) src-byte (*' src-element width)
+        dst-byte (*' dst-element width) bytes (*' elements width)
+        src-view (view/subview (:view src) {:byte-offset src-byte :shape [elements]})
+        dst-view (view/subview (:view dst) {:byte-offset dst-byte :shape [elements]})]
+    (when (view/overlaps? src-view dst-view)
+      (throw (ex-info "CUDA resident copies cannot overlap" {:reason :cuda-copy-overlap})))
+    (when (pos? bytes)
+      (let [ledger (:prepared-execution @state) stream (:stream @state)
+            pending (prepared-execution/binding-state) pins (atom []) token (random-uuid)
+            owner-value
+            (root/construct-child!
+             state [{:id :completion :release #(prepared-execution/drain! ledger pending stream native!)}
+                    {:id :bindings :after #{:completion}
+                     :release #(doseq [borrow @pins] (swap! borrow disj token))}]
+             (fn [_ _]
+               (doseq [buffer (distinct [src dst])]
+                 (assert-buffer-live! buffer)
+                 (swap! pins conj (:borrows buffer))
+                 (swap! (:borrows buffer) conj token)
+                 (assert-buffer-live! buffer))
+               (prepared-execution/submit!
+                ledger pending stream native! #(do (assert-buffer-live! src) (assert-buffer-live! dst))
+                :copy [(+' (:device-pointer dst) dst-byte) (+' (:device-pointer src) src-byte) bytes stream] false)
+               {})
+             #(prepared-execution/retain-debt! ledger %))]
+        (try (cleanup/release! (::cleanup/owner owner-value))
+             (catch Throwable failure
+               (prepared-execution/retain-debt! ledger (::cleanup/owner owner-value))
+               (throw failure)))))
+    dst))
 (defn shutdown! [] (root/shutdown-construction! state))
 (defn reset! [] (shutdown!))

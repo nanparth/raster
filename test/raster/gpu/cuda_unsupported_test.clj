@@ -7,7 +7,7 @@
   (binding [driver/*invoke* (fn [& _] (throw (ex-info "unexpected native contact" {})))]
     (doseq [operation '[invoke-registered-kernel invoke-registered-map-void-kernel
                        bind-registered-map-void-kernel register-kernel-dispatch!
-                       kernel-dispatch-registry-entry copy-buffer-range!]]
+                       kernel-dispatch-registry-entry]]
       (let [function (ns-resolve 'raster.gpu.cuda-runtime operation)]
         (is (some? function) (str operation " must report an explicit unsupported route"))
         (when function

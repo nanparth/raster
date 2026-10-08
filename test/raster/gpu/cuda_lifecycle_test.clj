@@ -187,7 +187,7 @@
           (is (identical? host (runtime/download-range! buffer host {:elements 0})))
           (finally (runtime/free-buffer! buffer)))))))
 
-(deftest unsupported-prepared-async-request-rejects-before-compilation-and-driver-contact
+(deftest prepared-async-still-validates-scalar-types-before-compilation-and-driver-contact
   (with-driver
     (fn [ops _]
       (let [a (kernel) buffer (runtime/make-buffer 4 :float)
@@ -200,15 +200,15 @@
                   error (try
                           (reset! unexpected-prepared
                                   (runtime/bind-kernel-call
-                                   (call/make a [{:type :float :value (float 2)} buffer])
+                                   (assoc (call/make a [{:type :float :value (float 2)} buffer])
+                                          :arguments [{:type :int :value 2} buffer])
                                    {:async? true}))
                           nil
                           (catch clojure.lang.ExceptionInfo e (ex-data e)))]
-              (is (= {:reason :cuda-unsupported-operation :backend :cuda
-                      :operation :bind-kernel-call :async? true}
-                     error))
-              (is (zero? @compiled) "unsupported option must reject before compiler contact")
-              (is (= before (count @ops)) "unsupported option must reject before driver contact")))
+              (is (= :float (:expected error)))
+              (is (= :int (:actual error)))
+              (is (zero? @compiled) "invalid ABI value must reject before compiler contact")
+              (is (= before (count @ops)) "invalid ABI value must reject before driver contact")))
           (finally
             (when-let [p @unexpected-prepared] (runtime/destroy-prepared! p))
             (runtime/free-buffer! buffer)
