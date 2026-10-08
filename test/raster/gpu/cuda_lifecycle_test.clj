@@ -3,6 +3,7 @@
             [raster.compiler.ir.kernel-abi :as abi]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-call :as call]
+            [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.gpu.cuda-driver :as driver]
             [raster.gpu.cuda-nvrtc :as nvrtc]
@@ -313,3 +314,70 @@
               (when @next-token (runtime/release-event! @next-token)))
             (finally (runtime/destroy-graph! graph) (runtime/destroy-prepared! prepared)
                      (runtime/free-buffer! buffer) (runtime/close-kernel-arena! nil))))))))
+
+
+(defn- session-executable [graph?]
+  (let [a (kernel)]
+    (if graph?
+      (graph/make {:inputs [(graph/buffer 'x :float 4 :device :inout)]
+                   :scalars [(graph/scalar 's :float)]
+                   :nodes [(graph/->ScheduledKernel :only a
+                                                   [(graph/->ValueUse 'x :read-write)] #{'s} [])]
+                   :abi (:abi a) :arguments (:arguments a)})
+      a)))
+
+(defn- bind-session-executable! [session executable direct?]
+  (if direct?
+    (if (graph/kernel-graph? executable)
+      (gpu/bind-kernel-graph! session :owned executable {'x :data} {'s {:type :float :value (float 2)}})
+      (gpu/bind-kernel-call! session :owned executable [{:type :float :value (float 2)} :data]))
+    (gpu/bind-step! session
+                  {:convention :executable :phase :owned :kernel-name "lifetime_contract"
+                   :artifact executable
+                   :argument-specs [{:kind :scalar :sym 's :type :float
+                                     :value-fn (constantly (float 2))}
+                                    {:kind :inout :sym 'x}]}
+                  [] {'x :data})))
+
+(deftest modern-session-registration-owns-its-explicit-arena
+  (doseq [graph? [false true] ambient? [false true] direct? [false true]]
+    (with-driver
+      (fn [_ _]
+        (let [session (gpu/make-session :cuda:0)
+              foreign (when ambient? (runtime/make-kernel-arena!))]
+          (gpu/alloc! session {:data [:float 4 nil]})
+          (binding [runtime/*current-arena* foreign]
+            (bind-session-executable! session (session-executable graph?) direct?))
+          (is (= (:arena-id @session)
+                 (:arena-id (get @runtime/kernel-registry "lifetime_contract")))
+              "session ownership is independent of an absent or foreign dynamic arena")
+          (gpu/close-session! session)
+          (is (empty? @runtime/kernel-registry))
+          (is (= 0 (root/lease-count runtime/state)))
+          ;; Isolated host-spy cleanup after assertions, including a failing implementation.
+          (runtime/close-kernel-arena! foreign))))))
+
+(deftest same-artifact-in-independent-sessions-keeps-prepared-native-lifetimes
+  (doseq [graph? [false true] direct? [false true]]
+    (with-driver
+      (fn [operations _]
+        (let [first-session (gpu/make-session :cuda:0)
+              second-session (gpu/make-session :cuda:0)
+              executable (session-executable graph?)]
+          (gpu/alloc! first-session {:data [:float 4 nil]})
+          (gpu/alloc! second-session {:data [:float 4 nil]})
+          (let [first-handle (binding [runtime/*current-arena* (:arena-id @second-session)]
+                               (bind-session-executable! first-session executable direct?))
+                second-handle (binding [runtime/*current-arena* (:arena-id @first-session)]
+                                (bind-session-executable! second-session executable direct?))]
+          (if direct? (gpu/run-kernel-graph! first-session first-handle)
+              (gpu/invoke-bound! first-session :owned))
+          (gpu/close-session! first-session)
+          (is (= (:arena-id @second-session)
+                 (:arena-id (get @runtime/kernel-registry "lifetime_contract"))))
+          (if direct? (gpu/run-kernel-graph! second-session second-handle)
+              (gpu/invoke-bound! second-session :owned))
+          (is (= 2 (count (filter #(= :launch (first %)) @operations))))
+          (gpu/close-session! second-session)
+          (is (empty? @runtime/kernel-registry))
+          (is (= 0 (root/lease-count runtime/state)))))))))

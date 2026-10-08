@@ -834,7 +834,7 @@
               {#'raster.gpu.core/rt-resolve
                (fn [_ function-name]
                  (case function-name
-                   "register-kernel!" (fn [_ _])
+                   "register-kernel!" (fn [_ _ & [_arena]])
                    "bind-kernel-call" (fn [call & _]
                                         (assoc call ::cleanup/owner (cleanup/owner [])))
                    (throw (ex-info "unexpected runtime resolution"
@@ -873,7 +873,7 @@
         resolver
         (fn [_ function-name]
           (case function-name
-            "register-kernel!" (fn [_ _])
+            "register-kernel!" (fn [_ _ & [_arena]])
             "make-buffer" (fn [elements dtype opts]
                             (lifecycle/native-buffer #(hash-map :elements elements :dtype dtype)
                                                      #(swap! freed conj %) opts))

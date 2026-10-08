@@ -96,7 +96,7 @@
             "buffer-as-float-buffer" identity
             "buffer-as-int-buffer" identity
             "free-buffer!" #(swap! freed conj %)
-            "register-kernel!" (fn [kernel-name artifact]
+            "register-kernel!" (fn [kernel-name artifact & [_arena]]
                                  (swap! registered conj [kernel-name artifact]))
             "bind-kernel-call" (fn [call & _]
                                  (let [prepared {:mock-call call}]
@@ -203,7 +203,7 @@
         resolver
         (fn [_ name]
           (case name
-            "register-kernel!" (fn [kernel-name emitted]
+            "register-kernel!" (fn [kernel-name emitted & [_arena]]
                                  (swap! registered conj [kernel-name emitted]))
             "bind-kernel-call" (fn [call & _] {:kernel-call call})
             "record-graph!" (fn [prepared opts]
