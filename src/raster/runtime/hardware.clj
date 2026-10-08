@@ -230,15 +230,27 @@
                 (let [dev-name (:name dev-info)
                       catalogue-spec (catalogue/find-gpu-spec dev-name)
                       probed (into {} (remove (comp nil? val))
-                                   {:compute-capability (:compute-capability dev-info)
-                                    :driver-api-version (:driver-api-version probe)})
-                      caps (merge catalogue-spec probed)
+                                   (merge (:attributes dev-info)
+                                          {:compute-capability (:compute-capability dev-info)
+                                           :driver-api-version (:driver-api-version probe)}))
+                      ;; A thread-derived residency upper bound, not achieved occupancy.
+                      threads (:max-threads-per-sm probed)
+                      warp (:warp-size probed)
+                      warps (when (and (pos-int? threads) (pos-int? warp)
+                                       (zero? (rem threads warp)))
+                              (quot threads warp))
+                      caps (cond-> (merge catalogue-spec probed)
+                             warps (assoc :max-warps-per-sm warps))
                       source (merge
+                              (into {} (map (fn [k] [k :unavailable]))
+                                    (keys (:attribute-errors dev-info)))
                               (into {} (map (fn [k] [k :catalogued])) (keys catalogue-spec))
-                              (into {} (map (fn [k] [k :detected])) (keys probed)))]
+                              (into {} (map (fn [k] [k :detected])) (keys probed)))
+                      source (cond-> source warps (assoc :max-warps-per-sm :derived))]
                   {:id :cuda:0 :type :cuda :index 0 :name dev-name
                    :driver-api-version (:driver-api-version probe)
-                   :capabilities caps :source source}))
+                   :capabilities caps :source source
+                   :probe-diagnostics (:attribute-errors dev-info)}))
               (filter #(= 0 (:ordinal %)) (:devices probe)))
         (do
           (when (and (= :driver-error (:status probe)) (System/getenv "ROMEO_DEBUG"))

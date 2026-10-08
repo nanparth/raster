@@ -10,6 +10,40 @@
 ;; Reset hardware state between tests
 (use-fixtures :each hardware-fixture/isolated)
 
+(deftest cuda-observed-limits-reach-the-shared-compiler-descriptor
+  (let [attributes {:sm-count 40 :warp-size 32 :max-threads-per-block 1024
+                    :max-threads-per-sm 1536 :max-blocks-per-sm 16
+                    :registers-per-block 65536 :registers-per-sm 65536
+                    :shared-memory-per-block 49152 :shared-memory-per-sm 102400
+                    :global-memory-bytes 8222998528
+                    :max-workgroup-dims [1024 1024 64]}
+        device (with-redefs [cuda-probe/probe
+                             (constantly {:status :ready :driver-api-version 13020
+                                          :devices [{:ordinal 0 :name "NVIDIA A100"
+                                                     :compute-capability [8 6]
+                                                     :attributes attributes}]})]
+                 (first (#'hw/detect-cuda-devices)))
+        descriptor (with-redefs [hw/device (constantly device)]
+                     (chw/descriptor-for :cuda:0))]
+    (doseq [[key value] attributes]
+      (is (= value (get-in device [:capabilities key])) (str key))
+      (is (= :detected (get-in device [:source key])) (str key)))
+    (is (= 48 (get-in device [:capabilities :max-warps-per-sm])))
+    (is (= :derived (get-in device [:source :max-warps-per-sm])))
+    (is (= {:sm-count 40 :max-warps-per-sm 48 :max-blocks-per-sm 16
+            :registers-per-block 65536 :shared-memory-per-block 49152
+            :subgroup-size 32 :max-workgroup-size 1024}
+           (select-keys descriptor [:sm-count :max-warps-per-sm :max-blocks-per-sm
+                                    :registers-per-block :shared-memory-per-block
+                                    :subgroup-size :max-workgroup-size])))
+    (is (= [1024 1024 64] (get-in descriptor [:execution :max-workgroup-dims])))
+    (is (= :detected (get-in descriptor [:execution :provenance :scratchpad-bytes])))
+    (is (= 8222998528 (:global-memory-bytes descriptor)))
+    (is (= 1280 (chw/grid-size descriptor 1000000 32))
+        "resident-block bound limits this direct launch helper")
+    (is (= 80 (chw/grid-size descriptor 1000000 1024))
+        "resident-warp bound limits this direct launch helper")))
+
 (deftest cuda-discovery-retains-driver-facts-and-field-provenance
   (let [detected (with-redefs [cuda-probe/probe
                               (constantly {:status :ready :driver-api-version 13020
@@ -32,6 +66,22 @@
     (is (= 108 (get-in device [:capabilities :sm-count])))
     (is (= :catalogued (get-in device [:source :sm-count])))
     (is (= :detected (get-in device [:source :driver-api-version])))))
+
+(deftest cuda-unavailable-attributes-retain-diagnostics-and-labelled-fallbacks
+  (doseq [[name expected-value expected-source]
+          [["unknown fixture GPU" nil :unavailable] ["NVIDIA A100" 108 :catalogued]]]
+    (let [diagnostics {:sm-count [{:reason :cuda-driver-attribute-unavailable
+                                  :attribute 16 :error-code 1}]}
+          device (with-redefs [cuda-probe/probe
+                               (constantly {:status :ready :driver-api-version 13020
+                                            :devices [{:ordinal 0 :name name
+                                                       :compute-capability [8 6]
+                                                       :attribute-errors diagnostics}]})]
+                   (first (#'hw/detect-cuda-devices)))]
+      (is (= expected-value (get-in device [:capabilities :sm-count])))
+      (is (= expected-source (get-in device [:source :sm-count])))
+      (is (= diagnostics (:probe-diagnostics device)))
+      (is (nil? (get-in device [:capabilities :max-warps-per-sm]))))))
 
 (deftest cuda-discovery-never-registers-unavailable-or-failed-probes
   (doseq [status [:unavailable :no-device :driver-error]]
