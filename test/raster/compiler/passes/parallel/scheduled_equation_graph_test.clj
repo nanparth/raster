@@ -2,6 +2,10 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.coverage :as coverage]
+            [raster.compiler.core.hardware :as hardware]
+            [raster.dl.array-ops :as array-ops]
+            [raster.dl.loss :as loss]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
@@ -16,6 +20,7 @@
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as route]
+            [raster.compiler.passes.parallel.typed-soac-resident :as resident]
             [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.dl.nn :as nn]))
 
@@ -493,3 +498,138 @@
     (is (= :segmented-plan-equation-boundary
            (reason-of #(equation-graph/make-for-plan-equation
                         parallel-program (assoc equation :operations [:not-the-plan])))))))
+
+(def ^:private scalar-source-target
+  ;; Recorded NVIDIA OpenCL compilation snapshot; this test makes no device calls.
+  {:integrated? false, :vendor "NVIDIA Corporation", :has-native-dot-reduce true, :subgroup-sizes #{}, :execution {:subgroup-kind :subgroup, :subgroup-sizes #{}, :preferred-subgroup-size nil, :max-workgroup-size 1024, :provenance {:subgroup-sizes :unavailable, :preferred-subgroup-size :derived, :max-workgroup-size :detected}}, :capability-provenance {:integrated? :detected, :vendor :detected, :max-clock-mhz :detected, :global-mem-bytes :detected, :max-work-group-size :detected, :driver-version :detected, :extensions :detected, :max-compute-units :detected, :version :detected}, :device-id :ocl:0, :compute-units 40, :llc-bytes 8222998528, :calibration-version 2, :device-type :gpu, :global-memory-bytes 8222998528, :balance 60, :driver-version "595.91.07", :device-name "NVIDIA GeForce RTX 3070 Laptop GPU", :num-vector-registers 128, :max-workgroup-size 1024, :backend :ocl})
+
+(deftest actual-terminal-and-ordered-scalar-sources-have-executable-device-schedules
+  (let [realize resident/realize
+        realizations (atom [])]
+    (with-redefs [hardware/descriptor-for
+                  (fn [device]
+                    (is (= :ocl:0 device))
+                    scalar-source-target)
+                  resident/realize
+                  (fn [before]
+                    (let [[after stats :as result] (realize before)]
+                      (swap! realizations conj [before after])
+                      result))]
+      (doseq [source [#'array-ops/masked-mse-loss #'loss/cross-entropy-loss
+                       #'nn/l2-normalize! #'nn/softmax-1d #'nn/softmax-1d-backward]]
+        (reset! realizations [])
+        (let [row (coverage/report-var source {:target-device :ocl:0 :dtype :float})]
+          (is (not= :error (:route row)) (pr-str row))
+          (is (:typed-validated row) (pr-str row))
+          (is (pos? (get-in row [:emission :routes :kernel-body] 0))
+              "the normal registered source must emit checked device artifacts, not host buffer reads")
+          (when (= source #'array-ops/masked-mse-loss)
+            (let [products (for [[before after] @realizations
+                                 equation (soac/equations before)
+                                 :when (= 'product-reduce (soac/operation-kind equation))
+                                 :let [preserved (first (filter #(= (second equation) (second %))
+                                                               (soac/equations after)))]]
+                             [equation preserved])]
+              (is (= 1 (count products)) "the actual loss keeps its checked product reduction")
+              (doseq [[before after] products]
+                (is (= before after) "both independent product lambdas remain unchanged")
+                (is (some? (:combine-lambda (soac/operation-parts after)))))))
+          (when (= source #'nn/softmax-1d-backward)
+            (let [folds
+                  (for [[before after] @realizations
+                        equation (soac/equations before)
+                        :when (and (= 'scalar (soac/operation-kind equation))
+                                   (some #(and (seq? %) (contains? #{'loop 'loop*} (first %)))
+                                         (tree-seq coll? seq equation)))
+                        :let [result (first (nth equation 2))
+                              value (get-in (soac/facts after) [:values result])
+                              preserved (first (filter #(= (second equation) (second %))
+                                                       (soac/equations after)))]]
+                    {:value value :before equation :after preserved})]
+              (is (= 1 (count folds)) "the actual backward source retains one ordered scalar loop region")
+              (doseq [{:keys [value before after]} folds]
+                (is (= before after) "the retained loop order, neutral and per-operation types remain exact")
+                (is (= [] (:shape value)))
+                (is (= :float (:dtype value)))
+                (is (= {:kind :resident-scalar-buffer :elements 1} (:representation value)))
+                (is (= :device (:memory-space value)))))))))))
+
+(deftest compatibility-product-output-contracts-retain-component-types
+  ;; Exact heterogeneous output policy of masked-mse-loss-into!: Double sum and Long count.
+  (let [source '(let* [sums (clojure.core/double-array 1)
+                       counts (clojure.core/long-array 1)
+                       effect
+                       (raster.par/product-reduce!
+                        [sums counts]
+                        [[sum 0.0 :double] [count (long 0) :long]]
+                        [[segment 1]] i n
+                        [active (long (if (not= (clojure.core/aget states i) 1) 1 0))
+                         diff (- (clojure.core/aget pred i) (clojure.core/aget target i))]
+                        [(if (== active 1) (* diff diff) 0.0) active]
+                        [[left-sum right-sum] [left-count right-count]] []
+                        [(+ left-sum right-sum) (unchecked-add left-count right-count)]
+                        {:associative? true :commutative? true :order :implementation-defined})]
+                  effect)
+        options {:dtype :double :target-device :ocl:0
+                 :array-types {'pred :double 'target :double 'states :long}
+                 :scalar-types {'n :long}}
+        schedule (fn [options]
+                   (with-redefs [hardware/descriptor-for (constantly scalar-source-target)]
+                     (:form (segop-lower/segop-lower-pass source options))))
+        scheduled (schedule options)]
+    (is (= :double (get-in scheduled [:values 'sums :dtype])))
+    (is (= :long (get-in scheduled [:values 'counts :dtype])))
+    (is (= [1] (get-in scheduled [:values 'sums :shape])))
+    (is (= [1] (get-in scheduled [:values 'counts :shape])))
+    (is (= :parallel-program-value-conflict
+           (reason-of #(schedule (assoc-in options [:array-types 'counts] :double))))
+        "a caller declaration cannot override the checked component's Long output contract")))
+
+(deftest direct-scheduling-keeps-gpu-scalars-resident-and-cpu-scalars-host
+  (let [source '(let* [effect (raster.par/map-void! i n
+                                (clojure.core/aset out i (clojure.core/aget x i)))
+                       loss (clojure.core/double (clojure.core/aget out 0))] loss)
+        options {:dtype :double :array-types {'x :double 'out :double}
+                 :scalar-types {'n :long 'loss :double}}]
+    (doseq [device [:ocl:0 :cpu:0]]
+      (with-redefs [hardware/descriptor-for (constantly scalar-source-target)]
+        (let [program (:program (segop-lower/schedule-source-program
+                                 source (assoc options :target-device device)))
+              scalar (first (filter #(= [ 'loss] (:results %)) (:equations program)))]
+          (is (some? scalar))
+          (if (= device :ocl:0)
+            (do (is (= {:kind :resident-scalar-buffer :elements 1}
+                       (get-in program [:values 'loss :representation])))
+                (is (seq (:operations scalar)))
+                (is (not (true? (get-in scalar [:attributes :host-only])))))
+            (do (is (empty? (:operations scalar)))
+                (is (true? (get-in scalar [:attributes :host-only]))))))))
+    (let [extent-source '(let* [width (long (clojure.core/aget params 0))
+                                effect (raster.par/map-void! i width
+                                         (clojure.core/aset out i 0.0))] effect)
+          extent-options {:dtype :double :target-device :ocl:0
+                          :array-types {'params :double 'out :double}
+                          :scalar-types {'width :long}}]
+      (is (= :unsupported-device-scalar-read
+             (reason-of #(segop-lower/schedule-source-program extent-source extent-options)))
+          "an unscheduled device-dependent extent must never be evaluated on host tokens"))))
+
+(deftest resident-scalar-conversion-cannot-become-a-host-launch-extent
+  (let [source '(let* [alpha (float (clojure.core/aget params 0))
+                       width (long alpha)
+                       effect (raster.par/map-void! i width
+                                (clojure.core/aset out i 0.0))] effect)
+        options {:dtype :float :array-types {'params :float 'out :float}
+                 :scalar-types {'alpha :float 'width :long}}
+        typed (frontend/form->program source options)]
+    (is (some? typed) "the negative reaches scheduling with a checked scalar dependency")
+    (with-redefs [hardware/descriptor-for (constantly scalar-source-target)]
+      (is (= :unsupported-device-scalar-read
+             (reason-of #(segop-lower/schedule-source-program
+                          source (assoc options :target-device :ocl:0))))
+          "a floating resident read converted to an extent cannot be evaluated on host tokens")
+      (let [cpu (:program (segop-lower/schedule-source-program
+                           source (assoc options :target-device :cpu:0)))]
+        (is (some? cpu))
+        (is (not-any? #(= :resident-scalar-buffer (get-in % [:representation :kind]))
+                      (vals (:values cpu))))))))

@@ -1,6 +1,7 @@
 (ns raster.gpu.cuda-training-device-test
   "Portable tiny linear/MSE/SGD reference and opt-in resident CUDA donation proof."
-  (:require [clojure.test :refer [deftest is]]
+  (:require [raster.gpu.device-probe :as device-probe]
+            [clojure.test :refer [deftest is]]
             [raster.ad.reverse :as ad]
             [raster.arrays :as arrays]
             [raster.compiler.ir.invocation-link :as invocation-link]
@@ -288,7 +289,7 @@
 
 (deftest public-cuda-tiny-training-donates-resident-weights-without-replay-uploads
   (if-not (= "1" (System/getenv "RASTER_REQUIRE_CUDA_DEVICE"))
-    (println "[CUDA SKIP] tiny training qualification requires RASTER_REQUIRE_CUDA_DEVICE=1")
+    (device-probe/cuda-skip! "tiny training qualification requires RASTER_REQUIRE_CUDA_DEVICE=1" :not-requested)
     (let [device (probe/probe)]
       (is (= :ready (:status device)) "required training execution cannot skip an absent device")
       (when (= :ready (:status device)) (prove-resident-training!)))))
@@ -334,7 +335,7 @@
 
 (deftest public-cuda-ad-weight-gradient-matches-two-exact-dyadic-cases
   (if-not (= "1" (System/getenv "RASTER_REQUIRE_CUDA_DEVICE"))
-    (println "[CUDA SKIP] direct AD gradient qualification requires RASTER_REQUIRE_CUDA_DEVICE=1")
+    (device-probe/cuda-skip! "direct AD gradient qualification requires RASTER_REQUIRE_CUDA_DEVICE=1" :not-requested)
     (let [device (probe/probe)]
       (is (= :ready (:status device)))
       (when (= :ready (:status device)) (prove-public-dyadic-weight-gradient!)))))
@@ -408,14 +409,14 @@
 
 (deftest public-cuda-primal-loss-matches-two-exact-dyadic-cases
   (if-not (= "1" (System/getenv "RASTER_REQUIRE_CUDA_DEVICE"))
-    (println "[CUDA SKIP] primal loss qualification requires RASTER_REQUIRE_CUDA_DEVICE=1")
+    (device-probe/cuda-skip! "primal loss qualification requires RASTER_REQUIRE_CUDA_DEVICE=1" :not-requested)
     (let [device (probe/probe)]
       (is (= :ready (:status device)))
       (when (= :ready (:status device)) (prove-public-dyadic-primal!)))))
 
 (deftest public-cuda-mse-retains-double-division-precision
   (if-not (= "1" (System/getenv "RASTER_REQUIRE_CUDA_DEVICE"))
-    (println "[CUDA SKIP] Double division qualification requires RASTER_REQUIRE_CUDA_DEVICE=1")
+    (device-probe/cuda-skip! "Double division qualification requires RASTER_REQUIRE_CUDA_DEVICE=1" :not-requested)
     (let [device (probe/probe)]
       (is (= :ready (:status device)))
       (when (= :ready (:status device)) (prove-public-double-division!)))))

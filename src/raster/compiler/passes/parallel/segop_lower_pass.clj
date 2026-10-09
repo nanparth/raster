@@ -12,6 +12,7 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.runtime.hardware :as hardware]
             [raster.compiler.ir.par :as par]
+            [raster.compiler.ir.kernel-launch :as kernel-launch]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.ir.abstract-value :as av]
@@ -134,7 +135,17 @@
   [id node dtype array-types scalar-types result?]
   (let [array-ids (set/union (or (soac/soac-inputs node) #{})
                              (or (soac/soac-outputs node) #{}))
+        output-component (when (and (soac/soac-reduce? node)
+                                    (not (reduction/scalar? (:reduction node))))
+                           (some #(when (= id (:result %)) %) (:components (:reduction node))))
+        output-extent (when output-component
+                        (let [axes (mapv second (:segment-axes node))]
+                          (cond
+                            (empty? axes) 1
+                            (= 1 (count axes)) (first axes)
+                            :else (apply kernel-launch/product axes))))
         shape (cond
+                output-component (soac-dialect/extent-shape output-extent)
                 result? (result-shape node)
                 ;; A scalar reduction's indexed reads are certified over its reduction extent.
                 ;; Retain that minimum physical capacity instead of the compatibility `?` shape;
@@ -144,8 +155,15 @@
                 :else [])
         type-id (if (and result? (soac/contract? node)) (get-in node [:facts :out]) id)
         declared-types (if (contains? array-ids type-id) array-types scalar-types)
-        value-dtype (or (get declared-types type-id)
-                        (when (symbol? type-id) (get declared-types (symbol (name type-id))))
+        declared-dtype (or (get declared-types type-id)
+                           (when (symbol? type-id) (get declared-types (symbol (name type-id)))))
+        component-dtype (:dtype output-component)
+        _ (when (and declared-dtype component-dtype
+                     (not= declared-dtype component-dtype))
+            (throw (ex-info "declared storage disagrees with the checked reduction component"
+                            {:reason :parallel-program-value-conflict :id id
+                             :declared-dtype declared-dtype :component-dtype component-dtype})))
+        value-dtype (or component-dtype declared-dtype
                         (:elem-type node)
                         dtype
                         :double)]
@@ -349,8 +367,12 @@
           values (:values (soac-dialect/facts algorithm))
           tensor-parameters (into {}
                                   (keep (fn [[parameter capture]]
-                                          (when (seq (:shape (get values capture)))
-                                            [parameter capture])))
+                                          (let [value (get values capture)]
+                                            (when (or (seq (:shape value))
+                                                      (and (= :device (:memory-space value))
+                                                           (= :resident-scalar-buffer
+                                                              (get-in value [:representation :kind]))))
+                                              [parameter capture]))))
                                   (map vector parameters captures))
           expressions (concat (map :init locals) body-results)
           read-buffers (set (keep (fn [form]
@@ -399,8 +421,16 @@
                     kind (soac-dialect/operation-kind
                           (first (soac-dialect/equations scheduling-algorithm)))
                     lowered (case kind
-                              scalar (do (check-host-scalar-schedule! scheduling-algorithm equation device-id)
-                                         {:operations []})
+                              scalar (if (and (contains? #{:cuda :ocl :ze :hip} (hardware/device-type device-id))
+                                              (every? #(= :resident-scalar-buffer
+                                                          (get-in (soac-dialect/facts scheduling-algorithm)
+                                                                  [:values % :representation :kind]))
+                                                      (soac-dialect/outputs scheduling-algorithm)))
+                                       {:operations (soac-lower/lower-typed-scalar
+                                                     scheduling-algorithm device-id
+                                                     :target-descriptor target-descriptor)}
+                                       (do (check-host-scalar-schedule! scheduling-algorithm equation device-id)
+                                           {:operations []}))
                               contract {:operations (soac-lower/lower-typed-contract
                                                       scheduling-algorithm device-id)}
                               map {:operations (soac-lower/lower-typed-map
@@ -447,7 +477,7 @@
                         (update :attributes assoc :device device-id)
                         (cond-> (:kernel-graph lowered)
                           (update :attributes assoc :kernel-graph (:kernel-graph lowered)))
-                        (cond-> (= 'scalar kind)
+                        (cond-> (and (= 'scalar kind) (empty? operations))
                           (update :attributes assoc :host-only true)))
                     result-storage (zipmap (:results equation)
                                            (equation-physical-results algorithm))]
@@ -522,7 +552,7 @@
             device-id (:target-device opts)
             target-descriptor (:target-descriptor opts)
             dtype (:dtype opts)
-            array-types (:array-types opts)
+            array-types (atom (:array-types opts))
             scalar-types (:scalar-types opts)
             lowered (atom 0)
             graphs-lowered (atom 0)
@@ -532,9 +562,19 @@
             declined (atom [])
             attempt (fn [sym init]
                       (let [r (lower-attempt sym init device-id target-descriptor dtype
-                                             array-types scalar-types)]
+                                             @array-types scalar-types)]
                         (when-let [d (:declined r)] (swap! declined conj d))
-                        (when (:segops r) r)))
+                        (when (:segops r)
+                          (let [node (:soac r)]
+                            (when (and (soac/soac-reduce? node)
+                                       (not (reduction/scalar? (:reduction node))))
+                              (doseq [{:keys [result dtype]} (:components (:reduction node))
+                                      :when (symbol? result)]
+                                ;; Validate the existing declaration before enriching subsequent
+                                ;; uses with the checked definition; never overwrite a contradiction.
+                                (value-contract result node (:dtype opts) @array-types scalar-types false)
+                                (swap! array-types assoc result dtype))))
+                          r)))
             binding-equations
             (keep-indexed
              (fn [idx [sym init]]
@@ -542,7 +582,7 @@
                  (swap! lowered inc)
                  (when (:kernel-graph lowered-values) (swap! graphs-lowered inc))
                  (equation idx [:binding sym] sym init lowered-values
-                           dtype array-types scalar-types)))
+                           dtype @array-types scalar-types)))
              pairs)
           ;; Also check body expressions for par forms
             body-equations
@@ -553,7 +593,7 @@
                    (swap! lowered inc)
                    (when (:kernel-graph lowered-values) (swap! graphs-lowered inc))
                    (equation (+ (count pairs) idx) [:body idx] tmp-sym expr
-                             lowered-values dtype array-types scalar-types))))
+                             lowered-values dtype @array-types scalar-types))))
              body-exprs)
             equations (vec (concat binding-equations body-equations))]
         {:form (build-program (list* let-sym bindings-vec body-exprs)
@@ -626,7 +666,9 @@
   (let [typed-result
         (typed-route/attempt
          source (or (:dtype opts) :double) (:array-types opts)
-         {:resident-reductions? (true? (:resident-reductions? opts))
+         {:resident-reductions? (or (true? (:resident-reductions? opts))
+                                    (contains? #{:cuda :ocl :ze :hip}
+                                               (hardware/device-type (:target-device opts))))
           :scalar-types (:scalar-types opts)
           :values (:values opts)
           :abstract-machine (:abstract-machine opts)})

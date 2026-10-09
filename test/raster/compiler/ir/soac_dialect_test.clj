@@ -3,6 +3,7 @@
             [pattern.nanopass.dialect :as pattern-dialect]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.scan :as scan]
+            [raster.compiler.ir.write-coverage :as coverage]
             [raster.compiler.ir.soac-dialect :as dialect]))
 
 (def ^:private tensor
@@ -68,6 +69,39 @@
     (is (nil? (shape (assoc-in resident [:representation :elements] 2))))
     (is (nil? (shape (assoc resident :shape [1]))))
     (is (nil? (shape (assoc resident :logical-layout {:kind :strided}))))))
+
+(deftest retained-floating-scalar-coverage-requires-exact-self-owned-domain
+  (doseq [dtype [:float :double]]
+    (let [resident (av/tensor {:dtype dtype :shape [] :memory-space :device
+                               :representation {:kind :resident-scalar-buffer :elements 1}})
+          facts (dialect/default-program-facts
+                 {:values {'out (av/tensor {:dtype dtype :shape [1]}) 'result resident}
+                  :inputs '[out] :equations {'terminal (dialect/default-equation-facts)}})
+          equation (list '= 'terminal '[result]
+                         (list 'scalar {:dtypes [dtype]} '[out]
+                               (dialect/lambda-form '[source] ['(clojure.core/aget source 0)])))
+          program (dialect/make facts [equation] '[result])
+          shape #(dialect/dense-functional-result-shape % equation 'result)]
+      (is (= program (dialect/validate! program)))
+      (is (= [] (shape program)) "the checked retained scalar writes its sole logical element")
+      (is (true? (coverage/dense-result-covers? program 'result 1 identity)))
+      (doseq [capacity [0 2]]
+        (is (not (coverage/dense-result-covers? program 'result capacity identity))))
+      (doseq [value [(assoc resident :memory-space :host)
+                    (assoc resident :representation {:kind :plain})
+                    (assoc-in resident [:representation :elements] 0)
+                    (assoc-in resident [:representation :elements] 2)
+                    (assoc resident :shape [1])
+                    (assoc resident :dtype :long)
+                    (assoc resident :logical-layout {:kind :strided})]]
+        (is (nil? (shape (assoc-in facts [:values 'result] value)))))
+      (is (nil? (dialect/dense-functional-result-shape program equation 'out)))
+      (is (nil? (shape (-> facts
+                          (assoc-in [:values 'other] resident)
+                          (assoc-in [:equations 'terminal :aliases] {'result 'other})
+                          (assoc-in [:equations 'terminal :attributes :result-storage]
+                                    [{:destination 'other :access :write :host-return :buffer}]))))
+          "coverage cannot silently credit a different physical result"))))
 
 (deftest typed-soac-is-a-pattern-declared-recursive-dialect
   (let [program (map-program)]

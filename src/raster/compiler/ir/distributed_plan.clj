@@ -12,11 +12,14 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.abstract-value :as abstract-value]
+            [raster.compiler.ir.buffer-view :as buffer-view]
             [raster.compiler.ir.distributed-compute :as compute]
             [raster.compiler.ir.distributed-readiness :as readiness]
             [raster.compiler.ir.execution-plan :as execution-plan]
             [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.ir.numerical-contract :as numerical-contract]
             [raster.compiler.ir.scan :as scan]
+            [raster.compiler.passes.parallel.collective-combine :as collective-arithmetic]
             [raster.compiler.ir.validate :refer [fail! finite-number? non-negative-number?
                                                   positive-number? unique-by!]]))
 
@@ -37,6 +40,7 @@
 (defrecord CollectiveOperation [id kind group value reduction root attributes])
 (defrecord CollectiveSchedule [algorithm rounds numerical-mode attributes])
 (defrecord ScheduledCollective [operation schedule dependencies steps completions])
+(defrecord CollectiveRefinement [operation group value numerical inputs nodes outputs])
 (defrecord HaloExchange [id value axis width boundary combine attributes])
 (defrecord ScheduledHalo [exchange routes dependencies steps completions])
 (defrecord DistributedStep
@@ -44,10 +48,10 @@
             peak-memory-bytes attributes])
 (defrecord DistributedPlan
            [id mesh topology values shards collective-groups collectives
-            halos device-plans steps outputs attributes])
+            halos device-plans copy-bindings refinements steps outputs attributes])
 (defrecord DistributedPlanCertificate
            [plan-id mesh-shape shard-coverage collectives halos
-            route-costs cost-vector device-plans])
+            route-costs cost-vector device-plans copy-bindings refinements])
 (defrecord CertifiedDistributedPlan [plan certificate])
 
 (defn device-mesh? [value] (instance? DeviceMesh value))
@@ -224,19 +228,26 @@
   (when (and (not= :broadcast kind) root)
     (fail! "only broadcast collectives may carry a root device"
            :distributed-collective-root {:id id :kind kind :root root}))
+  (when reduction (scan/validate! reduction))
   (->CollectiveOperation id kind group value reduction root attributes))
 
 (defn collective-schedule
+  "Construct an analytical communication schedule. An empty numerical mode is unspecified,
+   not execution consent. A declared mode uses the shared numerical-contract schema; validating
+   that declaration does not prove that communication legs implement the reduction."
   [{:keys [algorithm rounds numerical-mode attributes]
     :or {numerical-mode {} attributes {}}}]
-  (let [rounds (mapv (fn [round] (mapv #(if (communication-leg? %)
-                                          % (communication-leg %)) round)) rounds)]
+  (let [rounds (mapv (fn [round] (mapv communication-leg round)) rounds)]
     (when-not (and (keyword? algorithm) (seq rounds) (every? seq rounds)
                    (map? numerical-mode) (map? attributes))
       (fail! "collective schedule requires an algorithm and non-empty communication rounds"
              :distributed-collective-schedule
              {:algorithm algorithm :rounds rounds :numerical-mode numerical-mode
               :attributes attributes}))
+    (when (seq numerical-mode)
+      (numerical-contract/validate! numerical-mode
+                                    {:reason :distributed-collective-numerical-contract
+                                     :ir :collective-schedule}))
     (doseq [[round-index round] (map-indexed vector rounds)]
       (let [link-ids (mapcat :route round)]
         (when-not (= (count link-ids) (count (distinct link-ids)))
@@ -251,10 +262,8 @@
    Each round is a barrier: its legs may overlap, and the next round waits for all of them. The
    semantic CollectiveOperation is retained beside these cost/execution steps."
   [operation schedule dependencies]
-  (let [operation (if (collective-operation? operation) operation
-                      (collective-operation operation))
-        schedule (if (collective-schedule? schedule) schedule
-                     (collective-schedule schedule))
+  (let [operation (collective-operation operation)
+        schedule (collective-schedule schedule)
         dependencies (vec dependencies)
         {:keys [steps completions]}
         (reduce
@@ -279,6 +288,119 @@
          (map-indexed vector (:rounds schedule)))]
     (->ScheduledCollective operation schedule dependencies steps completions)))
 
+(defn refinement-facts
+  "Independently check a full-array all-reduce's immutable contribution DAG.
+
+   Inputs map fresh SSA identities to participants. Copy nodes preserve ancestry; local binary
+   combine nodes union disjoint ancestry. Every participant output must contain every input once.
+   Returned dependencies follow SSA producers, not caller assertions. This is an algorithm proof,
+   not physical binding or transport admission; topology, generated combines, buffer ranges and
+   readiness must still be checked when projecting it to an executable DistributedPlan."
+  [{:keys [operation group value numerical inputs nodes outputs] :as refinement}]
+  (when-not (and (instance? CollectiveRefinement refinement)
+                 (= #{:operation :group :value :numerical :inputs :nodes :outputs}
+                    (set (keys refinement))))
+    (fail! "expected a closed CollectiveRefinement"
+           :distributed-refinement-type {}))
+  (when-not (and (collective-operation? operation) (collective-group? group))
+    (fail! "refinement needs retained collective declarations"
+           :distributed-refinement-declarations {}))
+  (when-not (and (= operation (collective-operation operation))
+                 (= group (collective-group (:id group) (:devices group)))
+                 (= :all-reduce (:kind operation))
+                 (= (:group operation) (:id group)))
+    (fail! "refinement currently requires a complete all-reduce group"
+           :distributed-refinement-declarations {:operation (:id operation)}))
+  (abstract-value/validate! value)
+  (let [participants (set (:devices group))
+        algebra (:reduction operation)
+        dt (:dtype value)]
+    (when-not (and (= :tensor (:kind value)) (= {:kind :plain} (:representation value))
+                   (every? pos-int? (:shape value))
+                   (= dt (:dtype algebra))
+                   (= :replicated (get-in value [:sharding :kind]))
+                   (= participants (set (get-in value [:sharding :devices]))))
+      (fail! "all-reduce refinement requires static plain tensors replicated over its group"
+             :distributed-refinement-value {:value value}))
+    (numerical-contract/validate! numerical {:reason :distributed-refinement-numerical
+                                            :ir :collective-refinement})
+    ;; A monoid certificate does not establish bitwise floating-point associativity. This first
+    ;; tree refinement requires explicit reassociation with unchanged accumulation dtype.
+    (when-not (and (= :reassociated (:mode numerical))
+                   (= dt (:accumulator-dtype numerical)))
+      (fail! "all-reduce tree requires explicit same-dtype reassociation policy"
+             :distributed-refinement-numerical {:numerical numerical :dtype dt}))
+    (when-not (and (map? inputs) (every? some? (keys inputs))
+                   (= (count inputs) (count participants))
+                   (= participants (set (vals inputs)))
+                   (vector? nodes) (map? outputs)
+                   (= participants (set (keys outputs))))
+      (fail! "refinement needs exactly one input and output per participant"
+             :distributed-refinement-boundary {:inputs inputs :outputs outputs}))
+    (let [initial (into {} (map (fn [[id device]]
+                                 [id {:device device :contributors #{device}
+                                      :expression [:input id] :producer nil}])) inputs)
+          {:keys [values dependencies]}
+          (reduce
+           (fn [{:keys [values dependencies]} {:keys [id kind input target route left right device]
+                                              :as node}]
+             (let [fields (case kind
+                            :copy #{:id :kind :input :target :route}
+                            :combine #{:id :kind :left :right :device}
+                            nil)
+                   operands (case kind :copy [input] :combine [left right] [])]
+               (when-not (and fields (= fields (set (keys node)))
+                              (some? id) (not (contains? values id))
+                              (every? #(contains? values %) operands))
+                 (fail! "refinement nodes need closed, fresh, earlier-only SSA definitions"
+                        :distributed-refinement-node {:node node}))
+               (let [facts
+                     (case kind
+                       :copy
+                       (let [source (get values input)]
+                         (when-not (and (contains? participants target)
+                                        (not= target (:device source))
+                                        (vector? route) (seq route) (every? some? route))
+                           (fail! "copy needs another participant and an explicit route"
+                                  :distributed-refinement-copy {:node node}))
+                         (assoc source :device target :producer id))
+                       :combine
+                       (let [lhs (get values left) rhs (get values right)]
+                         (when-not (and (= device (:device lhs) (:device rhs))
+                                        (empty? (set/intersection (:contributors lhs)
+                                                                  (:contributors rhs))))
+                           (fail! "local combine requires co-located, disjoint contributions"
+                                  :distributed-refinement-combine {:node node}))
+                         {:device device
+                          :contributors (set/union (:contributors lhs) (:contributors rhs))
+                          :expression [(:combine algebra) (:expression lhs) (:expression rhs)]
+                          :producer id}))]
+                 {:values (assoc values id facts)
+                  :dependencies (assoc dependencies id
+                                       (vec (distinct (keep #(get-in values [% :producer])
+                                                            operands))))})))
+           {:values initial :dependencies {}} nodes)]
+      (doseq [[device id] outputs]
+        (let [facts (get values id)]
+          (when-not (and (= device (:device facts)) (= participants (:contributors facts)))
+            (fail! "each all-reduce output must contain every participant exactly once"
+                   :distributed-refinement-output {:device device :output id :facts facts}))))
+      {:values values :dependencies dependencies
+       :outputs (into {} (map (fn [[device id]] [device (get values id)])) outputs)})))
+
+(defn collective-refinement
+  "Construct a checked semantic all-reduce contribution witness, without allocating or emitting.
+   Copies and combines retain distinct immutable SSA identities; storage donation is a later
+   liveness refinement. This witness is not yet an executable DistributedPlan."
+  [options]
+  (let [expected #{:operation :group :value :numerical :inputs :nodes :outputs}]
+    (when-not (and (map? options) (= expected (set (keys options))))
+      (fail! "collective refinement requires its closed semantic schema"
+             :distributed-refinement-type {}))
+    (let [refinement (map->CollectiveRefinement options)]
+      (refinement-facts refinement)
+      refinement)))
+
 (defn halo-exchange
   "Declare a semantic neighbor exchange along one partitioned axis.
 
@@ -297,6 +419,7 @@
   (when (and combine (not (scan/associative-scan? combine)))
     (fail! "accumulating halo exchange requires a certified associative reduction"
            :distributed-halo-combine {:id id :combine combine}))
+  (when combine (scan/validate! combine))
   (->HaloExchange id value axis width boundary combine attributes))
 
 (defn- halo-face
@@ -357,7 +480,7 @@
    rectangles, destination regions, byte counts and the round index are retained on each transfer
    step."
   [exchange abstract shards routes dependencies]
-  (let [exchange (if (halo-exchange? exchange) exchange (halo-exchange exchange))
+  (let [exchange (halo-exchange exchange)
         {:keys [id value axis width boundary combine]} exchange
         mode (if combine :combine :copy)
         sharding (:sharding abstract)
@@ -608,6 +731,82 @@
         serialization (* (/ (double (:bytes transfer)) bottleneck) 1.0e9)]
     (long (Math/ceil (+ latency serialization)))))
 
+(defn project-refinement
+  "Derive ordinary copy/compute steps and SSA storage declarations from a checked refinement.
+
+   Input producers are retained compute steps, one per semantic input. Combine costs are explicit
+   analytical estimates, not target defaults. Copy routes use the existing topology authority.
+   The result is a structural projection, not execution admission: local generated arithmetic,
+   physical endpoints, readiness and enclosing-plan certificate binding remain obligations."
+  [refinement cluster input-producers combine-costs]
+  (let [facts (refinement-facts refinement)
+        inputs (:inputs refinement)
+        nodes (:nodes refinement)
+        combine-ids (into #{} (keep #(when (= :combine (:kind %)) (:id %))) nodes)
+        elements (reduce *' 1 (get-in refinement [:value :shape]))
+        bytes (*' elements (dtype/bytes-of (get-in refinement [:value :dtype])))]
+    (when-not (and (cluster-topology? cluster)
+                   (= cluster (topology (vals (:devices cluster)) (vals (:links cluster)))))
+      (fail! "collective projection requires a revalidated topology"
+             :distributed-refinement-topology {}))
+    (when-not (and (map? input-producers) (= (set (keys inputs)) (set (keys input-producers)))
+                   (every? (fn [[id producer]]
+                             (and (distributed-step? producer) (= :compute (:kind producer))
+                                  (= producer (compute-step producer))
+                                  (= (get inputs id) (:device producer))
+                                  (some? (:id producer))
+                                  (positive-number? (:duration-ns producer))
+                                  (integer? (:peak-memory-bytes producer))
+                                  (not (neg? (:peak-memory-bytes producer))))) input-producers))
+      (fail! "every collective input requires its retained same-device compute producer"
+             :distributed-refinement-input-producers {}))
+    (when-not (and (map? combine-costs) (= combine-ids (set (keys combine-costs)))
+                   (every? (fn [cost]
+                             (and (map? cost) (= #{:duration-ns :peak-memory-bytes} (set (keys cost)))
+                                  (positive-number? (:duration-ns cost))
+                                  (integer? (:peak-memory-bytes cost))
+                                  (not (neg? (:peak-memory-bytes cost))))) (vals combine-costs)))
+      (fail! "every combine requires an explicit closed resource estimate"
+             :distributed-refinement-combine-costs {}))
+    (when (> bytes Long/MAX_VALUE)
+      (fail! "collective payload exceeds representable byte extents"
+             :distributed-refinement-bytes {:bytes bytes}))
+    (let [producer-ids (mapv :id (vals input-producers))
+          node-ids (mapv :id nodes)]
+      (when-not (= (count (concat producer-ids node-ids))
+                   (count (distinct (concat producer-ids node-ids))))
+        (fail! "collective producers and projected steps need distinct identities"
+               :distributed-refinement-step-identities {})))
+    (let [producer (fn [id] (or (get-in facts [:values id :producer])
+                               (:id (get input-producers id))))
+          values (into {} (map (fn [[id fact]]
+                                [id (assoc (:value refinement)
+                                           :sharding {:kind :replicated :devices [(:device fact)]})]))
+                       (:values facts))
+          shards (into {} (map (fn [[id value]]
+                                [id [(shard {:id id :value id
+                                             :device (get-in facts [:values id :device])
+                                             :offsets (vec (repeat (count (:shape value)) 0))
+                                             :shape (:shape value) :ownership :replica})]])) values)
+          steps
+          (mapv (fn [{:keys [id kind input target route left right device]}]
+                  (let [dependencies (vec (distinct (map producer
+                                                        (case kind :copy [input] :combine [left right]))))]
+                    (case kind
+                      :copy
+                      (let [step (transfer-step {:id id :source (get-in facts [:values input :device])
+                                                 :target target :route route :value input
+                                                 :bytes (long bytes) :dependencies dependencies})]
+                        (transfer-duration-ns cluster step)
+                        step)
+                      :combine
+                      (compute-step (merge {:id id :device device :dependencies dependencies}
+                                           (get combine-costs id)))))) nodes)]
+      {:refinement refinement :input-producers input-producers
+       :values values :shards shards :steps steps
+       :completions (mapv (fn [device] (producer (get-in refinement [:outputs device])))
+                          (get-in refinement [:group :devices]))})))
+
 (defn- validate-collectives!
   [mesh topology values groups collectives steps]
   (when-not (and (map? groups) (every? collective-group? (vals groups))
@@ -827,6 +1026,32 @@
 
 (declare simulate)
 
+(defn- validate-copy-bindings! [{:keys [copy-bindings steps collectives halos]}]
+  (when-not (map? copy-bindings)
+    (fail! "explicit copy bindings must be a map" :distributed-copy-bindings {}))
+  (let [by-id (into {} (map (juxt :id identity)) steps)
+        semantic-steps (into #{} (map :id) (mapcat :steps (concat collectives halos)))]
+    (doseq [[id binding] copy-bindings]
+      (let [transfer (get by-id id)]
+        (when-not (and (= :transfer (:kind transfer))
+                       (not (contains? semantic-steps id))
+                       (map? binding) (= #{:source :target} (set (keys binding))))
+          (fail! "explicit copies require an ordinary transfer, not a semantic collective or halo"
+                 :distributed-copy-binding {:step id}))
+        (doseq [side [:source :target]
+                :let [{:keys [step local-value region] :as endpoint} (get binding side)
+                      owner (get by-id step)]]
+          (when-not (and (map? endpoint) (= #{:step :local-value :region} (set (keys endpoint)))
+                         (some? local-value) (= :compute (:kind owner))
+                         (= (:device owner) (get transfer side))
+                         (map? region) (= #{:offsets :shape} (set (keys region)))
+                         (vector? (:offsets region)) (vector? (:shape region))
+                         (seq (:shape region)) (= (count (:offsets region)) (count (:shape region)))
+                         (every? #(and (integer? %) (not (neg? %))) (:offsets region))
+                         (every? pos-int? (:shape region)))
+            (fail! "copy endpoint requires an exact local rectangle on its endpoint worker"
+                   :distributed-copy-endpoint {:step id :side side :endpoint endpoint})))))))
+
 (defn- validate-structure!
   "Validate and return a DistributedPlan without realizing any runtime resource."
   [plan]
@@ -862,15 +1087,125 @@
     (validate-halos! topology values shards halos steps)
     (validate-device-plans! mesh device-plans)
     (validate-steps! mesh topology values steps outputs)
+    (validate-copy-bindings! plan)
     (when-not (map? attributes)
       (fail! "distributed plan attributes must be a map"
              :distributed-plan-attributes {:attributes attributes})))
   plan)
 
+(defn- validate-refinements! [{:keys [refinements topology values shards steps copy-bindings
+                                    mesh collective-groups collectives]
+                             :as plan} bound]
+  (when-not (map? refinements)
+    (fail! "collective realizations must be an explicit map" :distributed-refinements {}))
+  (let [step-by-id (into {} (map (juxt :id identity)) steps)
+        claimed (volatile! #{})
+        ;; Exact-call memoization, not a global cache or a source-content snapshot.
+        actions (delay (:actions (readiness/check plan)))]
+    (doseq [[id {:keys [refinement input-producers combine-costs storage combines] :as realization}]
+            refinements]
+      (when-not (and (map? realization)
+                     (= #{:refinement :input-producers :combine-costs :storage :combines}
+                        (set (keys realization)))
+                     (= id (get-in refinement [:operation :id]))
+                     (= (:group refinement) (get collective-groups (get-in refinement [:group :id])))
+                     (set/subset? (set (get-in refinement [:group :devices])) (set (:devices mesh)))
+                     (not (some #(= id (get-in % [:operation :id])) collectives)))
+        (fail! "realization must retain its closed semantic projection request"
+               :distributed-refinement-realization {:id id}))
+      (let [projected (project-refinement refinement topology input-producers combine-costs)
+            facts (refinement-facts refinement)
+            combine-ids (into #{} (keep #(when (= :combine (:kind %)) (:id %))) (:nodes refinement))
+            projected-steps (concat (vals input-producers) (:steps projected))
+            node-ids (set (map :id (:steps projected)))]
+        (when-not (= :nearest-even (get-in refinement [:numerical :rounding]))
+          (fail! "generated collective arithmetic currently requires nearest-even rounding"
+                 :distributed-refinement-numerical {:id id}))
+        (when (seq (set/intersection @claimed node-ids))
+          (fail! "distinct collective realizations cannot share projected steps"
+                 :distributed-refinement-step-identities {:id id}))
+        (vswap! claimed into node-ids)
+        (when-not (and (every? #(= % (get step-by-id (:id %))) projected-steps)
+                       (every? (fn [[value abstract]] (= abstract (get values value))) (:values projected))
+                       (every? (fn [[value placements]] (= placements (get shards value))) (:shards projected)))
+          (fail! "realization projection differs from the actual distributed DAG or SSA storage declarations"
+                 :distributed-refinement-projection {:id id}))
+        (when-not (and (map? storage) (= (set (keys (:values facts))) (set (keys storage)))
+                       (= (count storage) (count (distinct (vals storage))))
+                       (map? combines) (= combine-ids (set (keys combines))))
+          (fail! "realization needs complete SSA storage and generated combine evidence"
+                 :distributed-refinement-storage {:id id}))
+        (let [nodes
+              (into {}
+                    (map (fn [[ssa {:keys [step local-value] :as endpoint}]]
+                           (let [entry (get bound step)
+                                 local (:link-plan entry)
+                                 value (get-in local [:values local-value])
+                                 leaves (:leaves value)
+                                 node (when (= 1 (count leaves))
+                                        (get-in local [:nodes (:node (first leaves))]))
+                                 binding (get-in entry [:values local-value])]
+                             (when-not (and (map? endpoint) (= #{:step :local-value} (set (keys endpoint)))
+                                            node (= ssa (:value binding)) (= ssa (:shard binding))
+                                            (= (get-in facts [:values ssa :device]) (:device (get step-by-id step)))
+                                            (= (get-in refinement [:value :shape]) (get-in node [:view :shape]))
+                                            (= (get-in refinement [:value :dtype]) (get-in node [:view :dtype]))
+                                            (buffer-view/contiguous? (:view node)))
+                               (fail! "SSA storage must name its exact dense bound local value on its worker"
+                                      :distributed-refinement-storage {:id id :ssa ssa :endpoint endpoint}))
+                             [ssa node]))) storage)
+              region {:offsets (vec (repeat (count (get-in refinement [:value :shape])) 0))
+                      :shape (get-in refinement [:value :shape])}
+              elements (reduce *' 1 (:shape region))]
+          (doseq [[ssa producer] input-producers]
+            (let [{:keys [step local-value]} (get storage ssa)]
+              (when-not (and (= step (:id producer))
+                             (contains? (set (link-plan/output-value-ids (get-in bound [step :link-plan]))) local-value))
+                (fail! "collective input must be a public value of its retained producer"
+                       :distributed-refinement-input-producers {:id id :ssa ssa}))))
+          (doseq [{:keys [id kind input left right] :as node} (:nodes refinement)]
+            (case kind
+              :copy
+              (when-not (= {:source (assoc (get storage input) :region region)
+                            :target (assoc (get storage id) :region region)} (get copy-bindings id))
+                (fail! "copy binding must realize the source and destination contribution SSA identities"
+                       :distributed-refinement-copy-binding {:node node}))
+              :combine
+              (let [local (get-in bound [id :link-plan])
+                    result-storage (get storage id)
+                    request {:id (:id local) :nodes {:left (get nodes left) :right (get nodes right)
+                                                     :result (get nodes id)}}]
+                (when-not (and (= id (:step result-storage))
+                               (contains? (set (link-plan/output-value-ids local)) (:local-value result-storage)))
+                  (fail! "combine result must be its actual compute step's public output"
+                         :distributed-refinement-combine-binding {:node node}))
+                (collective-arithmetic/validate-local!
+                 (get-in refinement [:operation :reduction]) elements request
+                 {:emitted (get combines id) :link-plan local}))))
+          ;; SSA ancestry is only a numerical proof if another entry cannot mutate its storage.
+          ;; The shared readiness authority supplies complete physical write scopes for all calls
+          ;; and transfers, as well as conditional initialization and actual DAG race checks.
+          (let [actions @actions]
+            (doseq [[ssa node] nodes
+                    :let [producer (or (get-in facts [:values ssa :producer])
+                                       (:id (get input-producers ssa)))]
+                    action actions
+                    write (:writes action)
+                    :when (and (not= producer (:id action))
+                               (buffer-view/overlaps? (:view node) write))]
+              (fail! "contribution SSA storage cannot be written outside its declared producer"
+                     :distributed-refinement-immutable
+                     {:id id :ssa ssa :producer producer :writer (:id action)}))))))))
+
+(defn- validated-compute-facts [plan]
+  (let [facts (compute/bindings (validate-structure! plan))]
+    (validate-refinements! plan (:bindings facts))
+    facts))
+
 (defn validate!
   "Validate distributed structure and local compute bindings without realizing resources."
   [plan]
-  (compute/bindings (validate-structure! plan))
+  (validated-compute-facts plan)
   plan)
 
 (defn compute-bindings
@@ -888,16 +1223,16 @@
    outputs are retained under the producer entry's `:boundary-outputs`, without a synthetic
    global shard. Combining transfers are not admitted as copy-replica placements."
   [plan]
-  (compute/bindings (validate-structure! plan)))
+  (validated-compute-facts plan))
 
 (defn transfer-bindings
   "Validate and project every transfer to exact physical source/target BufferViews.
-   Currently requires contiguous plain ScheduledHalo copies with bound owned sources and
-   replica destinations. Unsupported or absent endpoints fail rather than acquiring guessed
+   Supports contiguous plain ScheduledHalo copies and explicitly bound local graph regions.
+   Unsupported or absent endpoints fail rather than acquiring guessed
    storage. Returns a map keyed by transfer step ID. This does not authorize execution:
    initialization/freshness, shared allocation and transport capabilities remain obligations."
   [plan]
-  (compute/transfer-bindings (validate-structure! plan)))
+  (compute/transfer-bindings (validate! plan)))
 
 (defn check-readiness
   "Check conditional physical initialization, DAG effect ordering and replica/boundary freshness.
@@ -905,16 +1240,72 @@
    bound compute and strict copy endpoints; no allocation or execution occurs. Source snapshots,
    resource ownership, runtime input gates and event completion remain runtime obligations."
   [plan]
-  (readiness/check (validate-structure! plan)))
+  (readiness/check (validate! plan)))
 
 (defn plan
   [{:keys [id mesh topology values shards collective-groups collectives
-           halos device-plans steps outputs attributes]
+           halos device-plans copy-bindings refinements steps outputs attributes]
     :or {values {} shards {} collective-groups {} collectives []
-         halos [] device-plans {} steps [] outputs [] attributes {}}}]
+         halos [] device-plans {} copy-bindings {} refinements {} steps [] outputs [] attributes {}}}]
   (validate!
    (->DistributedPlan id mesh topology values shards collective-groups collectives (vec halos)
-                      device-plans (vec steps) (vec outputs) attributes)))
+                      device-plans copy-bindings refinements (vec steps) (vec outputs) attributes)))
+
+(defn refinement-plan
+  "Assemble one collective refinement with actual shard-local producer/consumer LinkPlans.
+
+   `device-plans`, `storage` and `combines` retain the actual local bindings and emitted
+   arithmetic evidence. No input/export kernels, buffers or runtime resources are invented.
+   `steps` contains only additional consumer compute steps; producers and collective steps are derived
+   from the retained projection request. `values`/`shards` declare additional local boundaries.
+   Conflicting declarations are rejected rather than overwritten. The ordinary plan validator
+   independently checks projection, public producer outputs, arithmetic and immutable SSA.
+
+   This is assembly convenience, not a new IR or a training-specific scheduling policy."
+  [{:keys [id mesh topology refinement input-producers combine-costs
+           values shards device-plans storage combines steps outputs attributes]
+    :or {values {} shards {} steps [] attributes {}} :as request}]
+  (let [allowed #{:id :mesh :topology :refinement :input-producers :combine-costs
+                  :values :shards :device-plans :storage :combines :steps :outputs :attributes}
+        required #{:id :mesh :topology :refinement :input-producers :combine-costs
+                   :device-plans :storage :combines :outputs}]
+    (when-not (and (map? request) (set/subset? (set (keys request)) allowed)
+                   (set/subset? required (set (keys request))))
+      (fail! "collective assembly requires a closed projection/binding request"
+             :distributed-refinement-assembly
+             {:unexpected (set/difference (set (keys request)) allowed)
+              :missing (set/difference required (set (keys request)))})))
+  (let [projected (project-refinement refinement topology input-producers combine-costs)
+        input-by-worker (set/map-invert (:inputs refinement))
+        merge-declarations
+        (fn [field declared retained]
+          (when-not (map? declared)
+            (fail! "collective assembly declarations must be maps"
+                   :distributed-refinement-assembly {:field field}))
+          (doseq [value (set/intersection (set (keys declared)) (set (keys retained)))]
+            (when-not (= (get declared value) (get retained value))
+              (fail! "collective assembly cannot replace projected SSA declarations"
+                     :distributed-refinement-projection {:field field :value value})))
+          (merge declared retained))
+        region {:offsets (vec (repeat (count (get-in refinement [:value :shape])) 0))
+                :shape (get-in refinement [:value :shape])}
+        operation-id (get-in refinement [:operation :id])]
+    (plan
+     {:id id :mesh mesh :topology topology
+      :values (merge-declarations :values values (:values projected))
+      :shards (merge-declarations :shards shards (:shards projected))
+      :collective-groups {(get-in refinement [:group :id]) (:group refinement)}
+      :device-plans device-plans
+      :copy-bindings
+      (into {} (for [{:keys [id kind input]} (:nodes refinement) :when (= :copy kind)]
+                 [id {:source (assoc (get storage input) :region region)
+                      :target (assoc (get storage id) :region region)}]))
+      :refinements {operation-id {:refinement refinement :input-producers input-producers
+                                 :combine-costs combine-costs :storage storage :combines combines}}
+      :steps (into (into (mapv (fn [worker] (get input-producers (get input-by-worker worker)))
+                              (get-in refinement [:group :devices]))
+                         (:steps projected)) steps)
+      :outputs outputs :attributes attributes})))
 
 (defn simulate
   "Simulate an explicit DistributedPlan schedule.
@@ -1028,13 +1419,14 @@
      (mapv (fn [{:keys [operation schedule steps completions]}]
              {:id (:id operation) :kind (:kind operation) :group (:group operation)
               :value (:value operation) :algorithm (:algorithm schedule)
+              :reduction (:reduction operation) :root (:root operation)
+              :numerical-mode (:numerical-mode schedule)
               :steps (mapv :id steps) :completions completions})
            (:collectives plan))
      (mapv (fn [{:keys [exchange steps completions]}]
              {:id (:id exchange) :value (:value exchange) :axis (:axis exchange)
               :width (:width exchange) :boundary (:boundary exchange)
-              :combine (some-> (:combine exchange)
-                               (select-keys [:combine :identity :dtype]))
+              :combine (:combine exchange)
               :rounds (inc (reduce max 0 (map #(get-in % [:attributes :round]) steps)))
               :steps (mapv :id steps) :completions completions
               :bytes (reduce + 0 (map :bytes steps))})
@@ -1045,7 +1437,9 @@
      ;; validated local plan values, including artifacts, scalar bindings, views and event
      ;; dependencies, so replacing an equally sized program invalidates the witness.
      ;; This is structural plan verification, not a digest of mutable buffer contents.
-     (:device-plans plan))))
+     (:device-plans plan)
+     (:copy-bindings plan)
+     (:refinements plan))))
 
 (defn certify
   "Validate a plan and attach coverage, route-cost, resource and structural local-plan witnesses.

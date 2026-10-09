@@ -1,6 +1,7 @@
 (ns raster.gpu.cuda-matrix-device-test
   "Exact FP32 NN accumulating GEMM on public equation-first Compiled/LinkPlan."
-  (:require [clojure.test :refer [deftest is]]
+  (:require [raster.gpu.device-probe :as device-probe]
+            [clojure.test :refer [deftest is]]
             [raster.compiler.passes.parallel.gemm-epilogue-device-test :as gemm]
             [raster.core :refer [deftm]]
             [raster.linalg.blas :as blas]
@@ -153,7 +154,7 @@
 
 (deftest public-cuda-nn-gemm-carries-initial-c-through-two-changed-input-replays
   (if-not (= "1" (System/getenv "RASTER_REQUIRE_CUDA_DEVICE"))
-    (println "[CUDA SKIP] matrix qualification requires RASTER_REQUIRE_CUDA_DEVICE=1")
+    (device-probe/cuda-skip! "matrix qualification requires RASTER_REQUIRE_CUDA_DEVICE=1" :not-requested)
     (let [device (probe/probe)]
       (is (= :ready (:status device)) "required CUDA matrix execution cannot skip")
       (when (= :ready (:status device)) (prove-carried-state!)))))
@@ -186,7 +187,7 @@
 
 (deftest public-cuda-nt-gemm-uses-separate-reset-state-executions
   (if-not (= "1" (System/getenv "RASTER_REQUIRE_CUDA_DEVICE"))
-    (println "[CUDA SKIP] NT qualification requires RASTER_REQUIRE_CUDA_DEVICE=1")
+    (device-probe/cuda-skip! "NT qualification requires RASTER_REQUIRE_CUDA_DEVICE=1" :not-requested)
     (let [device (probe/probe)]
       (is (= :ready (:status device)))
       (when (= :ready (:status device)) (prove-nt-reset!)))))
@@ -237,7 +238,7 @@
 
 (deftest generated-nn-equation-graph-binds-actual-input-and-state-offsets
   (if-not (= "1" (System/getenv "RASTER_REQUIRE_CUDA_DEVICE"))
-    (println "[CUDA SKIP] matrix pointer-offset qualification requires RASTER_REQUIRE_CUDA_DEVICE=1")
+    (device-probe/cuda-skip! "matrix pointer-offset qualification requires RASTER_REQUIRE_CUDA_DEVICE=1" :not-requested)
     (let [device (probe/probe)]
       (is (= :ready (:status device)))
       (when (= :ready (:status device)) (prove-direct-nn-offsets!)))))

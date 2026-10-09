@@ -19,6 +19,9 @@
             [raster.compiler.backend.intrinsics :as in]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.core.hardware :as hw]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.scalar-conversion :as conversion]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
@@ -60,6 +63,37 @@
            (get-in in/simd-isa [:avx512 :f32]))
     :avx512 :avx2))
 
+(def ^:dynamic *array-types*
+  "Retained array storage element types supplied by AOT binding. Storage width is
+   independent of arithmetic precision. Only an entirely empty environment retains
+   the legacy direct-emitter interface; partial environments fail closed."
+  {})
+
+(defn- storage-load-compatible? [isa elem arr int-widen?]
+  (let [storage (get *array-types* arr)]
+    (or (empty? *array-types*)
+        (= storage (case elem :f64 :double :f32 :float :i32 :int nil))
+        (and (= elem :f64) (= storage :float)
+             (:from-f32 (in/simd-type-info isa elem))
+             (:from-f32-load (in/simd-type-info isa elem)))
+        ;; Existing eight-lane i32 widening into Float arithmetic.
+        (and int-widen? (= elem :f32) (= storage :int)))))
+
+(defn- storage-loads-compatible? [isa elem expr idx int-widen?]
+  (every? #(storage-load-compatible? isa elem (first %) int-widen?)
+          (ss/collect-load-sites expr idx)))
+
+(defn- complete-double-operation-evidence? [expression]
+  (cond
+    ;; Storage and address calculations have their own admission obligations.
+    (and (seq? expression) (descriptor/aget-op? (descriptor/semantic-op expression))) true
+    (seq? expression)
+    (and (or (descriptor/cast-op? (first expression))
+             (= :double (dtype/dtype-for-scalar-tag (:raster.type/tag (meta expression)))))
+         (every? complete-double-operation-evidence? (rest expression)))
+    (coll? expression) (every? complete-double-operation-evidence? expression)
+    :else true))
+
 (defn- n-accumulators
   "Independent vector accumulators to hide FMA latency — the register-blocking policy
    from core.hardware/reduction-accumulators (the ONE place it lives, shared with the
@@ -72,7 +106,8 @@
 ;; ---------------------------------------------------------------------------
 ;; Horizontal-reduce helpers (emitted once per compiled unit that uses them).
 ;; ---------------------------------------------------------------------------
-(def simd-includes "#include <immintrin.h>\n")
+(def simd-includes
+  (str "#include <immintrin.h>\n" (in/simd-helper-sources :avx2)))
 
 (def simd-helpers
   (str
@@ -95,7 +130,8 @@
   "Extract the neutral vector plan from a SegRed's reduce-op, or nil if not a
    `+`-reduction with a vectorizable multiply/identity lane body. Mirrors the
    recognition core of segop_simd/compile-segred but backend-neutrally.
-   Returns {:idx :bound :acc :init :elem-expr :factors [f1 f2]|nil :fma? bool}."
+   Returns {:idx :bound :acc :init :elem-expr :factors [f1 f2]|nil}.
+   Recognizing a product does not grant contraction of its rounding boundary."
   [segred]
   (let [idx   (ss/seg-idx segred)
         bound (ss/seg-bound segred)
@@ -108,6 +144,7 @@
                        (= (nth lambda 2) acc) (nth lambda 1)
                        :else nil)]
         (when (and (= op '+) elem
+                   (ss/retained-floating-precision-compatible? lambda (:dtype segred))
                    (ss/simd-able? elem idx)
                    (empty? (ss/value-position-arrays elem idx)))
           (let [factors (when (and (seq? elem) (= '* (first elem)) (= 3 (count elem))
@@ -115,7 +152,7 @@
                                    (ss/aget-form? (nth elem 2) idx))
                           [(nth elem 1) (nth elem 2)])]
             {:idx idx :bound bound :acc acc :init init
-             :elem-expr elem :factors factors :fma? (boolean factors)}))))))
+             :elem-expr elem :factors factors}))))))
 
 ;; ---------------------------------------------------------------------------
 ;; C emission.
@@ -137,19 +174,14 @@
         off  (cond-> jv
                (not= blk "0") (as-> o (str o " + " blk))
                base (as-> o (str "(" (ce/emit-expr base nil array-syms "idx") ") + " o)))]
-    (str (:loadu ti) "(&" arrs "[" off "])")))
+    (if (and (= :float (get *array-types* arr)) (:from-f32 ti))
+      (str (:from-f32 ti) "(" (:from-f32-load ti) "(&" arrs "[" off "]))")
+      (str (:loadu ti) "(&" arrs "[" off "])"))))
 
 (defn- vidx
   "C index expr for an aget at affine base + loop counter jv."
   [base jv array-syms]
   (if base (str "(" (ce/emit-expr base nil array-syms "idx") ") + " jv) jv))
-
-(def ^:dynamic *array-types*
-  "Map array/scalar symbol → element keyword (:double/:float/:int/:long/:byte). Lets
-   emit-c-vexpr load int-typed arrays as __m256i + convert at float-cast boundaries
-   (the int8-MAC/quant widening). Bound by emit-c-fn from param-env + buffer elem
-   types; default {} = everything float (pure-float maps behave as before)."
-  {})
 
 (defn- dom-of
   "Vector domain of an array/scalar element kind."
@@ -163,9 +195,15 @@
    no fixed domain (broadcast into whatever its use needs). int-typed arrays (per
    *array-types*) load as __m256i and use epi32 ops; a `(float/double <int-expr>)`
    boundary emits _mm256_cvtepi32_ps. `felem` is the float element type (:f32/:f64)
-   for float ops. Throws on anything unvectorizable (caller guards with simd-able?)."
+   for float ops. Float storage into Double arithmetic uses a four-element converting
+   load, not a Double pointer load. Callers certify supported storage widths as well
+   as syntax before emission. Throws on anything unvectorizable."
   [expr idx isa felem jv array-syms target-dom]
-  (let [fti (in/simd-type-info isa felem)
+  (let [vector-op (fn [op elem]
+                    (or (in/simd-op isa op elem)
+                        (throw (ex-info "csimd: no vector lowering for operation"
+                                        {:op op :isa isa :elem elem}))))
+        fti (in/simd-type-info isa felem)
         iti (in/simd-type-info isa :i32)
         to-float (fn [[s d]] (case d
                                :float s
@@ -184,7 +222,7 @@
                      off (vidx base jv array-syms)]
                  (if (= :int (dom-of (get *array-types* arr :float)))
                    [(str (:loadu iti) "((const __m256i*)&" (ce/c-symbol arr) "[" off "])") :int]
-                   [(str (:loadu fti) "(&" (ce/c-symbol arr) "[" off "])") :float]))
+                   [(vec-load fti arr base jv "0" array-syms) :float]))
                ;; (long/int x) → int domain: identity on an int value, broadcast on a poly.
                (and (seq? e) (contains? '#{long int clojure.core/long clojure.core/int} (first e)))
                (let [[s d] (go (second e))]
@@ -197,13 +235,16 @@
                (let [op (first e) as (map go (rest e))]
                  (cond
                    (some #(= :float (second %)) as)     ; any float operand → float op, coerce rest
-                   [(str (in/simd-op isa op felem) "(" (str/join ", " (map to-float as)) ")") :float]
+                   [(str (vector-op op felem) "(" (str/join ", " (map to-float as)) ")") :float]
                    (some #(= :int (second %)) as)        ; int op (widening MAC subtract/add)
-                   (if-let [iop (in/simd-op isa op :i32)]
-                     [(str iop "(" (str/join ", " (map to-int as)) ")") :int]
-                     (throw (ex-info "csimd: no int vector op" {:op op})))
+                   (if (= :int (dtype/dtype-for-scalar-tag (:raster.type/tag (meta e))))
+                     (if-let [iop (in/simd-op isa op :i32)]
+                       [(str iop "(" (str/join ", " (map to-int as)) ")") :int]
+                       (throw (ex-info "csimd: no int vector op" {:op op})))
+                     (throw (ex-info "csimd: integer lane arithmetic requires retained i32 evidence"
+                                     {:op op :reason :unsupported-integer-lane-width})))
                    :else                                 ; all poly → default float
-                   [(str (in/simd-op isa op felem) "(" (str/join ", " (map to-float as)) ")") :float]))
+                   [(str (vector-op op felem) "(" (str/join ", " (map to-float as)) ")") :float]))
                :else (throw (ex-info "csimd/emit-c-vexpr: cannot vectorize" {:expr e}))))]
     (case target-dom
       :int (to-int (go expr))
@@ -225,8 +266,9 @@
 (defn compile-segmap-c
   "SegMap → a C statement block (string) that writes the vectorized element-wise map
    into out-sym, plus a scalar tail. Returns {:includes :block} or nil if not
-   vectorizable (caller keeps the scalar loop). Pure-float lane bodies only for now
-   (no int→float widening / no let*-wrapped lambda)."
+   vectorizable (caller keeps the scalar loop). Supports pure value-lets, i32→Float
+   widening and Float-storage→Double arithmetic loads. Uniform Double arithmetic
+   can end in a declared Float store; intervening mixed arithmetic still declines."
   [segmap isa array-syms]
   (let [idx    (ss/seg-idx segmap)
         bound  (ss/seg-bound segmap)
@@ -234,15 +276,43 @@
         ;; Project them through their retained source spelling at this emitter boundary.  The
         ;; conversion attributes have already been certified, and both the vector expression and
         ;; scalar tail must see the same projection.
-        raw    (some-> (:lambda segmap) soac-dialect/scalar-converts->source)
-        ;; inline pure value-lets so a let*-bodied map (composed kernels: folded/scale
-        ;; bindings) is a single lane expression — no manual source inlining needed.
-        lambda (when raw (inline-lets (ss/normalize-invk (ss/clean-dead-bindings raw))))
+        source (some-> (:lambda segmap) ss/clean-dead-bindings)
         out    (:out-sym segmap)
-        cast   (:cast-fn segmap)
-        elem   (vt-of (:dtype segmap))
+        source-cast (:cast-fn segmap)
+        terminal-conversion (conversion/canonical-parts source)
+        terminal-double-to-float?
+        (= {:source-dtype :double :target-dtype :float
+            :rounding :nearest-even :overflow :ieee}
+           (select-keys (:attributes terminal-conversion)
+                        [:source-dtype :target-dtype :rounding :overflow]))
+        double-source (if terminal-double-to-float? (:operand terminal-conversion) source)
+        storage-elem (vt-of (:dtype segmap))
+        same-precision? (ss/retained-floating-precision-compatible? source (:dtype segmap))
+        double-info (in/simd-type-info isa :f64)
+        ;; The lambda's retained operations determine arithmetic precision; the output
+        ;; dtype only determines storage. Do not erase intervening Float roundings.
+        double-to-float? (and (not same-precision?) (= :float (:dtype segmap))
+                              (or terminal-double-to-float?
+                                  (= 'float (descriptor/cast-result-tag source-cast)))
+                              (seq *array-types*)
+                              (:to-f32 double-info) (:to-f32-store double-info)
+                              (ss/retained-floating-precision-compatible? double-source :double))
+        ;; Move only a certified terminal narrowing to the store, never an interior cast.
+        compute-source (if double-to-float? double-source source)
+        raw (some-> compute-source soac-dialect/scalar-converts->source)
+        lambda (when raw (inline-lets (ss/normalize-invk raw)))
+        cast (if double-to-float? 'float source-cast)
+        elem   (cond same-precision? storage-elem double-to-float? :f64)
         ti     (in/simd-type-info isa elem)]
     (when (and idx bound out ti (seq? lambda)
+               ;; Compatibility with missing stamps is not proof for changing species.
+               (or (not double-to-float?) (complete-double-operation-evidence? lambda))
+               ;; Check before projecting conversions, while their declared source precision
+               ;; is still present. Syntax admission below remains emitter-specific.
+               (storage-loads-compatible? isa elem lambda idx true)
+               (or (empty? *array-types*)
+                   (= (get *array-types* out)
+                      (case storage-elem :f64 :double :f32 :float :i32 :int nil)))
                (ss/simd-able? lambda idx)
                (empty? (ss/value-position-arrays lambda idx)))
       (let [lanes (:lanes ti)
@@ -261,7 +331,9 @@
                 "  const int _n = " n-c ";\n"
                 "  int j = 0;\n"
                 "  for (; j + " lanes " <= _n; j += " lanes ") {\n"
-                "    " (:storeu ti) "(&" outc "[j], " vexpr ");\n"
+                "    " (if double-to-float? (:to-f32-store ti) (:storeu ti))
+                "(&" outc "[j], "
+                (if double-to-float? (str (:to-f32 ti) "(" vexpr ")") vexpr) ");\n"
                 "  }\n"
                 "  for (; j < _n; j++) " outc "[j] = " tail ";\n"
                 "}")})))))
@@ -280,8 +352,9 @@
            elem (vt-of (:dtype segred))
            ti   (in/simd-type-info isa elem)
            vadd (in/simd-op isa :+ elem)
-           vfma (in/simd-op isa :fma elem)]
-       (when (and ti vadd (or (nil? factors) vfma))
+           vmul (in/simd-op isa :* elem)]
+       (when (and ti vadd (or (nil? factors) vmul)
+                  (storage-loads-compatible? isa elem elem-expr idx false))
          (let [vt    (:vtype ti)
                lanes (:lanes ti)
                nacc  (n-accumulators elem)
@@ -299,10 +372,11 @@
                           (let [[f1 f2] factors
                                 [a1 b1] (ss/aget-form? f1 idx)
                                 [a2 b2] (ss/aget-form? f2 idx)]
-                            (str (accs k) " = " vfma "("
+                            ;; The monoid certificate permits changing the addition tree,
+                            ;; not fusing the separately rounded element product into it.
+                            (str (accs k) " = " vadd "(" (accs k) ", " vmul "("
                                  (vec-load ti a1 b1 "j" (blk k) array-syms) ", "
-                                 (vec-load ti a2 b2 "j" (blk k) array-syms) ", "
-                                 (accs k) ");"))
+                                 (vec-load ti a2 b2 "j" (blk k) array-syms) "));"))
                          ;; non-fused: elem is a single affine load → add
                           (let [[a b] (ss/aget-form? elem-expr idx)]
                             (str (accs k) " = " vadd "(" (accs k) ", "
@@ -314,8 +388,9 @@
                            (let [[f1 f2] factors
                                  [a1 b1] (ss/aget-form? f1 idx)
                                  [a2 b2] (ss/aget-form? f2 idx)]
-                             (str (scalar-aget a1 b1 "j" array-syms) " * "
-                                  (scalar-aget a2 b2 "j" array-syms)))
+                             (let [ct (if (= elem :f64) "double" "float")]
+                               (str "(" ct ")(" (scalar-aget a1 b1 "j" array-syms) ") * "
+                                    "(" ct ")(" (scalar-aget a2 b2 "j" array-syms) ")")))
                            (let [[a b] (ss/aget-form? elem-expr idx)]
                              (scalar-aget a b "j" array-syms)))]
            {:includes simd-includes

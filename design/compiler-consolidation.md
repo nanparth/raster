@@ -1632,3 +1632,79 @@ rejection against a real foreign sealed source program. Packaged build identitie
 providers remain explicitly synthetic. Final independent review and all seven exact-head CI
 gates are still required before merge. Device packing, scalable hierarchy validation,
 subcycling/reflux, external training acceptance and real fabric execution remain open.
+
+### Actual local AD to collective to SGD boundary — 2026-10-09
+
+`distributed-plan/refinement-plan` assembles the existing checked projection with caller-owned
+local producer/consumer LinkPlans and generated combine evidence. It derives no identity input
+or export kernels. Terminal refinement copies target consumer input storage directly; the root
+combine and its consumer share the same exact dense physical realization. Same-worker staging
+would remain ordinary local compute, not a fabricated self-link. Producer order follows the
+retained participant vector, and incoming declarations cannot shadow derived contribution SSA.
+
+The differentiated fixture uses ordinary public `value+grad` over a linear prediction and MSE
+loss, with parameters selected by `:wrt [0]`. Local mean gradients are multiplied by their local
+sample count before the declared FP32 sum tree; SGD divides the learning rate by the global
+sample count. Unequal batches `[1 3]` and `[1 2 4]` prevent equal-size averaging from standing in
+for this contract. Public equation-first lowerings are namespaced through existing certified
+LinkComposition before ordinary, unsealed LinkPlan endpoint rebinding and validation. There is
+no separate training IR, execution loop, cache or GPU session convention, and no host gradient
+computation or download/re-upload between the actual device producers and updates.
+This is compiler acceptance evidence using checked LinkPlan rebinding, not yet a released
+public distributed trainer interface.
+
+This is one complete synchronous update with initially identical parameter replicas. It does
+not prove multi-step state reuse: the distributed owner is deliberately one-shot. Repeated
+training needs explicit canonical parameter state and a checked unrolled/replay contract, not
+calling `run!` again with stale initialization evidence. Co-located logical workers do not
+demonstrate multi-host/fabric performance; timings in this fixture are analytical declarations.
+The held original real-model gradient gate, external transformer training acceptance and the
+rest of the eight-item campaign remain open.
+
+AD type-propagation debt found by the JVM reference: a local `nth` projection from the generated
+`value+grad` tuple, immediately consumed by `broadcast`, can emit an `Object[]` access for an
+actual `float[]` and throw `ClassCastException`. The explicitly Float fixture retains `^floats`
+on that binding. Its GPU lowering succeeded even without the tag; this is not evidence that the
+JVM boundary was sound. Follow up by retaining the selected gradient slot's primitive-array
+type through the ordinary typed tuple projection, with unannotated JVM/native/GPU regression
+coverage. Do not add an AD-specific array/function registry or silently remove the CPU oracle.
+
+### Sound erased-array JVM boundary — 2026-10-09
+
+The AD fixture's unannotated tuple projection exposed a general JVM emission defect, not a
+special meaning of `nth`: unknown array storage was assumed to be `Object[]` before `aaload`
+or `aastore`. A primitive array cannot satisfy that cast. The JVM emitter now delegates erased
+reads/writes to Clojure's existing runtime array dispatch, using the existing boxed-call emitter
+for once-only, source-ordered operand evaluation and standard coercion/exception behavior.
+Retained concrete array types keep their direct JVM load/store instructions; their checkcasts
+reuse the existing JVM type-descriptor authority instead of duplicated array-class tables.
+Nested array operations likewise retain all arguments rather than using a one-dimensional
+instruction on a variadic call.
+
+The same distributed AD/collective/SGD fixture now omits `^floats`; its JVM analytic oracle and
+actual device updates remain unchanged. Separate JIT/AOT checks compare all primitive-array
+kinds and reference arrays against the ordinary Clojure runtime, with independent pre-store
+arrays, raw NaN/signed-zero bits, invalid accesses, source-ordered side effects, nested indices
+and direct-typed-path dispatch tripwires. This fixes erased JVM execution correctness. It does
+not pretend that the AD tuple's missing static slot type has been recovered: retaining that
+information remains an optimization/type-propagation follow-up, and GPU/native layouts still
+require their existing static admission proofs. No numerical policy or AD-specific registry is
+introduced, and the original actual-model training gate remains held.
+
+### Narrow lazy-JIT AD normalization — 2026-10-09
+
+Direct AD applications in a walked straight-line `let` now consume the same prepared typed
+reverse program and known tuple projections as AOT. This occurs after TC walking and before
+optional SIMD, without rewalking the retained conversions, expanding ordinary helper or ftm
+boundaries, or introducing a result-type registry. Earlier local types participate in overload
+selection. Argument evaluation uses the shared call-by-value lifting contract; projection
+rewriting respects the canonical lexical scope description and quoted data.
+
+The admitted lazy-JIT slice does not hoist nested applications across branches, scopes or
+other operands, expand loop bodies, or perform D-algebra rewriting. Those calls retain runtime
+behavior. Indirect applications may retain their explicit constructor binding because this
+step performs no dead-code elimination; it does not claim construction-free execution for
+that shape. General non-inlined aggregate result typing remains open. New scalar and Float-array
+fixtures use runtime-constructor and boxed-array-read tripwires, while mixed Float/Double
+checks retain raw-bit conversion oracles. This is not real-model gradient acceptance or a
+numerical-policy change, and the original training gate remains held.

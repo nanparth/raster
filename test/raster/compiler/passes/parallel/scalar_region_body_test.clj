@@ -20,6 +20,39 @@
       :lower-index (fn [expression scope] (index/lower expression (conj scope 'i) decline!))
       :decline! decline!})))
 
+(deftest scalar-fold-converts-only-its-completed-result
+  (let [expression '(fold {:accumulator acc :index j :identity 0.0
+                          :lower 0 :extent 3 :dtype :double :association :ordered}
+                         (lambda [acc j] (region [] [(+ acc 1.0)])))
+        lowered ((:lower (lowerer)) expression :float {})
+        operations (:operations lowered)
+        loop (first operations)]
+    (is (= :float (:type lowered)))
+    (is (= :double (get-in loop [:iter-args 0 :binding :type])))
+    (is (= :double (get-in loop [:results 0 :type])))
+    (is (= :cast (get-in (last operations) [:expression :op])))
+    (is (= :float (get-in (last operations) [:result :type])))))
+
+(deftest elementary-math-source-precision-is-independent-of-result-storage
+  (doseq [operator [:exp :tanh :sin :cos :log :expm1 :log1p]]
+    (let [lower (:lower (lowerer))
+          raster-call (symbol "raster.math" (name operator))
+          java-call (symbol "Math" (name operator))
+          ;; These are retained frontend result facts, not an emitter-side function registry.
+          narrow-call (with-meta (list raster-call '(aget x i)) {:raster.type/tag 'float})
+          wide-call (with-meta (list java-call '(double (aget x i))) {:raster.type/tag 'double})
+          narrow (lower narrow-call :float {'i :int})
+          wide (lower (list 'float wide-call) :float {'i :int})
+          math-calls #(filter (fn [operation] (= operator (get-in operation [:expression :op])))
+                              (:operations %))]
+      (is (= [:float] (mapv #(get-in % [:expression :result-type]) (math-calls narrow))))
+      (is (= [:double] (mapv #(get-in % [:expression :result-type]) (math-calls wide))))
+      (doseq [operation (concat (math-calls narrow) (math-calls wide))]
+        (is (= {:kind :target-library :accuracy :implementation-defined}
+               (get-in operation [:expression :options :math-realization]))))
+      (is (= :float (:type wide)))
+      (is (= :cast (get-in (last (:operations wide)) [:expression :op]))))))
+
 (deftest static-numeric-constants-use-shared-evidence
   (let [lower (:lower (lowerer))
         result (lower 'java.lang.Float/NEGATIVE_INFINITY :float {})]
@@ -948,3 +981,95 @@
     (is (= 1 (count (:operations result))))
     (is (apply = (:results result)))
     (is (= :half (get-in result [:operations 0 :result :type])))))
+
+(defn- finite-volume-fold-region
+  ([] (finite-volume-fold-region {}))
+  ([{:keys [storage-type lower-bound upper-bound]
+     :or {storage-type :int lower-bound 0}}]
+  (let [decline! (fn [rule message data] (throw (ex-info message (assoc data :rule rule))))
+        lower (:lower (scalar/make-lowerer
+                       {:array-types {'offsets storage-type} :arrays #{'offsets} :scalar-types {}
+                        :require-source-types? true :conversion-policy conversion/policy
+                        :lower-index (fn [expression scope]
+                                       (body/index-cast (index/lower expression scope decline!) :long :exact))
+                        :decline! decline!}))
+        fold (list 'fold {:accumulator 'sum :index 'i :identity 0.0 :dtype :double
+                          :lower lower-bound :extent (if (some? upper-bound) upper-bound 'degree) :association :ordered}
+                   (dialect/lambda-form ['sum 'i]
+                                       [(dialect/local-value 'p :long '(+ start i))]
+                                       ['(+ sum (double p))]))]
+    (assoc (lower (list 'let* '[start (long (clojure.core/aget offsets 0))
+                               end (long (clojure.core/aget offsets 1)) degree (- end start)] fold)
+                  :double {}) :storage-type storage-type))))
+
+(defn- fold-region-kernel [region]
+  (body/make
+   {:id :finite-volume-range-test
+    :parameters [(body/->KernelParameter 'offsets :input (:storage-type region) [2] :global
+                                         (layout/row-major [2] (:storage-type region)) :input)
+                 (body/->KernelParameter 'out :output :double [1] :global
+                                         (layout/row-major [1] :double) :result)]
+    :stable-reads [(body/stable-read 'offsets)]
+    :operations (conj (:operations region) (body/->ScalarStore 'out [0] (:result region) nil))
+    :schedule {:subgroup-size 1} :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+    :provenance {:dialect :test} :attributes {:kind :scalar}}))
+
+(deftest finite-volume-int32-offsets-bound-the-canonical-fold-induction
+  ;; Source provenance: start/end are arbitrary Int32 storage values, degree is their checked
+  ;; Long difference, and the body adds widened start to the induction value. No mesh fixture
+  ;; size or generated SSA spelling contributes evidence.
+  (let [region (finite-volume-fold-region)
+        loop (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %) (:operations region)))
+        addition (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                                       (= :+ (get-in % [:expression :op]))
+                                       (= :long (get-in % [:expression :result-type])))
+                                (:operations loop)))]
+    (is (some? loop))
+    (is (some? addition))
+    (is (= :no-overflow (get-in addition [:expression :options :overflow])))
+    (is (= {:lower -6442450943 :upper 6442450942 :kind :typed-scalar-range}
+           (get-in addition [:expression :options :proof])))
+    (is (some? (body/validate! (fold-region-kernel region))))
+    (is (string? (emit/emit-scalar-kernel "finite_volume_ranges" (fold-region-kernel region)
+                                        {:target-dialect :opencl-portable})))))
+
+(defn- induction-addition [region]
+  (let [loop (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %) (:operations region)))]
+    (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                         (= :+ (get-in % [:expression :op]))
+                         (= :long (get-in % [:expression :result-type]))) (:operations loop)))))
+
+(deftest canonical-fold-range-controls-retain-empty-negative-and-overflow-contracts
+  (doseq [[lower upper] [[0 0] [0 -3] [-7 -2] [-4 3]
+                         [Integer/MIN_VALUE Integer/MAX_VALUE]]]
+    (let [region (finite-volume-fold-region {:lower-bound lower :upper-bound upper})
+          addition (induction-addition region)]
+      (is (= :no-overflow (get-in addition [:expression :options :overflow])))
+      (is (some? (body/validate! (fold-region-kernel region))))))
+  (doseq [options [{:upper-bound Long/MAX_VALUE}
+                   {:lower-bound Long/MIN_VALUE :upper-bound -1}
+                   {:storage-type :long :upper-bound 1}]]
+    (let [region (finite-volume-fold-region options)]
+      (is (= :trap (get-in (induction-addition region) [:expression :options :overflow])))
+      (is (some? (body/validate! (fold-region-kernel region))))))
+  ;; The checked parser/validator's positive-step contract remains unchanged.
+  (let [kernel (fold-region-kernel (finite-volume-fold-region))
+        index (first (keep-indexed #(when (instance? raster.compiler.ir.kernel_body.ForLoop %2) %1)
+                                  (:operations kernel)))]
+    (doseq [step [0 -1]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"explicit bounds"
+                            (body/validate! (assoc-in kernel [:operations index :step] step)))))))
+
+(deftest independent-kernel-body-checker-rejects-forged-fold-range-certificates
+  (let [kernel (fold-region-kernel (finite-volume-fold-region))
+        loop-index (first (keep-indexed #(when (instance? raster.compiler.ir.kernel_body.ForLoop %2) %1)
+                                       (:operations kernel)))
+        body-operations (get-in kernel [:operations loop-index :operations])
+        addition-index (first (keep-indexed #(when (and (= (get-in %2 [:expression :result-type]) :long)
+                                                (= (get-in %2 [:expression :op]) :+)) %1)
+                                           body-operations))
+        forged (assoc-in kernel [:operations loop-index :operations addition-index :expression :options]
+                         {:overflow :no-overflow :proof {:kind :typed-scalar-range :lower 0 :upper 0}})]
+    (is (= :kernel-body-intrinsic-overflow
+           (try (body/validate! forged) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))

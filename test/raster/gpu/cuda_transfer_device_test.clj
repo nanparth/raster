@@ -1,8 +1,8 @@
 (ns raster.gpu.cuda-transfer-device-test
   "Required-device pinned async transfer proof through public session contracts."
-  (:require [clojure.test :refer [deftest is]]
+  (:require [raster.gpu.device-probe :as device-probe]
+            [clojure.test :refer [deftest is]]
             [raster.gpu.core :as gpu]
-            [raster.gpu.cuda-driver-probe :as probe]
             [raster.gpu.cuda-runtime :as runtime]
             [raster.gpu.runtime-root :as root]))
 
@@ -86,8 +86,6 @@
       (finally (gpu/close-session! session)))))
 
 (deftest pinned-async-uneven-float-and-encoded-half-public-contracts
-  (if (= :ready (:status (probe/probe)))
+  (if @device-probe/cuda-available?
     (doseq [dt [:float :half]] (prove-transfers! dt))
-    (if (= "1" (System/getenv "RASTER_REQUIRE_CUDA_DEVICE"))
-      (is false "CUDA device is required; async transfer proof cannot skip")
-      (println "[CUDA SKIP] No device for optional pinned async transfer proof"))))
+    (device-probe/cuda-skip! "No device for optional pinned async transfer proof")))

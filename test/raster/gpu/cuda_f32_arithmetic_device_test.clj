@@ -1,6 +1,7 @@
 (ns raster.gpu.cuda-f32-arithmetic-device-test
   "Retained float multiply/add and explicit FMA through public Compiled/LinkPlan."
-  (:require [clojure.java.io :as io]
+  (:require [raster.gpu.device-probe :as device-probe]
+            [clojure.java.io :as io]
             [clojure.test :refer [deftest is]]
             [raster.arrays :as arrays]
             [raster.core :refer [deftm]]
@@ -122,7 +123,7 @@
 
 (deftest public-cuda-f32-map-preserves-retained-operations-and-explicit-fma
   (if-not (= "1" (System/getenv "RASTER_REQUIRE_CUDA_DEVICE"))
-    (println "[CUDA SKIP] f32 arithmetic requires RASTER_REQUIRE_CUDA_DEVICE=1")
+    (device-probe/cuda-skip! "f32 arithmetic requires RASTER_REQUIRE_CUDA_DEVICE=1" :not-requested)
     (let [device (probe/probe)]
       (is (= :ready (:status device)) "required native arithmetic cannot skip")
       (when (= :ready (:status device))

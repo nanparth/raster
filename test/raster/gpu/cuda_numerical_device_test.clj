@@ -1,6 +1,7 @@
 (ns raster.gpu.cuda-numerical-device-test
   "Numerical qualification through public equation-first Compiled/LinkPlan execution."
-  (:require [clojure.test :refer [deftest is]]
+  (:require [raster.gpu.device-probe :as device-probe]
+            [clojure.test :refer [deftest is]]
             [raster.compiler.passes.parallel.full-reduction-device-test :as reduction]
             [raster.gpu.compiled :as compiled]
             [raster.gpu.core :as gpu]
@@ -91,7 +92,7 @@
       (is (= :ready (:status device)) "required CUDA execution cannot skip")
       (when (= :ready (:status device))
         (doseq [n [8 0 1025]] (prove-dot! n))))
-    (println "[CUDA SKIP] Public numerical qualification requires RASTER_REQUIRE_CUDA_DEVICE=1")))
+    (device-probe/cuda-skip! "Public numerical qualification requires RASTER_REQUIRE_CUDA_DEVICE=1" :not-requested)))
 
 (defn- prove-generated-graph-offsets! [n]
   (let [capacity (max 1 n)
@@ -156,4 +157,4 @@
       (is (= :ready (:status device)) "required CUDA execution cannot skip")
       (when (= :ready (:status device))
         (doseq [n [8 0 1025]] (prove-generated-graph-offsets! n))))
-    (println "[CUDA SKIP] Generated graph offset qualification requires RASTER_REQUIRE_CUDA_DEVICE=1")))
+    (device-probe/cuda-skip! "Generated graph offset qualification requires RASTER_REQUIRE_CUDA_DEVICE=1" :not-requested)))

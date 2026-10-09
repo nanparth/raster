@@ -1,5 +1,106 @@
 # Compiler unification campaign
 
+### October 9 verified nonlinear boundary checkpoint
+
+The shared elementary-math realization contract covers 23 C-family library operations while
+preserving source precision. A captured real-model layer-0 diagnostic now verifies its taps
+against the unchanged JVM pullback bit-for-bit. Supplying identical tanh values makes CPU/GPU
+pullback arithmetic identical; target Float tanh differences reproduce strong derivative
+cancellation sensitivity on both systems. This is local boundary evidence, not closure of the
+held real-weight gate. See `local-compiler-evidence.md` for controls and the three-coordinate
+distinction from the original GPU kernel. All eight campaign items retain their original
+workload acceptance obligations; continue the general compiler, training and distributed
+verticals without replacing them with isolated numerical regressions.
+
+### October 9 typed arithmetic consolidation checkpoint
+
+#1098–#1100 are merged: C-family scalar product boundaries are protected separately
+from explicit FMA, transposed-left products use the shared register body, and JVM
+helper extraction retains typed calls and their operand conversions. #1101 extends
+that preservation to scalar simplification and partial evaluation; its follow-up
+checks retained operation precision during JVM scheduled SegMap admission with an
+active species. An executed mixed-width
+surface map exposed different rounding in vector lanes and the scalar tail; the
+correct scalar schedule is retained until mixed-species vector lowering exists.
+These are shared semantic fixes, not replacement model kernels or a new type registry.
+The follow-up threads active-species precision obligations into stencil and C-SIMD
+consumers and checks complete reduction recurrences. C integer-widening syntax
+admission remains emitter-specific; canonical conversion precision is checked before
+source projection. A further reproduced Boolean comparison miscompile requires
+retaining selected interface parameter tags through SIMD canonicalization. Declared
+comparison domains are checked before compare-and-blend; missing signatures decline
+rather than being inferred. Untyped compatibility and missing operation stamps still
+need separate evidence, and mixed-species vector execution remains unimplemented.
+
+The C-SIMD guard also exposes a quant-fold performance residual: Q4 x8 explicitly
+computes Double scale products into Float storage, while its old vector assertion
+required an all-Float implementation. Bit-sensitive changed-input JVM/native tests
+now retain the source precision. The integer-dot override and homogeneous Float
+widening tests remain; mixed-precision load/compute/store vector schedules are still
+needed to recover the fold optimization without narrowing arithmetic.
+
+The fresh unchanged real-weight two-layer training gate after #1100 passes loss and
+input-gradient checks but still fails 12 of 28 adapter-gradient checks.
+After the subsequent retained-precision fixes, a cold unchanged run fails eleven
+of 28 adapter checks; a public strict-FP32 matrix-policy diagnostic produces the
+identical metrics. This rules out that policy switch as a remedy for this case.
+Acceptance therefore remains open; neither these narrow regressions nor synthetic
+training acceptance closes campaign item 5. Continue precision-boundary consolidation
+and identical-input matrix/VJP localization without loosening the pinned oracle.
+The October 9 diagnostic below preserves that gate: an independent CPU model
+using the default GPU's decomposed Float dot order reproduces the same eleven
+failing adapter keys and the GPU loss exactly, but four adapter comparisons
+still exceed the original coordinate threshold against that counterfactual.
+Whole-tensor relative L2 errors against the unchanged native reference are much
+smaller (at most 2.45e-5); this is evidence of sensitivity, not acceptance or
+permission to relax the original oracle. See `local-compiler-evidence.md`.
+CUDA/HIP runtime performance and multi-host execution likewise remain separate from
+hardware-free vendor compilation and local logical-worker acceptance.
+
+### October 8 collective execution and precision-boundary follow-up
+
+The storage boundary fix is merged as #1095 after all seven required CI gates passed.
+The next isolated checkpoint diagnostic uses identical layer-0 Q/K/V and a synthetic cotangent,
+not a full-model replay. Raw causal scores and DW dots match the JVM exactly on local OpenCL;
+the D reduction matches exactly for both CPU and GPU supplied intermediates. Same-input softmax
+weights differ by at most one Float ULP. Selectively spelling exponential evaluation as
+`float(Math.exp(double(delta)))` restores exact agreement for this sixteen-weight diagnostic
+without changing Float max/sum carries, storage or the reference. This does not close the held
+adapter-gradient gate or prove universal libm bitwise equality.
+
+Native `:exp` realization is now stated separately from evaluation-order evidence in KernelBody.
+Its target-library accuracy is implementation-defined, not a correctly-rounded or bounded-error
+claim. Float calls remain Float; explicit Double calls followed by Float conversion retain that
+typed sequence. Other transcendental realization contracts and a user-selected reproducible
+algorithm remain follow-ups; do not globally widen math or introduce an attention-specific emitter.
+
+The contribution refinement, ordinary generated-combine bindings and complete realization
+certificate are merged (#1090–1094), with all required CI gates green. Two and three logical
+workers execute complete all-reduces on the local OpenCL and Level Zero devices. Fractional
+products and FP32/FP64 cancellation are checked against independently rounded evaluation trees;
+optional FP64 skips retain all FP32 cases. This closes the local numerical collective seam,
+not multi-host transport, distributed transformer training or performance acceptance.
+
+Training diagnosis exposed a separate declared-storage inconsistency: the preservation option
+reached parameter typing but was dropped before the TypedSOAC frontend, and resolved local
+polymorphic allocations still followed ambient precision. Retaining their array tags also exposes
+two existing restrictions: fold-map results assumed a single ambient storage dtype, and a canonical
+scalar Fold required its consumer precision to equal its carry precision. The follow-up forwards
+one existing policy, derives each destination's storage dtype and converts only completed Fold
+results through the shared scalar conversion authority. Default allocation policy is unchanged;
+the explicitly requested preservation option now applies to resolved locals as well as parameters.
+Host fold-map projection spells the same per-destination completed-result conversions explicitly,
+including mixed Float/Double outputs. Its executed oracle compares the projected form with typed
+source execution; the shared mixed-storage fixture also enters CUDA/HIP compile gates. No fold
+carry is narrowed merely because its consumer uses narrower storage.
+
+An isolated real-checkpoint attention probe executes Double computation with Float storage after
+these changes, with small nonzero differences from the existing CPU reference. The global `:dtype`
+still selects generic source overloads; this probe fixes the Float source overload explicitly.
+It is not a new independent precision-selection API and does not close the held real-model gate.
+The next acceptance work must distinguish source specialization, intermediate arithmetic and
+storage, without rewriting the pinned model or loosening its original gradient checks.
+
 ### October 8 native reference-environment admission
 
 `blas/library-info` and `lapack/library-info` now report retained selection facts,
@@ -534,8 +635,26 @@ do not infer a published release from a merge, or device performance from source
 | 4. CUDA/HIP public-source verticals | Public numerical, attention and matrix fixtures compile in hardware-free vendor gates; allocation-free LinkPlan lowering is tested separately from source emission. | Vendor compilation is not vendor device correctness or performance. Keep matched execution/benchmark campaigns outside the laptop/CI dependency chain. |
 | 5. Reusable training and external models | Direct equation-first AD/SGD and small resident Gemma/LoRA tests check state progress, numerical trajectories and admitted routes. Isolated committed external numerical sources have LoRA/QLoRA 30-step parity and two tiny Gemma forward/VJP/update replays against the JVM on OpenCL and Level Zero, including 14 explicitly shared mutable adapters across independently prepared programs (#950); no sibling checkout is changed. The mixed scalar-energy gradient preserves its Float tangent result through a Double reduction on both local backends. | External adapter migration, longer/real-weight training and preparation-cost acceptance remain. The inspected finetune checkout still uses retired `bind-program!`/`run-program!`; do not resurrect them. The direct terminal conversion is admitted, not arbitrary device-scalar placement or mixed epilogue arithmetic. Ranged/cross-executable mutable sharing and asynchronous lifetime proofs remain separate. |
 | 6. Hardware-free distributed simulation | `distributed_plan_test.clj` covers topology, dependency/resource overlap, directed routes, capacity gates, collectives, halos and certificate drift. | Calibrate against real execution and broaden workload projections without presenting analytic costs as measured performance. |
-| 7. Data-parallel/halo execution | #558/#559 execute checked DAGs and co-located logical workers with shared physical budgets; unequal two/four-row heat partitions execute resident halo copies and agree with the monolithic reference. | Real multi-device/fabric execution, overlap and distributed training collectives still need numerical validation. Co-location validates ownership/scheduling, not network performance. |
+| 7. Data-parallel/halo execution | #558/#559 execute checked DAGs and co-located logical workers with shared physical budgets; unequal two/four-row heat partitions execute resident halo copies and agree with the monolithic reference. #1117 assembles collective refinements from the existing checked projection and canonical storage endpoints. #1118 executes actual public reverse AD, row-weighted FP32 gradient all-reduce and resident SGD for unequal local batches on OpenCL and Level Zero, checked against independent analytic gradients and the declared reduction tree. | Real multi-device/fabric execution, overlap and multi-step distributed training state still need validation. The admitted training fixture performs one update through a one-shot owner; it is not a released distributed trainer. Co-location validates ownership, arithmetic and scheduling, not network performance. |
 | 8. Durable numerical state and multilevel/AMR | Heat resumes from actual mapped bytes. #561 provides generated prolongation/restriction; #562 binds producer-attested implementations; #563 restores both coarse/fine fields and exercises both operation orders in fresh executions. The whole-domain heat oracle checks host refinement/convergence. The local continuation gate executes four generated fine-grid heat steps and restriction per replay on OpenCL and Level Zero, restores addressed coarse/fine bytes and matches uninterrupted evolution bit-for-bit while conserving mass (#926). Partial-patch evolution checks shared conservative coarse/fine face fluxes. #988/#989 add production hierarchy-to-connectivity and conservative layout transfer builders; fixtures retain independent small numerical oracles. Changed-layout mapped-byte restoration matches an uninterrupted 17-stage resident chain bit-for-bit on both local backends. PR #990 verifies declared target compatibility before leasing; affected state/native restart/lease/AMR tests pass 40 tests / 454 assertions. #1032 adds a bounded two-level diffusion subcycle/reflux implementation and synchronized restart fixtures; the reconciliation below distinguishes it from the outer AMR planner. | Device patch packing, scalable hierarchy validation, durable publication/lineage realization and temporal AMR planner integration remain. Producer/source facts are now derived, but are not numerical correctness proofs. Multi-patch/adaptive/hyperbolic and mid-cycle restart acceptance remain; the bounded cases do not establish an adaptive simulator, external AMR accuracy or a production store. |
+
+### Item-7 training reconciliation (2026-10-09)
+
+`distributed_training_device_test.clj` now joins real local loss gradients to the collective
+refinement and SGD consumer through allocation-free public lowering and checked LinkPlans.
+Local batch sizes `[1 3]` and `[1 2 4]` exercise unequal contribution weights; each gradient is
+scaled by its local row count before the declared FP32 sum tree, and SGD scales by the total
+row count. Independent coordinate loops reproduce the leaf rounding, binary tree rounding
+and final update. Both local backends pass, and final parameter replicas agree bit-for-bit.
+The affected fixture passed four tests / 70 assertions, including hardware-free compilation
+with session, allocation and instantiation tripwires.
+
+This is one numerical update with co-located logical workers and synchronous resident copies.
+It does not establish multi-step parameter-state reuse, asynchronous overlap, fabric throughput
+or real-model training acceptance. The runtime deliberately rejects replay of a completed
+one-shot owner; future training steps need an explicit checked parameter-state transition,
+not a reset that silently reuses stale initializers. The independent real-weight Gemma gradient
+gate remains open, and its original model, provider, numerical policy and tolerance are unchanged.
 
 Item 8 now also has a production 2D hierarchy projection in `raster.ode.amr-geometry`: rectangular,
 anisotropic, multilevel active rows retain patch provenance and match geometric sides into faces
@@ -615,6 +734,49 @@ Before presenting finetune-rstr as an installable training package:
 CUDA work can continue against Raster's committed external-source acceptance fixtures and
 public pretrained-rstr while that migration proceeds. It must not require an unpublished
 sibling package to execute Raster's hardware-free compiler gates.
+
+### Distributed algebra witness consolidation (2026-10-08)
+
+Review found that the analytic collective witness retained routes/algorithm names but omitted
+the reduction algebra, broadcast root and numerical mode. Accumulating halo witnesses retained
+only combine/identity/dtype, dropping the algebra's numerical facets. Retained records also
+bypassed their constructors, so record identity could masquerade as validation after mutation.
+
+The existing associative scalar authority now independently rederives retained certificates.
+Distributed scheduling revalidates operations, schedules and communication legs even when they
+are records. Collective certificates retain the reduction/root/numerical mode, and halo
+certificates retain the complete associative certificate. Valid semantic changes require new
+distributed evidence; missing/forged algebra facts reject before certification. Old witnesses
+must be regenerated. This adds no operator registry, domain kernel emitter or runtime transport.
+
+The execution boundary remains narrower than the analytic planner: readiness accepts only copy
+halos, and refuses reducing collectives/accumulating halos before sessions or allocations.
+Arithmetic execution must eventually transfer into explicit scratch and run a generated typed
+combine as an ordinary bound compute step. The analytic witness is not a collective numerical
+equivalence proof, a real-fabric measurement or completion of campaign items 6/7.
+
+Focused scan/distributed-plan/physical-binding/AMR-plan validation passes 70 tests / 370
+assertions in the capped REPL. Independent review found no blockers; its extra qualified-operator
+and retained-leg mutation checks are included. Full cold CI remains a merge requirement.
+
+### Distributed physical assignments before arithmetic lowering (2026-10-08)
+
+The next seam binds ordinary copies to exact existing local graph regions through
+`DistributedPlan.copy-bindings`; see [distributed-materialization.md](distributed-materialization.md).
+It reuses BufferView projection, shared copy extent/alias checks and the existing readiness/runtime
+authorities. Source storage must realize the transferred value and stay within its owned region;
+constant destinations, unproven ghost sources, malformed or strided endpoints and stale witnesses
+reject. Explicit copies cannot override semantic collective or halo legs. The assignment may
+target a different mutable logical value: it is a physical copy contract, not value-version or
+collective algebra equivalence evidence.
+
+Focused scan/distributed-plan/compute/AMR-plan tests pass 74 tests / 392 assertions. A generated
+`acopy!` → resident scratch copy → generated `axpy!` fixture passes on the actual Level Zero device.
+The complete affected numerical namespace passes 13 tests / 61 assertions after separately fixing
+independent owned LinkPlan instantiations' runtime root identity collision. That lifetime fix keeps
+compiler and explicitly borrowed identities unchanged; it does not relax root retention guards.
+Independent physical-copy review found no blockers. Exact-head cold CI remains required; semantic
+collective lowering, packing, real fabric/overlap and full-model training acceptance remain open.
 
 The strict semantic restore boundary now checks the independently supplied target field/layout,
 logical phase, numerical policy and provenance before leases/uploads; bit-preserving certificate
@@ -3202,3 +3364,36 @@ schedule permission, selector, error tolerance or numerical oracle is introduced
 review found no blocker; focused source/numerical/GEMM suites pass 49 tests / 1390 assertions.
 Native portable BLAS and explicitly mixed attention/projection checks
 pass 2 tests / 72 assertions on OpenCL and Level Zero. The real-checkpoint gate remains held.
+
+### Explicit register-product realization — 2026-10-08
+
+The real-checkpoint diagnosis is recorded in `local-compiler-evidence.md`: generated
+forward matrix products and matrix pullbacks match ordered Float multiply/add
+references, while native BLAS uses different reduction/rounding realizations.
+This is not sufficient to close the unchanged model-gradient gate.
+
+The existing register-tiled schedule now exposes `:typed-contraction :multiply-add`
+as `:decomposed` (default) or `:fused`. The latter produces canonical typed `:fma`
+SSA without a new operator registry, emitter or model-specific compiler rule.
+Only explicitly permissive register-tiled/fused-register dispatch requests admit
+it; other strategies and restrictive precision reject the request. The resolved
+schedule, body, legality, numerical certificate, tuning metadata and exact
+complete-write rederivation retain the choice. Unknown nested schedule fields
+fail closed, including misspelled arithmetic choices.
+
+`Decomposed` describes the typed IR, not proof that a vendor compiler will refrain
+from contraction. Numerical rounding remains implementation-defined. Explicit
+FMA is currently a C-family capability; the existing WASM polynomial facet is not
+a single-round FMA implementation. Before cross-target exact rounding can be
+claimed, introduce checked target non-contraction controls or explicit rounded
+operations and verify the resulting device/compiler instructions. This is a
+correctness follow-up, not permission to weaken an ordered source reduction.
+
+Bit-sensitive NN/NT projection checks on local OpenCL and Level Zero compare raw
+Float bits against independent ordered oracles, replace inputs and compile
+decomposed/fused/decomposed to exercise cache separation. Fused CUDA sm80 PTX and
+HIP gfx1100 code compile locally; inspected PTX contains `fma.rn.f32`. No NVIDIA
+or AMD execution/performance acceptance is implied. The real checkpoint's fused
+Q projection matches the independent ordered FMA oracle exactly, but still differs
+from native BLAS. Full-model gradient parity, sustained training and the original
+distributed/AMR campaign residuals remain open.

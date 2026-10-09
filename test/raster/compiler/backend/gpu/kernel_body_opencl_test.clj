@@ -1,12 +1,15 @@
 (ns raster.compiler.backend.gpu.kernel-body-opencl-test
-  (:require [clojure.java.shell :as shell]
+  (:require [raster.gpu.device-probe :as device-probe]
+            [clojure.java.shell :as shell]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.kernel-body-fixtures :as fixtures]
+            [raster.compiler.backend.gpu.kernel-body-c-dialect :as dialect]
             [raster.compiler.backend.gpu.kernel-body-opencl :as opencl]
             [raster.compiler.backend.gpu.kernel-body-target :as target]
             [raster.gpu.cuda-nvrtc :as nvrtc]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
@@ -20,6 +23,72 @@
       (is (= ["" 7] (#'opencl/emit-scalar-operations [] 7 2)))
       (is (= ["2:7:a;2:8:b;2:9:c;" 10]
              (#'opencl/emit-scalar-operations ["a" "b" "c"] 7 2))))))
+
+(deftest elementary-math-accuracy-evidence-does-not-change-target-source
+  (let [descriptor intrinsics/descriptor
+        operators (keep (fn [[op facts]]
+                          (when (= :target-library (:kernel-body-math-realization facts)) op))
+                        intrinsics/table)]
+    (doseq [op operators type [:float :double]
+            target [:opencl-intel :opencl-portable :cuda :hip]]
+      (let [arguments (vec (take (:arity (descriptor op)) ['a 'b]))
+            expression (body/scalar-expression op type arguments)
+            template (fixtures/scalar-product-body type false)
+            kernel (body/make
+                    (assoc template :operations
+                           [(body/->ScalarCompute (body/value 'result type) expression)
+                            (body/->ScalarStore 'out [0] 'result nil)]))
+            emit #(-> (opencl/emit-scalar-module "elementary_math" %
+                                               {:target-dialect target}) :source)
+            current (emit kernel)
+            previous
+            (with-redefs [intrinsics/descriptor
+                          (fn [operator]
+                            (dissoc (descriptor operator) :kernel-body-math-realization))]
+              (emit (assoc-in kernel [:operations 0 :expression :options] {})))]
+        (is (= previous current)
+            (str "accuracy evidence does not widen or alter " op " " type " " target))))))
+
+(deftest scalar-product-target-spelling-preserves-explicit-fma
+  (let [emit (fn [target op type]
+               (binding [opencl/*scalar-dialect* (dialect/resolve! target)]
+                 (#'opencl/emit-intrinsic-expression
+                  (body/scalar-expression op type
+                    (if (= :fma op)
+                      [(body/literal 1.0 type) (body/literal 2.0 type)
+                       (body/literal 3.0 type)]
+                      [(body/literal 1.0 type) (body/literal 2.0 type)]))
+                  {:names {} :types {}})))]
+    (doseq [[type spelling] [[:float "__fmul_rn("] [:double "__dmul_rn("]]]
+      (is (str/starts-with? (emit :cuda :* type) spelling))
+      (is (str/starts-with? (emit :hip :* type)
+                           (dialect/noncontracting-multiply-name (dialect/resolve! :hip) type)))
+      (doseq [target [:opencl-intel :opencl-portable]]
+        (is (str/includes? (emit target :* type) " * "))))
+    (doseq [target [:opencl-intel :opencl-portable :cuda :hip]
+            type [:float :double]]
+      (is (str/starts-with? (emit target :fma type) "fma(")))))
+
+(deftest scalar-product-controls-are-self-contained-and-demand-driven
+  (doseq [target [:opencl-intel :opencl-portable :cuda :hip]
+          type [:float :double]
+          fused? [false true]]
+    (let [module (opencl/emit-scalar-module
+                  "scalar_product" (fixtures/scalar-product-body type fused?)
+                  {:target-dialect target})
+          source (:source module)]
+      (is (empty? (:compilation module)) "no external flag requirement is discarded")
+      (when (contains? #{:opencl-intel :opencl-portable} target)
+        (is (str/starts-with? source "#pragma OPENCL FP_CONTRACT OFF\n")))
+      (when (= :hip target)
+        (is (not (str/includes? source "#pragma clang fp contract"))
+            "protect only Float/Double products, not unrelated HIP arithmetic globally")
+        (is (= (not fused?) (str/includes? source "__asm__(\"\" : \"+v\"(product))")))
+        (is (not (str/includes? source "__fmul_rn(")))
+        (when-not fused?
+          (is (str/includes? source "requires AMD HIP"))
+          (is (not (str/includes? source "volatile"))
+              "the register boundary must not become a volatile memory spill"))))))
 
 (defn- scalar-kernel-body []
   (let [group 'query-row
@@ -363,6 +432,63 @@
         (let [result (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
                                "-fsyntax-only" "-" :in source)]
           (is (zero? (:exit result)) (:err result)))))))
+
+(deftest half-extrema-reuse-verified-widening-and-narrowing
+  (doseq [target [:opencl-portable :cuda :hip]
+          operator [:min :max]
+          make-body [fixtures/half-extremum-body fixtures/local-half-extremum-body]
+          :let [source (opencl/emit-scalar-kernel "half_extremum"
+                         (make-body operator) {:target-dialect target})]]
+    (is (str/includes? source (str "rstr_source_" (name operator) "_f32(")))
+    (is (str/includes? source "if (isnan(a)) return a;"))
+    (is (str/includes? source "signbit(a)"))
+    (is (str/includes? source (if (= :opencl-portable target)
+                              "convert_half_rte(" "__float2half_rn(")))
+    (when (= :opencl-portable target)
+      (is (str/includes? source "#pragma OPENCL EXTENSION cl_khr_fp16 : enable"))
+      (when (command-available? "clang")
+        (let [{:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                                         "-fsyntax-only" "-" :in source)]
+          (is (zero? exit) err))))))
+
+(deftest half-extrema-collectives-require-an-explicit-widening-schedule
+  (doseq [[target width reason] [[:opencl-portable 16 :kernel-body-opencl-collective-dtype]
+                                [:cuda 32 :kernel-body-c-collective]
+                                [:hip 32 :kernel-body-c-collective]]
+          operator [:min :max]]
+    (is (= reason
+           (try
+             (opencl/emit-scalar-kernel "half_collective"
+               (fixtures/floating-extrema-collective-body :half operator width)
+               {:target-dialect target})
+             nil
+             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+
+(deftest floating-extrema-collectives-preserve-source-semantics
+  (doseq [[target width] [[:opencl-portable 16] [:cuda 32] [:hip 32]]
+          type [:float :double]
+          operator [:min :max]
+          :let [source (opencl/emit-scalar-kernel
+                        "source_collective_extrema"
+                        (fixtures/floating-extrema-collective-body type operator width)
+                        {:target-dialect target})]]
+    (if (= :opencl-portable target)
+      (do
+        (is (str/includes? source "sub_group_any(isnan("))
+        (is (str/includes? source
+                           (str "== 0 && " (when (= :max operator) "!") "signbit(")))
+        (is (str/includes? source (str "sub_group_reduce_" (name operator) "(")))
+        (when (command-available? "clang")
+          (let [{:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                                           "-fsyntax-only" "-" :in source)]
+            (is (zero? exit) err))))
+      (let [helper (str "rstr_source_" (name operator) "_" (if (= :float type) "f32" "f64"))]
+        (is (= 1 (count (re-seq (re-pattern (str helper "\\([^)]*\\) \\{")) source))))
+        (is (str/includes? source (str "= " helper "(rstr_extremum,")))
+        (is (str/includes? source "if (isnan(a)) return a;"))
+        (when (command-available? ({:cuda "nvcc" :hip "hipcc"} target))
+          (let [{:keys [exit err]} (compile-c-family-source target source)]
+            (is (zero? exit) err)))))))
 
 (deftest wrapping-integral-collectives-use-unsigned-carriers
   (doseq [[target unsigned bitcast]
@@ -726,7 +852,9 @@
                                  (body/->ScalarStore 'out [0] 'narrowed nil)])
           source (opencl/emit-scalar-kernel "literal_narrowing" literal-kernel)]
       (is (str/includes? source "convert_float_rte(0.0)"))
-      (is (not (str/includes? source "rstr_narrow_f64_f32_rte"))))))
+      (is (str/includes? source "#pragma OPENCL EXTENSION cl_khr_fp64 : enable"))
+      (is (= 1 (count (re-seq #"rstr_narrow_f64_f32_rte\(" source)))
+          "the shared FP64 preamble defines the helper, but literal conversion does not call it"))))
 
 (deftest checked-integral-narrowing-reaches-capable-c-family-targets
   (testing "portable OpenCL declines because it has no standard terminating trap"
@@ -1030,6 +1158,4 @@
                                       :include-paths [(str cuda-home "/include")])]
         (is (pos? (alength (:ptx result))))
         (is (some #{"--fmad=false"} (:compiler-options result))))
-      (if (= "1" (System/getenv "RASTER_REQUIRE_NVRTC"))
-        (is false "Typed non-finite compile proof requires NVRTC and explicit CUDA_HOME")
-        (println "[NVRTC SKIP] typed non-finite source compile requires toolkit headers")))))
+      (device-probe/nvrtc-skip! "typed non-finite source compile requires toolkit headers"))))

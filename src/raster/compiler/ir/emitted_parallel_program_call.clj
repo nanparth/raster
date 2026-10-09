@@ -672,9 +672,14 @@
           (emitted-program/validate-with-physical-results! parallel-program))
         _ (when-not (and (map? result-views)
                          (every? (set (mapcat :results
-                                             (filter #(emitted-equation/emitted-equation?
-                                                       (equation-dispatch/boundary-equation
-                                                        (first (:operations %))))
+                                             (filter (fn [equation]
+                                                       (let [operation (first (:operations equation))]
+                                                         (and (or (emitted-equation/emitted-equation? operation)
+                                                                  (equation-dispatch/emitted-equation-dispatch? operation))
+                                                              (emitted-equation/emitted-equation?
+                                                               (:boundary
+                                                                (emitted-program/operation-projection
+                                                                 projections operation))))))
                                                      (:equations parallel-program))))
                                  (keys result-views)))
             (fail! :emitted-program-result-views

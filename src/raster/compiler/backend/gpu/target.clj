@@ -4,7 +4,8 @@
    Hardware descriptors state what a device can execute. These predicates state which concrete
    source dialect the currently selected backend leaf can emit; schedule-neutral compiler passes
    must not use them to constrain otherwise-portable schedules."
-  (:require [clojure.string :as str]))
+  (:require [clojure.string :as str]
+            [raster.compiler.passes.parallel.device :as device]))
 
 (defn kernel-body-c-dialect
   "Select the scalar/control KernelBody source dialect proven by a target descriptor.
@@ -38,3 +39,23 @@
    detected/catalogued Intel path until runtime backend capabilities become a first-class facet."
   [desc]
   (= :opencl-intel (kernel-body-c-dialect desc)))
+
+(defn source-dialect
+  "Select source spelling from the same hardware descriptor used by scheduling.
+
+   A missing optional descriptor still has a conservative family default: Level Zero is the
+   explicit Intel path, while generic OpenCL uses portable subgroup spelling."
+  [target backend descriptor]
+  (or (try
+        (some-> descriptor kernel-body-c-dialect)
+        (catch Throwable _ nil))
+      (case (device/device-type target)
+        :ze :opencl-intel
+        :ocl :opencl-portable
+        :cuda :cuda
+        :hip :hip
+        (case backend
+          :cuda :cuda
+          :hip :hip
+          nil))))
+

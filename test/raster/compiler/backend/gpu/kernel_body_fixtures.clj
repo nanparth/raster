@@ -6,6 +6,86 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.passes.parallel.scalar-expression-body :as scalar]))
 
+(defn floating-extrema-collective-body
+  "One subgroup reads runtime operands and writes its source-semantic extremum."
+  [type operator width]
+  (body/make
+   {:id [:floating-extrema-collective type operator width]
+    :parameters [(body/->KernelParameter 'x :input type [width] :global
+                                         (layout/row-major [width] type) :input)
+                 (body/->KernelParameter 'out :output type [1] :global
+                                         (layout/row-major [1] type) :result)]
+    :indices [(body/->IndexBinding 'lane :lane 0)]
+    :masks [(body/->Mask :lane-zero [(body/predicate :eq 'lane 0)])]
+    :operations [(body/->ScalarLoad (body/value 'operand type) 'x ['lane] nil nil :cached)
+                 (body/->Collective (body/value 'extremum type) :reduce :subgroup width
+                                    'operand operator nil (body/full-participation)
+                                    :implementation-defined {:overflow :ieee})
+                 (body/->ScalarStore 'out [0] 'extremum :lane-zero)]
+    :schedule {:subgroup-size width}
+    :launch (launch/spec {:workgroup-size [width] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
+(defn scalar-product-body
+  "Dynamic nested product/add or explicit FMA, shared by emission and instruction gates."
+  [type fused?]
+  (body/make
+   {:id [:scalar-product type fused?]
+    :parameters [(body/->KernelParameter 'a :scalar type [] nil nil :a)
+                 (body/->KernelParameter 'b :scalar type [] nil nil :b)
+                 (body/->KernelParameter 'c :scalar type [] nil nil :c)
+                 (body/->KernelParameter 'out :output type [1] :global
+                                         (layout/row-major [1] type) :result)]
+    :operations [(body/->ScalarCompute
+                  (body/value 'result type)
+                  (if fused?
+                    (body/scalar-expression :fma type ['a 'b 'c])
+                    (body/scalar-expression :+ type
+                      [(body/scalar-expression :* type ['a 'b]) 'c])))
+                 (body/->ScalarStore 'out [0] 'result nil)]
+    :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
+(defn half-extremum-body
+  "Typed half extrema select an operand through exact Float widening."
+  [operator]
+  (body/make
+   {:id [:half-extremum operator]
+    :parameters [(body/->KernelParameter 'x :input :half [1] :global
+                                         (layout/row-major [1] :half) :input)
+                 (body/->KernelParameter 'out :output :half [1] :global
+                                         (layout/row-major [1] :half) :result)]
+    :operations [(body/->ScalarLoad (body/value 'operand :half) 'x [0] nil nil :cached)
+                 (body/->ScalarCompute (body/value 'result :half)
+                                       (body/scalar-expression operator :half ['operand 'operand]))
+                 (body/->ScalarStore 'out [0] 'result nil)]
+    :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
+(defn local-half-extremum-body
+  "Float-only storage with expression-local half conversions and extrema."
+  [operator]
+  (body/make
+   {:id [:local-half-extremum operator]
+    :parameters [(body/->KernelParameter 'x :input :float [1] :global
+                                         (layout/row-major [1] :float) :input)
+                 (body/->KernelParameter 'out :output :float [1] :global
+                                         (layout/row-major [1] :float) :result)]
+    :operations [(body/->ScalarLoad (body/value 'operand :float) 'x [0] nil nil :cached)
+                 (body/->ScalarCompute (body/value 'result :float)
+                   (body/cast-expression
+                    (body/scalar-expression operator :half
+                      [(body/cast-expression 'operand :half :nearest-even :ieee)
+                       (body/cast-expression 'operand :half :nearest-even :ieee)])
+                    :float :exact :exact))
+                 (body/->ScalarStore 'out [0] 'result nil)]
+    :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
 (defn trapping-integral-cast-body
   "Checked signed narrowing fixture shared by emitter tests and hardware-free target CI."
   [source-type result-type]

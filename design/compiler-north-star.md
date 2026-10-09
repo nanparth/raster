@@ -133,8 +133,20 @@ and HIP reduction phases through nvcc/hipcc in CI. Graph families that have not 
 portable KernelBody fail at this boundary instead of embedding OpenCL source in a CUDA/HIP
 program. Typed one-dimensional SegMap now shares one scalar-expression lowering with SegFoldMap:
 stable loads, retained dtypes, scalar SSA, branches, and horizontally fused stores emit from the
-same KernelBody to all three C-family targets. Canonical loop/recur scalar carries become ordered
-KernelBody `ForLoop` regions rather than being reassociated as reductions. This is sufficient for
+same KernelBody to all three C-family targets.
+
+KernelBody math realization is separate from evaluation-order attestation: the shared intrinsic
+authority now records 23 C-family elementary target-library operations with implementation-defined
+accuracy, not correctly-rounded or JVM-bitwise guarantees. Float calls and explicit Double calls
+followed by Float conversion remain distinct SSA programs. This C-family facet does not describe
+WASM's polynomial realization. Named reproducible algorithms still require independent accuracy,
+derivative and cost evidence before claiming a complete cross-target math contract; do not silently
+widen every Float operation to reproduce one host library. Same-input real-model diagnostics
+demonstrate that a small tanh-library difference can amplify near derivative cancellation; retaining
+evaluation order alone therefore does not establish derivative-sensitive training parity.
+
+Canonical loop/recur scalar carries become ordered KernelBody `ForLoop` regions rather than being
+reassociated as reductions. This is sufficient for
 the public seven-stage GQA composition to emit entirely as CUDA/HIP and pass both vendor compilers;
 certified stencils and scans now lower their
 single- or three-phase schedule to target-neutral KernelBody scalar SSA, workgroup storage,
@@ -1505,6 +1517,18 @@ algorithm and ordered communication rounds. Each round expands mechanically to r
 steps, parallel legs cannot claim the same directed link, and the certificate retains both the
 semantic operation and its schedule. This makes ring/tree/native implementations replaceable while
 the dependency DAG and topology simulator account for their actual bytes and routes.
+
+Those communication-round schedules alone are analytical, not numerical all-reduce implementations.
+The first **landed and locally measured** arithmetic realization is a separately retained
+`CollectiveRefinement`: immutable contribution SSA, ancestry-preserving copies and generated binary
+combines. Every participant output contains each input contribution exactly once. Plan admission
+rederives the ordinary step DAG, checks full-region physical copies and the actual bound generated
+LinkPlans, and rejects unrelated writes to contribution storage. Its certificate retains the whole
+realization and explicit reassociation policy, with unchanged accumulation dtype and nearest-even
+rounding. Two- and three-worker OpenCL/Level Zero tests check complete sums against independent CPU
+answers on one physical GPU. This is numerical composition evidence, not measured network transport,
+scalability or a validated distributed transformer training step. Storage donation and general
+collective algorithms still require further proofs and workload acceptance.
 
 Axis-partitioned scientific values now use the same machinery for halo exchange. A
 semantic `HaloExchange` names the value, partition axis, halo width, and boundary policy. Scheduling

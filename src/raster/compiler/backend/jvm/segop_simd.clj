@@ -15,6 +15,7 @@
    - Decide phase decomposition (SegOp already decided)
    - Collect arrays/scalars (SegOp already has them)"
   (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.backend.jvm.bytecode :as bc]
             [raster.compiler.core.util :as util]
@@ -117,6 +118,14 @@
         (when-let [op (util/impl->op (second form))]
           (get op->canonical op)))))
 
+(defn- selected-parameter-tags
+  [form]
+  (or (::parameter-tags (meta form))
+      (when (and (seq? form) (= '.invk (first form)))
+        (let [info (types/sym-fn-info (second form))]
+          (or (:param-tags info)
+              (:param-tags (get @types/fn-interface-by-name (:iface-name info))))))))
+
 (defn normalize-invk
   "Rewrite (.invk impl args...) and qualified raster.*/raster.math/* forms
    to canonical (op args...) for SIMD.
@@ -130,7 +139,8 @@
     (let [canonical (infer-canonical-op form)]
       (if canonical
         (with-meta (apply list canonical (map normalize-invk (drop 2 form)))
-          (meta form))
+          ;; A nil signature is still a selected call, not an untyped legacy op.
+          (assoc (meta form) ::parameter-tags (selected-parameter-tags form)))
         ;; Unknown op — still recurse into args
         (with-meta (apply list '.invk (second form) (map normalize-invk (drop 2 form)))
           (meta form))))
@@ -296,6 +306,45 @@
   "Active Vector species element dtype while a scheduled SegOp is admitted."
   nil)
 
+(defn- floating-node-precision-compatible?
+  [expr elem-type]
+  (let [result-dtype (when (seq? expr)
+                       (dtype/dtype-for-scalar-tag (:raster.type/tag (meta expr))))
+        cast-dtype (when (seq? expr)
+                     (dtype/dtype-for-scalar-tag
+                      (descriptor/cast-result-tag (first expr))))
+        conversion-dtypes (when (soac-dialect/scalar-convert-form? expr)
+                            ((juxt :source-dtype :target-dtype)
+                             (:attributes (soac-dialect/scalar-convert-parts expr))))
+        comparison? (some? (descriptor/comparison-kind (descriptor/semantic-op expr)))
+        parameter-tags (selected-parameter-tags expr)]
+    (or (nil? elem-type)
+        (and (every? #(or (not (contains? #{:float :double} %)) (= elem-type %))
+                     (concat [result-dtype cast-dtype] conversion-dtypes))
+             ;; A Boolean result does not state the comparison's operand domain.
+             ;; Selected interface parameters own the conversions before comparison.
+             ;; Unknown typed comparisons retain scalar execution, not guessed domains.
+             (or (not comparison?)
+                 (and (seq parameter-tags)
+                      (= (count parameter-tags) (count (descriptor/call-args expr)))
+                      (every? #(= elem-type (dtype/dtype-for-scalar-tag %)) parameter-tags))
+                 (and (nil? parameter-tags)
+                      (not (contains? (meta expr) ::parameter-tags))
+                      (nil? (:raster.type/tag (meta expr)))
+                      (not (and (seq? expr) (= '.invk (first expr))))))))))
+
+(defn retained-floating-precision-compatible?
+  "Do retained floating computations/conversions agree with the active species?
+   This is a precision obligation, not complete vector admission. It does not
+   infer missing types. Typed comparison domains use selected interface parameters;
+   missing comparison signatures retain scalar execution. Integer conversion support
+   remains the emitter's responsibility (C SIMD supports widening that JVM SIMD
+   does not)."
+  [expr elem-type]
+  (and (floating-node-precision-compatible? expr elem-type)
+       (or (not (coll? expr))
+           (every? #(retained-floating-precision-compatible? % elem-type) expr))))
+
 (defn simd-able?
   "Check if an expression can be fully compiled to SIMD ops."
   ([expr idx-sym]
@@ -303,6 +352,12 @@
   ([expr idx-sym elem-type]
    (binding [*simd-element-type* (or elem-type *simd-element-type*)]
     (cond
+    ;; Canonicalizing a typed call preserves its result stamp, not permission to
+    ;; evaluate it at the destination species. In particular (float <f64 term>)
+    ;; must compute the term in f64 before narrowing. Mixed-species arithmetic
+    ;; needs an explicit lane-shape schedule; retain scalar execution meanwhile.
+    (not (floating-node-precision-compatible? expr *simd-element-type*))
+    false
     (number? expr) true
     (symbol? expr) true
     (some? (aget-form? expr idx-sym)) true
@@ -358,6 +413,7 @@
       (and (seq? cond-expr)
            (= 3 (count cond-expr))
            (contains? simd-compare-ops (first cond-expr))
+           (floating-node-precision-compatible? cond-expr *simd-element-type*)
            (simd-able? (nth cond-expr 1) idx-sym)
            (simd-able? (nth cond-expr 2) idx-sym)
            (simd-able? (nth expr 2) idx-sym)
@@ -1123,7 +1179,7 @@
                              (and (seq? a3) (= 'double (first a3)) (= acc (second a3))))))
                   ['+ '.add true]
                   :else [nil nil false])]
-            (when op
+            (when (and op (retained-floating-precision-compatible? lambda elem-type))
               (let [[acc-pos elem-raw]
                     (cond
                       fma? [:right (list '* (nth inner-body 1) (nth inner-body 2))]
@@ -1183,12 +1239,13 @@
                         simd-elems (vec (for [k (range nacc)]
                                           (let [e (emit-simd elem-expr idx (nth vec-envs k) species-sym elem-type)]
                                             (if (seq? e) (with-meta (apply list e) {:tag vec-tag}) e))))
-                        ;; FMA fusion: acc + a[i]*b[i] → DoubleVector.fma(b,c)=this*b+c → one
-                        ;; vfmadd231pd. Crucially we inline the fromArray loads INTO the .fma so
+                        ;; Only an explicit source FMA authorizes contraction. A certified
+                        ;; addition monoid may reassociate sums, but its element multiplication
+                        ;; retains a separate rounding boundary. For source FMA, inline loads so
                         ;; C2 folds the memory load into the FMA instruction (vfmadd ymm,ymm,[mem])
                         ;; and unrolls deeply — matching hand-tuned Java. Pre-binding loads to vec
                         ;; syms yields register-only FMA + separate vmovupd (slower, shallow unroll).
-                        fma-f1 (when (and (= op '+) (contains? #{:double :float} elem-type)
+                        fma-f1 (when (and fma? (= op '+) (contains? #{:double :float} elem-type)
                                           (seq? elem-expr) (= 3 (count elem-expr))
                                           (contains? #{'* 'clojure.core/* 'raster.numeric/*} (first elem-expr)))
                                  (nth elem-expr 1))

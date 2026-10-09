@@ -1,5 +1,102 @@
 # Local compiler evidence — 2026-09-27
 
+## SIMD retained-operation precision — 2026-10-09
+
+A surface `deftm` mapping a Float array with a Double scalar and the expression
+`(+ (aget src i) (float (* gain gain)))` exposed a vector/scalar-tail disagreement.
+At `gain=1.00000006`, zero inputs produced `1.0000001` in scalar execution and
+the vector tail, but `1.0000002` in the vector lanes. The original walked multiply
+is stamped Double; canonical SIMD arithmetic retained that stamp but ignored it,
+broadcasting the operands into the Float species before multiplying.
+
+JVM scheduled SegMap admission with an active species now checks retained floating operation result stamps against the
+active species, using the existing dtype projection rather than reconstructing
+types from operator names. Mixed-width computations retain scalar execution until
+an explicit mixed-species lane-shape schedule exists. Homogeneous typed operations
+remain admitted. The executable regression uses two lengths and changed scalar
+inputs, with an independent Double-then-Float reference; admission controls cover
+both narrowing and widening boundaries. This does not establish real-model training
+acceptance or complete mixed-width vector support.
+At that checkpoint, JVM stencil and C-SIMD callers without an active species,
+reduction-root operation precision, and typed comparison domains remained follow-ups. A
+public native-C execution of this fixture also returns the correct result, but does
+not establish that its vector admission applied this guard.
+
+The follow-up separates retained floating precision obligations from emitter syntax
+admission. Stencil now carries the active species, while C map and reduction schedules
+use the same precision predicate without losing their supported integer-widening path.
+C map checks canonical conversion facts before projecting them back into source casts.
+Both reduction emitters check the complete retained recurrence, not only the extracted
+element. Positive and negative hardware-free admission controls cover these consumers;
+the affected suites, including executed native C integer widening, pass 53 tests and
+207 assertions locally. Missing result stamps are not inferred, and Boolean-result
+comparison operand domains remain unproven. This is not complete mixed-width SIMD
+lowering, a general numerical equivalence proof, or actual-weight training acceptance.
+
+A subsequent public Float-map probe comparing Double scalars `1.00000006` and
+`1.00000007` returned 1 in scalar code and the tail, but 2 in all 64 vector lanes.
+The two scalars collapse to one Float; a Boolean result stamp alone cannot certify
+the operand domain. Canonical SIMD calls now retain parameter tags from the selected
+declared interface, using existing function-info metadata and the shared interface
+index, not parsing implementation names or adding a registry. Compare-and-blend
+admission checks that signature as well as the operands. Missing typed signatures,
+arity mismatches and mismatched integer/floating comparison domains retain scalar
+execution. Untyped compatibility syntax remains explicitly outside that proof.
+Changed-input execution and positive/negative admission controls bring the affected
+suite to 55 tests / 218 assertions locally. Explicit mixed-species lowering and
+type-complete removal of untyped compatibility remain follow-ups.
+
+## Scalar non-contraction investigation — 2026-10-08
+
+Separate ScalarCompute multiply/add nodes are not sufficient evidence of two machine-level
+roundings. The generated decomposed register-contraction fixture, compiled with the local
+`nvcc -ptx -arch=sm_80` defaults, contains 256 FMA instructions. Explicit fused realization
+remains a separate compiler policy; neither realization is accepted as a replacement for
+the unchanged real-weight training oracle.
+
+A small independent HIP compilation probe tests three operations over resident pointers:
+ordinary multiply followed by add, `__fmul_rn` followed by `__fadd_rn`, and explicit `fmaf`.
+The translation unit sets `#pragma clang fp contract(off)` after the HIP runtime header.
+With local HIP 5.7.31921-9999 / Ubuntu Clang 21.1.2, `--offload-arch=gfx1100
+--cuda-device-only -S -O2` produces separate `v_mul_f32_e64` and `v_dual_add_f32` for
+ordinary arithmetic, but `v_fmac_f32_e64` for both named-RN and explicit-fused cases.
+The installed HIP header defines the named multiplication as plain `x * y`; its previously
+parsed helper body retains LLVM `contract` flags despite the later pragma. Merely borrowing
+CUDA's intrinsic names would therefore not preserve the same contract on this HIP toolchain.
+
+Device LLVM output (`-S -emit-llvm`) also shows this distinction, both with defaults and
+with an explicit `-ffp-contract=fast`: ordinary arithmetic has unflagged `fmul`/`fadd`,
+whereas the named helpers retain `contract`. That local pragma behavior must not be promoted
+to a portable guarantee: [Clang documents that `fast` can override controlling pragmas](https://clang.llvm.org/docs/LanguageExtensions.html).
+[NVIDIA documents non-contraction for its rounded multiply](https://docs.nvidia.com/cuda/libdevice-users-guide/__nv_fmul_rn.html);
+[OpenCL provides its own FP_CONTRACT control](https://registry.khronos.org/OpenCL/specs/unified/refpages/man/html/FP_CONTRACT.html).
+
+The follow-up protects Float/Double scalar products in the shared target lowering: CUDA's
+rounded multiply and AMD HIP's empty read/write VGPR asm fence preserve the intermediate
+product; OpenCL uses FP_CONTRACT OFF. The HIP fence changes no product bits, has no memory
+clobber or volatile spill, and allows unused results to be eliminated. It requires AMD HIP,
+not a claim about other HIP platforms. Helper discovery is demand-driven and shared with
+matrix scalar epilogues. Explicit canonical FMA and matrix multiply-accumulate instructions
+remain explicit. Controls are entirely in the emitted source, already part of artifact/cache
+identity; there are no additional flags to lose or a second numerical-policy registry.
+
+The new shared Float/Double nested product/add and explicit-FMA fixtures compile through
+both hardware-free vendor instruction checks. CUDA emits separate rounded multiplication
+for the decomposed cases and FMA for explicit cases. HIP emits separate multiplication/add
+even with `-ffp-contract=fast`, and explicit FMA remains fused. These checks are added to
+the existing vendor CI gates. Both multiplication and addition must be present for decomposed
+cases. Review removed a redundant global HIP contraction pragma: only Float/Double products
+are protected, avoiding unvalidated global changes to unrelated HIP arithmetic. The affected
+scalar/matrix source suites pass 34 tests / 474 assertions. The existing bit-sensitive public
+register replay oracle passes 1 test / 36 assertions on OpenCL and Level Zero, including
+changed inputs and both product policies.
+
+This is bounded Float/Double product non-contraction evidence, not proof of all floating-point
+properties, CUDA/HIP execution, instruction throughput, or real-model training acceptance.
+Half scalar arithmetic, arbitrary fast-math reassociation/denormal settings, and target-library
+transcendental accuracy are not made exact by this change. The unchanged real-weight training
+gate still needs its matrix association and full cotangent differences localized.
+
 ## Public training and resident GEMM checkpoint — 2026-10-06
 
 PR #1054 (`e57ba203`) migrates the existing mixed Gemma fixture onto public equation-first
@@ -1250,3 +1347,618 @@ trust flag is introduced. Argument, alias, scalar conversion, effect, numerical 
 checks remain in place. The affected scheduled-body, emitted-equation and OpenCL emitter
 suites pass 46 tests / 503 assertions in the capped warm REPL. This measures removed duplicate
 validation, not end-to-end compilation speedup or training numerical acceptance.
+
+### Real-checkpoint softmax precision experiment — 2026-10-08
+
+The held two-layer training gate used the unchanged finetune source/oracle at
+`9e9ba5d62f3822f056e01c37231d7eaa7c84947c`, the checkpoint SHA-256
+`700b710a9a99c295ed546647aa81cacf9f81f4c573ea2be613a0e2517a44afab`,
+sequence length 2, batch 1, rank 16 and nonzero adapter B matrices. An isolated
+same-input attention diagnostic established that native Float exponential rounding
+can change softmax weights by one ULP; explicitly evaluating Double exp and casting
+back to Float eliminated that isolated discrepancy on the local OpenCL device.
+
+Applying this explicit precision boundary consistently to both denominator and
+numerator in the production materialized softmax did not close the original model
+gate. Predicted/reference losses were 17921.275/17921.271875, input-gradient worst
+relative error was 0.0040108606627614705, and 11 of 28 adapter gradients exceeded
+the unchanged 0.02 worst-relative threshold (maximum 1.1454261263845888).
+These are diagnostic results, not accepted training parity or a performance claim.
+
+The source-default experiment and its experiment-specific tests were removed:
+extra Double exponentials are not justified by an isolated match when the full
+gate still fails. The accepted explicit precision/target-library realization
+contracts remain intact. Next diagnosis must compare actual model intermediates
+and pullbacks at shared operands to distinguish inherited forward rounding from
+local derivative/lowering errors; no oracle rewrite or tolerance relaxation is
+authorized by this evidence. Temporary experiment scripts are not release tests.
+
+The subsequent unchanged layer-0 forward-stage diagnostic localized the first
+divergence to `linear-nb` inside the Q/K/V LoRA projections. Input RMS normalization
+matched exactly. Q/K normalization and RoPE also matched exactly on shared inputs;
+their end-to-end differences were inherited. Splitting Q projection showed local
+differences in all three matrix products, while residual addition matched exactly
+on shared operands. Base Q product maximum absolute difference from native BLAS
+was 0.0001068115234375.
+
+An independent dot reference over the same checkpoint operands established that
+the generated base Q product matched ordered Float multiply-then-add exactly
+(all 2048 outputs). Neither native BLAS nor ordered Float FMA matched that result.
+Against a Double accumulated, Float stored diagnostic, native BLAS maximum
+absolute error was 0.000030517578125 and generated GPU error was
+0.000091552734375. These checks distinguish arithmetic realization from a lost
+operand or wrong index in this isolated forward stage; they do not establish
+correctness of every backward stage, justify changing the training oracle, or
+close full-model gradient parity. Next work must isolate same-input matrix
+pullbacks and assess a declared numerical policy for native-BLAS boundaries.
+
+The public `linear-dx` and `linear-dW` helpers were then executed on the same
+checkpoint weights/normalized inputs with one identical deterministic synthetic
+cotangent, rather than an inherited full-model cotangent. Both generated helpers
+matched independent ordered Float multiply-then-add references exactly. Native
+BLAS differed (dx maximum absolute difference 0.0000022649765014648438;
+dW 0.000030517578125). For the two-row dW reduction, native BLAS matched the
+independent ordered Float FMA reference exactly, while the generated helper did
+not. This establishes a concrete contraction-realization difference in both
+forward and pullback, not a reason to turn on fusion implicitly under an exact
+source contract. It is still limited to these operands/helpers: full-model
+cotangent propagation and original gradient acceptance remain unverified.
+
+### Transposed-left register staging — 2026-10-08
+
+The unchanged real-checkpoint gate, when explicitly requesting the fused register
+schedule, declined at a backward `AᵀB` contraction before model execution. The
+register lowerer admitted NN and NT but not TN; the verified dense-matrix view
+already represented the missing orientation. This was an execution-capability
+gap, not evidence that changing arithmetic policy closes model-gradient parity.
+
+The shared register body now stages physical TN storage `[K,M]` in contiguous
+order into the existing canonical `[M,K]` workgroup tile. Its multiply loop,
+barriers, scalar ABI, product policy and output mapping are unchanged. TT,
+batched products and unsupported layouts remain outside this extension.
+
+Structural tests cover unequal physical dimensions and canonical staging for
+NT/TN (14 tests, 111 assertions). Public local OpenCL/Level Zero checks cover
+NN/NT/TN decomposed and fused rounding, changed-input replay, and NN/TN ragged
+dimensions including `[M,K,N]=[65,17,67]` under fixed and dispatch-selected
+schedules, against an independent ordered Float oracle (2 tests, 102 assertions,
+no failures/errors). The compile-fixture corpus emits the TN body for portable
+OpenCL, CUDA and HIP. The TN fixture also compiles locally to `sm_80` PTX and
+`gfx1100` device assembly, with HIP contraction enabled. This is hardware-free
+compilation, not vendor execution or throughput evidence.
+Full real-checkpoint acceptance remains a separate, unchanged gate.
+
+With TN admitted, the explicit fused-register diagnostic executed the unchanged
+two-layer model and reached its numerical gate rather than declining compilation.
+It still failed at iteration 0: predicted/reference loss
+17921.278125/17921.271875, input-gradient worst-relative error
+0.005268926908926802, and 15 of 28 adapter gradients above the unchanged 0.02
+threshold (maximum 0.7991052642515084). This rules out merely switching to
+ordered FMA as a sufficient fix. The capability extension is independently
+validated; the fused policy is not promoted to a default or a training-parity
+claim. Actual shared-operand pullbacks and inherited cotangents still need
+localization against the monolithic CPU AD oracle.
+
+### Actual shared-cotangent pullbacks — 2026-10-09
+
+Two isolated real-checkpoint block VJPs were run with the native CPU forward
+input and native CPU output cotangent supplied identically to CPU and GPU.
+The original external backward declaration and explicit fused register schedule
+were used. This removes inter-layer input/cotangent drift but still recomputes
+each block's internal forward intermediates on its respective target. Layer 1
+still exceeds the adapter threshold for Ak and Bg; layer 0 exceeds it for Ak,
+Bk, Av, Bg, Au, Bu, Ad and Bd. Thus inter-layer drift is not the only cause.
+These are diagnostic comparisons, not a substitute acceptance oracle.
+
+Wrapping the existing Float matrix-pullback typed interfaces captured 42 calls
+from the CPU layer-1 VJP without changing any of its 14 adapter gradients
+(all coordinates bit-identical). Each adapter gradient is the direct result of
+one captured `linear-dW` call. On those exact actual-model operands, all 14
+generated fused TN products match both native BLAS and an independent ordered
+Float Math/fma dot reference exactly. Their reduction width is two, matching
+the unchanged sequence length. This rules out those isolated adapter-matrix
+products as the source of the observed layer-1 discrepancy; it does not prove
+other widths, the full forward recomputation, input cotangent propagation,
+nonlinear adjoints, or the final training gate. Next localization follows the
+actual cotangents upstream and checks input-gradient products at shared operands.
+
+All 21 captured layer-1 input-gradient matrix calls were also executed on
+identical operands. Generated fused NN products match ordered Float Math/fma
+exactly in every coordinate. Native BLAS uses different accumulation results;
+the largest observed same-input absolute difference is 0.00067138671875.
+Double-dot diagnostics improve some differences and worsen others; they are not
+an automatic justification for widening the production graph. The remaining
+full-block mismatch must be diagnosed through its recomputed intermediates and
+cotangent propagation, rather than attributing it to the isolated adapter-TN
+products or replacing the monolithic oracle with a convenient local one.
+
+A separate CPU-only arithmetic simulation replaced the three typed matrix
+helpers with independent Double-dot/Float-store implementations, leaving the
+model, AD rules, nonlinear operations and native-BLAS monolithic reference
+unchanged. Widening all matrix calls still fails 8 of 28 adapter checks (maximum
+1.1460127391180726). Widening only input-gradient products leaves two failures
+(layer-1 Ak 0.02482720148392874 and Ag 0.03098584773269312). Neither diagnostic
+is a GPU execution result or an accepted replacement oracle; no production
+widening follows from it. Better local dot accuracy alone is insufficient
+evidence that the complete numerical contract is met.
+
+Replacing only the CPU matrix helpers with ordered Float FMA also fails 15
+adapter checks (maximum 0.8192590523403551), with predicted loss 17921.278125,
+the same loss as the executed fused GPU chain. The unchanged nonlinear CPU
+path is retained in this simulation. Thus matrix realization alone can
+reproduce the acceptance failure pattern; this is not a proof that every GPU
+nonlinear operation or full cotangent agrees with its CPU counterpart.
+
+Captured actual layer-1 normalization calls give additional bounds. All six
+chunked RMSNorm forward calls match CPU exactly at shared inputs. All six
+backward input-gradient calls have small differences: maximum absolute error
+0.00006103515625 and maximum coordinate-relative error
+0.00004876049798283915 (these maxima come from different calls). Capture
+preserves the original CPU adapter gradients exactly. A proposed partial-state
+diagnostic based on evaluating the retained body, including a return-projected
+anonymous ftm, did not reproduce the original compiled CPU output exactly.
+Its partial states are therefore rejected as an oracle, not used to justify
+production changes. A valid partial-state comparison must first establish
+observational equivalence through the same specialization and emission path.
+
+The native reference in this warm JVM is the selected MKL threaded LP64
+component provider (`libmkl_intel_lp64.so`), not the CUDA agent's separately
+reported OpenBLAS batch-extension environment. Provider selection is metadata,
+not a numerical proof; the captured dot comparisons above supply the functional
+evidence for these operands. Do not conflate this accumulation-order finding
+with the independent OpenBLAS interleaved-batch crash.
+
+A bounded CPU-only partitioned-FMA ladder was also checked before adding a
+production reduction policy. Strided 4/8/16-chain products each fail 9 adapter
+checks; contiguous 4/8/16-chain products fail 10/9/13 respectively. Tiny
+reductions (including the two-row adapter products) retain one FMA chain.
+The model, nonlinear CPU operations and native monolithic oracle are unchanged.
+These finite candidates do not establish that all blocked policies fail, but
+none supplies evidence for a numerical fix or a new production default. Keep
+parallel-reduction performance work separate from unchanged model acceptance.
+
+### Mixed-precision JVM helper extraction: retained call boundaries
+
+A subsequent partial-state diagnostic used named `deftm` projections with the
+original Array-float return annotation and verified that its projected output
+was bit-identical to the original captured CPU normalization call. Its partial
+dot state differed from the GPU at 35 of 64 coordinates. An independent oracle
+identified the CPU realization as Float inner products with Double weighted
+terms and a Double carry; the GPU matched narrowing the weighted term before
+each Float addition. However, the original retained loop binder and addition
+were both stamped Float. This was not evidence for introducing a new GPU
+precision mode.
+
+The JVM helper-extraction path normalized typed `.invk` calls into generic
+arithmetic, discarding both result stamps and typed-call operand conversions.
+That changed a Float addition accepting a Double term into generic Double
+arithmetic. A cancelling weighted fold reproduced the difference independently
+of the model: the small method returned zero, but the extracted version returned
+one. Retaining the original typed calls fixes that regression without a new
+type registry or a model-specific lowering. The existing typed JVM call emitter
+remains responsible for conversions; helper partitioning is not permission to
+change numerical semantics.
+
+With fresh named projections after this change, the actual model's PSS, PC and
+k1 states match the GPU exactly, and PC matches the independent Float-carry
+oracle exactly. Downstream k2 still differs at one coordinate, and dx differs
+at 536 of 1280 coordinates (maximum absolute 0.001953125, maximum coordinate
+relative 2.3887326823598837e-7). These diagnostics do not establish acceptance
+of the full real-model gradient gate or certify helper-call performance. The
+affected JVM loop and bytecode suites pass 50 tests / 139 assertions, including
+lazy and AOT changed-input checks across the actual extraction threshold.
+
+Cold CI exposed one test-metric assumption: the chunked Float RMSNorm backward
+was compared to a different reduction tree using error divided by the resulting
+dx coordinate. The maximum was 0.0010544952502931275 against 0.001 after restored
+Float rounding. Because dx subtracts two potentially large terms, that ratio
+can amplify harmless reassociation at cancellation coordinates. The test now
+uses an independent Double mathematical reference and the sum of the two term
+magnitudes as its backward-error scale, for both Float and Double schedules.
+The existing numerical bounds and finite-difference checks remain, and both
+schedules are checked against the independent reference as well as each other.
+Zero scales require exact agreement; no arbitrary absolute-error floor is added.
+No production normalization formula or pinned model acceptance metric changes.
+The three affected JVM/normalization namespaces pass 55 tests / 201 assertions
+in the fresh capped REPL, including the unchanged finite-difference checks.
+
+A fresh capped JVM reran the held real-weight harness at the original source
+pins and tolerances with no pre-fix CPU classes. Loss remains 17921.2765625 vs
+17921.271875; input-gradient error is 0.006813176206858781. Twelve of 28 adapter
+checks still fail, with maximum 1.0649456537233917. This fixes a genuine compiler
+partitioning inconsistency but does not close the real-weight acceptance gate.
+
+A subsequent cold run including retained scalar and SIMD precision fixes has
+the same loss pair, input-gradient error 0.0019965899080526235, and eleven of 28
+adapter checks failing (maximum 0.6251970207953054). An additional diagnostic
+using the public `:gemm-precision :f32-scalar` option produces the identical
+metrics. Thus this experiment does not attribute the remaining disagreement to
+default mixed-precision matrix selection. Source pins, checkpoint, adapter seeds,
+reference arithmetic and acceptance tolerances are unchanged. These are still
+failed model checks, not a training certificate.
+
+### Quantized native fold: retained arithmetic versus output storage
+
+The wider CI suite exposed an obsolete vectorization assertion in the Q4 x8
+test. Its source explicitly converts both scales and the accumulator to Double,
+then stores Float after each block. The old all-Float AVX2 lowering instead rounds
+the scale product early. A one-block independent fixture distinguishes them:
+Float scales 1.0000001 and 0.3, folded integer dot 3, produce 0.90000015 with
+retained Double arithmetic but 0.9000001 with early Float rounding. Tests compare
+raw Float bits for the JVM source, native scalar and SIMD-requested compilation,
+with changed scales and the same compiled functions.
+
+The precision guard therefore declines this mixed-precision fold; the Q8 x8
+sibling uses the same Double-compute/Float-store structure and shares this debt.
+The integer
+dot override remains, and the separate homogeneous Float integer-widening SIMD
+execution regression remains required. This is an explicit performance debt,
+not evidence of performance parity: restore vectorization through typed
+Float-load → Double-compute → Float-store conversions, preserving lane counts,
+integer widths and rounding boundaries. Do not change the kernel's arithmetic or
+remove the precision guard merely to recover the previous intrinsic spelling.
+
+### Shared scalar partial evaluation: typed operation boundaries
+
+The same conversion-erasure class exists outside JVM helper extraction. Shared
+scalar simplification and partial evaluation turned a retained Float addition
+of Float 1e8 and Double 1 into Double 100000001; a nested cancelling Float
+program changed from zero to one. Direct invocation of the original selected
+typed methods supplies an independent executable semantic oracle.
+
+These passes now preserve `.invk` nodes and their selected implementation/type
+metadata while simplifying arguments. Generic arithmetic identities and constant
+folds do not establish the selected operation's operand conversions, result
+rounding or IEEE behavior. Unknown calls are also preserved rather than guessed
+from mangled impl names. Direct untyped arithmetic retains its existing rules.
+Recursive and fixpoint entrypoints are checked as well as one-step helpers;
+regressions include mixed constants, intervening rounding, signed zero, infinity
+times zero, metadata and child constant propagation. This is not a new type or
+function registry, and it does not add a separate typed scalar evaluator.
+
+The unused recursive scalar normalizer is deleted after checking production and
+test references. Its sole test dependency now uses the existing shared implementation-name
+decoder strictly as a provenance diagnostic, not as an arithmetic lowering rule.
+The positive and deliberately corrupted-call controls preserve that regression.
+The SIMD backend has a distinct `normalize-invk` requiring its own proof and
+execution regression before a global no-erasure claim. Safe typed scalar
+optimizations should derive from existing declared signatures and canonical
+conversion/numeric authorities, not reintroduce generic rewriting through a
+different namespace. Compile-size and performance effects remain to be measured.
+
+### Native SIMD storage precision is independent of arithmetic precision
+
+C-SIMD previously selected a vector pointer load from the arithmetic species
+alone. A Double map/reduction over a retained Float array therefore emitted a
+Double pointer load, which can read the wrong values and exceed the allocation.
+The emitter now checks the existing AOT storage-type environment. AVX2 supports
+Float storage into Double arithmetic with a four-Float load followed by an exact
+four-lane widening conversion, declared in the existing intrinsics facet. Vector
+iteration and scalar tails use the same arithmetic precision; reduction-tail
+products explicitly widen each Float operand before multiplication.
+
+Unsupported known byte/long storage, narrowing loads, and conflicting output
+storage decline before vector emission. Existing i32-to-Float map widening remains
+supported; it is not permission to reinterpret byte or Long arrays as i32 arrays.
+Only an entirely empty storage environment retains the legacy direct-emitter
+interface; partial environments require every accessed/output storage fact and
+fail closed if propagation omitted one. This is not a proof of arbitrary
+mixed-storage support. Native map/reduction tests cover changed
+inputs and lengths around vector boundaries; no model oracle or tolerance changes.
+This enables a genuine storage conversion but does not yet implement mixed
+arithmetic domains or Double-compute-to-Float-store quantized folds.
+
+### Uniform Double computation with a terminal Float store
+
+The native SIMD map now separates its arithmetic species from output storage.
+Retained uniform Double operations can use four-lane Double vectors and end in
+a four-Float store. A canonical terminal Double→Float conversion is moved only
+to that store when its declared nearest-even/IEEE policy matches the existing C
+conversion lowering; other policies and interior Float roundings decline. Fully
+retained input/output storage facts and both narrowing facet entries are required.
+Every arithmetic operation in the species-changing route must retain Double
+result evidence. An unstamped inner Float product cannot be promoted just because
+its parent contains a Double cast. There is no blanket permission to widen source
+arithmetic or infer missing types.
+
+Public deftm/native/JVM raw-bit checks use Double gains whose squared values
+distinguish Double arithmetic from early Float rounding, varied inputs, and lengths
+around four-lane boundaries. These checks use the ordinary native floating-point
+environment; they do not certify semantics under a modified host rounding mode.
+The Q4/Q8 x8 quant folds still require integer-width-aware vector conversion of
+their folded integer dots; this floating-only schedule does not close that debt.
+
+### Integer lane width must survive widening into Float
+
+A public typed map reading an Int array, subtracting a Long offset and storing
+Float reproduced a separate miscompile. For Integer/MAX_VALUE minus -1 at length
+nine, the old eight-lane i32 subtraction produced negative values, while the JVM
+and scalar tail produced positive values. A Long offset of 2^32 also exposed
+truncated scalar broadcasts. Known Int storage is not proof that its subsequent
+Long arithmetic may execute at i32 width.
+
+Int-domain SIMD arithmetic now requires retained i32 result evidence; Long or
+missing widths retain scalar execution. Public changed-input tests cover these
+boundaries, while a positive typed Integer subtraction still emits i32 operations
+and Float widening and agrees with the JVM. The old emitter fixture claimed Long
+subtraction while checking an i32 schedule; it now supplies genuine i32 evidence.
+This is a width check, not a new checked-overflow or general integer certificate.
+Restoring Long quant-fold vectorization requires a width-preserving i64 schedule
+and conversions, or proven range refinement from the general compiler—not an
+assumption that quantization-specific values fit i32.
+
+### Native compilation must not silently authorize fast math
+
+The default native C compiler flags previously enabled `-ffast-math` for every
+source program. That independently permits eliminating NaN checks, ignoring
+signed zero, reassociating arithmetic and contracting multiply/add, without a
+numerical permission from the source or schedule. Default native compilation
+now omits that flag and disables implicit contraction. Explicit intrinsics remain
+explicit; this does not certify the legality of every existing SIMD schedule.
+Compiler flags already participate in native artifact identity, so older
+fast-math artifacts are not reused.
+
+A compiled-and-loaded runtime-input regression checks NaN classification,
+negative zero and a Float multiply/add that differs from FMA. This is a semantic
+default change, not a performance result: implicit autovectorization may change,
+especially for transcendental loops. Legal relaxed schedules should recover
+performance through explicit numerical contracts rather than global flags.
+Preserving the environment alone did not fix JVM-compatible scalar and SIMD
+min/max: C `fmin`/`fmax` semantics needed the separate lowering described below.
+
+### Native extrema realize JVM Math/numeric semantics
+
+The two-array public Float max reproduction returned a finite value for
+max(NaN, 1) and negative zero for max(+0, -0), unlike JVM execution. Native-only
+scalar min/max implementations now live in the shared intrinsic descriptors.
+C overload selection uses the actual emitted operand types without evaluating
+them, and each argument is evaluated once by the selected helper. Float, Double
+and integral operations are distinct; integral extrema do not pass through FP.
+The shared source emitter applies the same target extrema override to retained
+devirtualized calls as to Java Math calls.
+
+The AVX2 facet uses lane-wise zero-tie repair and NaN propagation instead of
+exposing raw asymmetric min/max instructions as the source operation. Public
+Float Math and Double raster.numeric maps compare native scalar/SIMD results
+against JVM execution across empty, short, exact-vector and tail lengths,
+with changed inputs, both NaN positions, signed-zero orders, infinities, and
+Double values that differ only below Float precision. Tests require an emitted
+vector call, not merely a correct scalar fallback. Additional native checks
+cover single operand evaluation and Long extrema beyond exact Double range.
+NaNs are compared by classification, not payload identity; finite values and
+signed zero are compared by raw bits. This closes native map extrema only:
+other target facets and reductions' numerical legality require their own gates.
+
+### Typed C-family scalar extrema — production OpenCL reproduction
+
+The native fix did not cover KernelBody. A four-element equation-first OpenCL
+max map returned 1.0 for either operand position containing NaN, while the JVM
+returned NaN. The typed C-family scalar emitter now realizes Float/Double min/max
+with demand-driven, dtype-specific helpers owned by the same intrinsic authority
+as the native fix. Their return logic is shared, not separately reimplemented.
+The dialect layer adds only OpenCL/CUDA/HIP qualifiers. Integer extrema retain
+their existing target lowering. Half scalar extrema widen exactly to Float,
+select the source-semantic operand there, and reuse the existing verified
+nearest-even narrowing emitter; no separate half helper or type inference is
+introduced. Other unsupported floating carriers are rejected.
+Capability demand includes canonical retained ValueSpec, Literal and ScalarExpr
+dtypes, not just buffer storage. A Float-only buffer kernel with expression-local
+Half casts/extrema therefore requests FP16; local Double literals also request
+FP64. The source fixtures include this storage-free boundary.
+Double helper demand contributes to the OpenCL FP64 extension requirement even
+when the surrounding result is not a named Double value.
+
+Native and GPU tests share source fixtures and exceptional-value cases. The
+production equation-first OpenCL test compares JVM/device results for Float and
+Double min/max, with per-device FP64 gating, changed-input replay and explicit
+artifact close. Hardware-free tests check all three C-family realizations, and
+the public CUDA/HIP compile corpus includes these four fixtures. This does not
+certify floating subgroup/workgroup collectives or CUDA/HIP numerical execution;
+their separate NaN/zero contracts remain to be validated.
+
+Independent review caught the shared scalar-region consumer boundary: matrix
+epilogues also use this expression emitter. Extrema helper demand now travels
+through the existing intrinsic helper module, so CUDA/HIP fragment epilogues and
+ordinary scalar kernels use the same requirements seam. Intel DPAS source also
+consumes that module rather than emitting a dangling helper call. Focused matrix
+epilogue checks and the vendor compile corpus cover this compositional boundary.
+
+### Subgroup extrema source semantics (2026-10-09 follow-up)
+
+A verified KernelBody subgroup reduction reproduced four device/JVM mismatches:
+Float min and max each discarded a NaN placed in either the first or last lane
+among numeric operands. This is distinct from the scalar extrema defect above.
+The intrinsic remains source min/max; its collective lowering may change the
+tree, not the operator's NaN or signed-zero semantics.
+
+OpenCL retains the native reduction and adds two uniformly executed subgroup
+predicate reductions, detecting any NaN and a preferred-sign zero operand. It
+then reconstructs NaN classification or the correct zero sign without depending
+on the native builtin's zero-sign choice. The operand is evaluated once. CUDA/HIP
+shuffle trees instead use the existing demand-driven typed extrema helper, so
+there is no additional operator registry or separate numerical implementation.
+
+The shared KernelBody fixture feeds hardware-free Float/Double source checks,
+the mandatory CUDA/HIP compile corpus, and an OpenCL device/JVM oracle with
+changed resident inputs covering NaNs at both ends, all-NaN lanes, zero ties,
+ordinary values and infinities. This does not certify CUDA/HIP execution or
+performance, workgroup extrema, NaN payload identity, or unrelated reductions.
+The OpenCL predicate overhead is a correctness cost, not a measured speedup.
+
+### Real-weight training conditioning localization (2026-10-09)
+
+The unchanged two-layer Gemma training gate remains declined: eleven of 28
+adapter tensors exceed its coordinate-relative threshold. Loss error is
+0.004687500000727596, input-gradient error 0.0019965899080526235, and the
+largest adapter coordinate-relative error is 0.6251970207953054. The harness
+pin remains 4520615d7a970a9bf9e438c1830553224a06de2d, finetune pin
+9e9ba5d62f3822f056e01c37231d7eaa7c84947c, and pretrained reader pin
+f4c2bb476884c36b5e12a8fa934eb2ddf4ca2ead. Checkpoint SHA-256 remains
+700b710a9a99c295ed546647aa81cacf9f81f4c573ea2be613a0e2517a44afab.
+No model math, reference provider, threshold or source policy was changed.
+
+Capturing the already evaluated gradient pairs gives relative L2 error at most
+2.4444621704846155e-5 per adapter tensor; the largest maximum-absolute-error
+normalized by reference maximum magnitude is 5.477350704221801e-5. Those
+summaries do not replace the original near-zero-sensitive coordinate check.
+
+A separate CPU-only counterfactual substitutes ordered Float multiply then add
+for the three matrix helpers, leaving model operations and AD otherwise
+unchanged. This matches the default GPU register body's declared decomposed
+arithmetic, not an FMA policy. Its loss is 17921.2765625, equal to the observed
+GPU loss, and its comparisons with the unchanged native reference fail the
+same eleven adapter keys. GPU comparisons with that counterfactual still fail
+four keys: layer-0 Bk (0.03741095119665075), Bg (0.1734874921955559), Au
+(0.042673148433426046), and Ad (0.021022411274254693). Matrix realization
+order therefore explains much of the pattern, but not the entire discrepancy.
+An ordered Float FMA counterfactual is a distinct experiment, not the default
+GPU policy or an acceptance oracle.
+
+At actual captured layer-1 native-model operands and cotangents, public generated
+OpenCL GELU forward is bit-identical for 4096 elements. GELU backward differs
+by at most 7.62939453125e-6 absolute and 0.0011374907921994236 coordinate-relative.
+The three attention pullbacks at their actual captured inputs differ by at most
+3.814697265625e-6 (dQ), 9.5367431640625e-6 (dK), and 2.9802322387695312e-8
+(dV) absolute. Capture wrappers preserve all fourteen native adapter gradients
+bit-for-bit. These are identical-input operation checks, not full-chain parity;
+small discrepancies can be amplified by cancellation in later operations.
+
+Next: localize the four residual counterfactual failures and audit reduction
+numerical permissions across CPU/JVM/GPU. A reassociation certificate alone
+must not silently authorize contraction of a separately rounded product into
+FMA. Keep the real-model acceptance gate held throughout this work.
+
+### CPU dot reductions retain element-product rounding
+
+The reassociation audit found two independent consumers contracting ordinary
+`acc + a[i]*b[i]` recurrences without a contraction certificate: native C AVX2
+and JVM Vector API. The canonical reduction algebra certifies the sum tree;
+it does not authorize removing the element product's rounding boundary.
+Both emitters now keep multiply followed by add for an ordinary dot. Explicit
+source FMA still uses its intrinsic realization rather than being decomposed.
+No new operation registry, type inference or model-specific kernel is added.
+
+The regression puts -1 and a separately rounded product of (1+2^-27) and
+(1-2^-27) in successive visits to the same Double vector lane. The scheduled
+sum is zero, but FMA leaves a nonzero residual. Native Float uses the analogous
+2^-13 operands. Changed signs and zero tails exercise changed inputs and both
+vector/scalar portions without assuming an ordered scalar reduction oracle.
+The dot remains vectorized; source checks assert the retained multiply and
+absence of implicit FMA, while an explicit JVM FMA map retains `.fma`.
+
+Restoring only the pre-fix emitter functions from commit 2888c61b makes these
+same tests fail (native: sixteen failed assertions, JVM: eight; no test errors).
+The fixed two affected namespaces pass 49 tests / 266 assertions, including
+explicit-FMA preservation. This validates the isolated numerical
+permission boundary, not real-weight training parity or performance. Removing
+an implicit FMA can cost throughput; a future relaxed schedule must declare its
+contraction permission rather than relying on a syntactic product recognizer.
+
+The first full CI run found a stale native RMSNorm integration assertion that
+explicitly required `_mm256_fmadd_pd`. Its interpreter/scalar/vector numerical
+comparisons passed. The assertion now requires vector multiply and add and
+rejects implicit FMA, retaining the original numerical oracle and tolerances.
+The affected native AOT namespace passes 13 tests / 275 assertions locally.
+
+### Elementary math accuracy is separate from retained precision
+
+At the actual captured native-model layer-0 cotangent, GELU forward is again
+bit-identical for 4096 elements. Backward differs by at most
+5.817413330078125e-5 absolute and 0.7065903880116969 coordinate-relative, with
+1354 differing elements. Capturing the GELU boundary preserves all fourteen
+native layer-0 adapter gradients bit-for-bit. This isolates an operation-level
+accuracy question, not the complete cause of the remaining model discrepancy.
+
+The retained specialization selects `raster.math/tanh_m_float-impl`, with Float
+call-result metadata and the `IFn__float` interface. Generated OpenCL likewise
+uses Float `tanh`; surrounding explicit Double operations remain Double. The
+Float JVM helper implements its fallback using `float(Math.tanh(double(x)))`.
+Canonical Float target math and that JVM fallback are not a bitwise equivalence
+proof. A subsequent attempt to intercept the scalar tanh helper captured zero
+calls; it is rejected as input-capture evidence rather than used to infer an
+evaluation path or a numerical fix.
+
+Previously only exponential ScalarExpr values declared their target-library
+realization. The existing intrinsic authority now states the same descriptive
+accuracy contract for the 23 C-family elementary-library operations. A shared
+descriptor constructor removes repeated facet declarations. KernelBody's
+existing validator requires this evidence and rejects missing, forged
+correctly-rounded, or otherwise unsupported accuracy claims. Precision remains
+independent: retained Float calls stay Float; explicit Double calls followed by
+Float conversion keep both operations. Tests supply retained frontend dtype
+facts, not an emitter-side function/type inference list.
+
+This does not change target source, add a bounded-error guarantee, select a
+reproducible algorithm, widen model math, or relax training acceptance. WASM's
+polynomial facet remains separate. The real-weight gate remains held; resolving
+the near-zero derivative sensitivity still needs numerical and workload-level
+evidence rather than declaring library accuracy sufficient for that gate.
+
+### Native absolute-value precision and vector admission
+
+Public Float/Double `deftm` maps using Math/abs and raster.numeric/abs exposed
+31 failing assertions before the native correction. The scalar native facet
+now selects the actual C operand type, evaluates the operand once, and handles
+signed integer minima without undefined negation. Double inputs no longer
+narrow through fabsf. GPU library facets are unchanged.
+
+The same regression exposed a separate SIMD admission defect: an unavailable
+vector operation name could stringify as empty text and silently turn a unary
+operation into its operand. Float/poly vector operations now require an actual
+intrinsic or decline emission. AVX2 Float/Double abs clears the sign bit, with
+scalar tails retaining the native source semantics. The focused three-test
+run passed 291 assertions, including raw-bit floating comparisons, integer
+minima, operand evaluation count, and changed inputs across vector boundaries.
+No model oracle, provider, precision policy or acceptance tolerance changed.
+
+Independent review caught the native `_Float16` boundary, which the initial
+generic selector omitted despite its presence in native dtype admission. The
+helper now retains the previous Float-widening/half-rounding path explicitly,
+with compiled checks for half result type and exactly representable half values.
+
+The first rebased full CI run exposed an older Clang target without `_Float16`:
+unconditional helper declarations broke ordinary Float/Double abs consumers.
+Half declarations and generic associations now depend on the compiler's half
+capability macro. A forced-absent capability test executes the ordinary Float
+helper, while the half boundary test reports whether actual half or its ordinary
+Float control branch ran. The affected native/SIMD suites pass 40 tests and
+768 assertions locally; full CI still supplies the older-toolchain acceptance.
+
+### Verified layer-0 tanh boundary and pullback sensitivity
+
+The follow-up uses the same captured native-model layer-0 GELU-backward inputs
+and cotangent, not newly sampled inputs. An instrumented parametric source
+retains the original Raster numeric operators and first reproduces all 4096
+original pullback values bit-for-bit. Its recorded Float tanh operands and
+results also reproduce the public JVM Float helper bit-for-bit. Instrumentation
+that fails this control is rejected; the earlier zero-call capture is not used.
+
+On those exact operands, generated Float target tanh differs from the JVM
+fallback in 2074 elements, by at most 1.1920928955078125e-7 absolute and
+3.765291834651375e-7 coordinate-relative. Explicit Double tanh followed by Float
+conversion agrees in all 4096 values for this local OpenCL execution. This is a
+case-specific observation, not a general Double-libm/JVM equivalence theorem.
+
+A separate diagnostic takes the tanh values as resident input while retaining
+the unchanged pullback arithmetic. Its JVM result with the original tanh
+values first matches the captured model pullback bit-for-bit. CPU and GPU then
+agree bit-for-bit for each of three supplied arrays: original JVM tanh, target
+Float tanh, and explicitly widened tanh. The first and third also match the
+original model pullback exactly. The target Float values induce 1357 differences
+from that pullback on both systems, with maximum absolute error
+5.817413330078125e-5 and coordinate-relative error 0.7065903880116969.
+
+This demonstrates amplification of the tanh-library difference near derivative
+cancellation. It is not a complete replay of the original GPU GELU kernel:
+that earlier kernel had 1354 differing outputs, so three differing coordinates
+still distinguish its internal operand evaluation from this supplied-boundary
+experiment. Nor does this close the full training gate or attribute every
+adapter discrepancy to tanh. The pinned model, native provider, original oracle,
+source precision and acceptance threshold remain unchanged. Do not globally
+widen Float calls or manufacture a correctly-rounded accuracy certificate.
+
+The next model acceptance work should resolve this explicitly at the existing
+typed operation/realization boundary and test the whole unchanged gradient
+trajectory. A named reproducible implementation would need independent accuracy,
+derivative and cost evidence; an implementation-defined library descriptor alone
+does not establish derivative-sensitive cross-target parity.

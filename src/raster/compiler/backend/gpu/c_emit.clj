@@ -652,16 +652,23 @@
     ;; :c and :cpp both use C-style casts
     (str "(" type-name ")(" inner-str ")")))
 
+(defn- resolve-c-function
+  "Apply target function overrides to canonical C spellings, including retained
+   devirtualized calls. Function aliases must not bypass the target facet."
+  [base]
+  (case base
+      "fabs" (:float-abs *emit-config* "fabs")
+      "fmax" (:float-max *emit-config* "fmax")
+      "fmin" (:float-min *emit-config* "fmin")
+      base))
+
 (defn- resolve-op
   "Resolve an op symbol to a C function name, applying backend overrides."
   [op]
   (let [base (get op-map op)]
     (case base
-      "fabs" (:float-abs *emit-config* "fabs")
-      "fmax" (:float-max *emit-config* "fmax")
-      "fmin" (:float-min *emit-config* "fmin")
       "atan2" (or (:atan2-name *emit-config*) "atan2")
-      (or base (c-symbol op)))))
+      (or (resolve-c-function base) (c-symbol op)))))
 
 ;; ================================================================
 ;; Expression & statement emission
@@ -1516,7 +1523,7 @@
                       ;; the operator; a str/join over one arg would drop it entirely.
                       (str "(" (:op c-op) (first es) ")")
                       (str "(" (str/join (str " " (:op c-op) " ") es) ")")))
-           :fn    (str (:op c-op) "("
+           :fn    (str (resolve-c-function (:op c-op)) "("
                        (str/join ", " (map #(emit-expr % idx-sym array-syms opencl-idx) args)) ")")
            :floored-mod (let [ea (emit-expr (first args) idx-sym array-syms opencl-idx)
                               eb (emit-expr (second args) idx-sym array-syms opencl-idx)]
@@ -1559,7 +1566,7 @@
                       ;; the operator; a str/join over one arg would drop it entirely.
                       (str "(" (:op c-op) (first es) ")")
                       (str "(" (str/join (str " " (:op c-op) " ") es) ")")))
-           :fn    (str (:op c-op) "("
+           :fn    (str (resolve-c-function (:op c-op)) "("
                        (str/join ", " (map #(emit-expr % idx-sym array-syms opencl-idx) args)) ")")
            :floored-mod (let [ea (emit-expr (first args) idx-sym array-syms opencl-idx)
                               eb (emit-expr (second args) idx-sym array-syms opencl-idx)]
@@ -2044,15 +2051,19 @@
         standards (set (keep :language-standard contracts))]
     (when (> (count standards) 1)
       (throw (ex-info "conflicting intrinsic compilation standards" {:standards standards})))
-    {:source (str/join "\n" (distinct (keep :source helpers)))
+    {:source (str/join "\n"
+                       (distinct
+                        (concat (keep :source helpers)
+                                (let [extrema (intrinsics/c-floating-extremum-helper-sources body-str)]
+                                  (when (seq extrema) [extrema])))))
      :compilation (if (seq contracts)
                     {:language-standard (first standards)
                      :extensions (into #{} (mapcat :extensions) contracts)}
                     {})}))
 
 (defn intrinsic-helper-sources
-  "The C helper DEFINITIONS for every registry intrinsic whose C function is CALLED in
-   `body-str`, each once, in table order. Registry-driven: an intrinsic that carries a
+  "Demand-driven C helper definitions, including dtype-specialized source extrema,
+   each once. Registry-driven: an intrinsic that carries a
    `:c-helper-src` (today `:dp4a` → `inline int rstr_dp4a(...)`) is defined iff its `:c :fn`
    name appears in the emitted body.
 

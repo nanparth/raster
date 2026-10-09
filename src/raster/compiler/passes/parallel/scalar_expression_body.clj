@@ -308,6 +308,21 @@
                                                      (body/literal 0 type))) :cached)]
                    :result id :type type :range range})))
 
+            (index-bound-range [expression env]
+              ;; Read only already-checked scalar intervals through the index owner's exact
+              ;; widening representation. Compound/unknown index expressions retain no proof.
+              (cond
+                (integer? expression) (scalar-range/literal expression :int)
+                (symbol? expression)
+                (known-range expression (canon-type (or (get env expression)
+                                                       (get scalar-types expression) :long)))
+                (instance? raster.compiler.ir.kernel_body.IndexCast expression)
+                (let [range (index-bound-range (:argument expression) env)]
+                  (when (and (= :exact (:overflow expression))
+                             (scalar-range/contained-in-dtype? range (:dtype expression)))
+                    range))
+                :else nil))
+
             (compute-ssa [operator result-type arguments options range]
               (reserve! arguments)
               (let [result-type (canon-type result-type)
@@ -719,9 +734,9 @@
                         [accumulator index] parameters
                         fold-type (canon-type (:dtype attributes))
                         _ (when-not (and (= 2 (count parameters))
-                                         (= 1 (count body-results)) (= fold-type expected))
+                                         (= 1 (count body-results)))
                             (decline! :typed-scalar-fold-shape
-                                      "canonical scalar fold must match its expected typed result"
+                                      "canonical scalar fold requires one typed carry and result"
                                       {:expression expression :expected expected
                                        :dtype fold-type :parameters parameters
                                        :locals fold-locals :results body-results}))
@@ -729,6 +744,14 @@
                         carry (fresh "fold-carry")
                         result (fresh "fold-result")
                         initial (lower (:identity attributes) fold-type env)
+                        lower-bound (lower-index (:lower attributes 0) (set (keys env)))
+                        upper-bound (lower-index (:extent attributes) (set (keys env)))
+                        ;; KernelBody independently uses this conservative bound hull, including
+                        ;; the upper endpoint. Keep negative/empty bounds rather than assuming a
+                        ;; fixture's positive trip count, and establish it before lowering locals.
+                        _ (remember-range! loop-index
+                                           (scalar-range/hull [(index-bound-range lower-bound env)
+                                                               (index-bound-range upper-bound env)]))
                         local-state
                         (reduce
                          (fn [{:keys [operations substitutions environment]} local]
@@ -767,9 +790,7 @@
                         loop-operation
                         (body/->ForLoop
                          (body/value loop-index :long)
-                         (lower-index (:lower attributes 0) (set (keys env)))
-                         (lower-index (:extent attributes) (set (keys env)))
-                         1
+                         lower-bound upper-bound 1
                          [(body/->LoopArg (body/value carry fold-type) (:result initial))]
                          (conj (into (vec (:operations local-state)) (:operations update))
                                (body/->Yield [(:result update)]))
@@ -779,8 +800,13 @@
                            (= :inclusive (:upper-bound attributes))
                            (assoc :upper-bound :inclusive)
                            (:algebra attributes) (assoc :algebra (:algebra attributes))))]
-                    {:operations (conj (vec (:operations initial)) loop-operation)
-                     :result result :type fold-type})
+                    (let [computed {:operations (conj (vec (:operations initial)) loop-operation)
+                                    :result result :type fold-type}]
+                      ;; Consumer/storage precision does not change the declared carry. Convert
+                      ;; only the completed result, using the same conversion authority as SSA ops.
+                      (if (or (nil? expected) (= fold-type (canon-type expected)))
+                        computed
+                        (cast-lowered computed expected expression))))
 
                   (dialect/product-component-form? expression)
                   (let [[_ product ordinal] expression

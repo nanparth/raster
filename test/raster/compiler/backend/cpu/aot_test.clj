@@ -17,6 +17,8 @@
             [raster.par]
             [raster.math]
             [raster.compiler.backend.cpu.aot :as aot]
+            [raster.compiler.fixtures.absolute :as absolute]
+            [raster.compiler.fixtures.extrema :as extrema]
             [raster.compiler.ir.parallel-program :as parallel-program]))
 
 (deftest qualified-integer-size-casts-use-the-shared-descriptor
@@ -43,6 +45,26 @@
       (* (double ulps)
          (max (Math/ulp (double expected))
               (Math/ulp (double actual))))))
+
+(deftest native-absolute-preserves-public-source-precision
+  (doseq [[function dtype array-fn bits] absolute/cases simd? [false true]]
+    (let [native (aot/compile-aot-c function dtype :simd? simd?)]
+      (when (and simd? (#{#'absolute/float-math-abs #'absolute/double-math-abs} function))
+        (is (re-find (re-pattern (str "rstr_avx2_abs_" (if (= dtype :float) "f32" "f64") "\\("))
+                     (:c-source (meta native)))))
+      (doseq [length [0 1 3 4 5 7 8 9 17]
+              values [(absolute/operands dtype) (reverse (absolute/operands dtype))]]
+        (let [input (array-fn (take length (cycle values)))
+              reference (function input length)
+              actual (native input length)]
+          (is (= (count reference) (count actual)))
+          (is (every? true?
+                      (map (fn [expected observed]
+                             (if (Double/isNaN (double expected))
+                               (Double/isNaN (double observed))
+                               (= (bits expected) (bits observed))))
+                           reference actual))
+              (str function " " dtype " simd=" simd? " length=" length)))))))
 
 ;; ---- kernels under test (proper raster style: rn/ arithmetic, ra/ arrays) ----
 
@@ -139,18 +161,37 @@
             "the composition is a single fused C function, not two")
         (is (clojure.string/includes? src "double eps")
             "the Double scalar param is declared double, not int")
-        ;; The fused normalization reduction is compiled with -ffast-math. Retaining the
-        ;; source Long induction type may change clang's reassociation relative to the JVM,
-        ;; while preserving the same numerical algorithm. Keep this as a tight ULP oracle;
-        ;; exact equality here was compiler/architecture dependent.
+        ;; Keep the existing cross-backend ULP oracle. Native compilation no longer
+        ;; grants blanket fast-math permission; this tolerance is not such permission.
         (is (every? true? (map #(within-double-ulps? 4 %1 %2) rs cs))
             "per-block scales within four double ULPs")
-        ;; q is within 1 ULP of the reference: -ffast-math reassociation in the
-        ;; reduction can shift a value across a rounding boundary (inference-grade,
-        ;; same as llama.cpp), so allow an off-by-one, never more.
+        ;; Retain the existing quantization boundary oracle without loosening it.
         (is (every? #(<= (Math/abs (- (int (first %)) (int (second %)))) 1)
                     (map vector rq cq))
             "int8 output within 1 ULP of the lazy-JIT reference")))))
+
+(deftest native-extrema-preserve-source-semantics
+  (when (clang-available?)
+    (doseq [[v dtype array-fn bits op] extrema/cases
+            simd? [false true]
+            :let [native (aot/compile-aot-c v dtype :simd? simd?)
+                  pairs extrema/operand-pairs]]
+      (when simd?
+        ;; Definitions occur once; a second occurrence proves a vector call was
+        ;; actually emitted rather than a passing scalar fallback.
+        (let [name (str "rstr_avx2_" (name op) "_" (if (= dtype :float) "f32" "f64"))]
+          (is (< 1 (count (re-seq (re-pattern (str name "\\(")) (:c-source (meta native))))))))
+      (doseq [n [0 1 3 4 5 7 8 9 17]
+              shift [0 4 8]
+              :let [inputs (take n (drop shift (cycle pairs)))
+                    x (array-fn (map first inputs))
+                    z (array-fn (map second inputs))
+                    actual (array-fn n)
+                    expected (array-fn n)]]
+        (native x z actual n)
+        (@v x z expected n)
+        (is (extrema/same-result? bits actual expected)
+            (str (:name (meta v)) " simd=" simd? " n=" n " shift=" shift))))))
 
 (deftest cpu-c-round-half-up
   (when (clang-available?)
@@ -195,7 +236,7 @@
 ;; ---- #27: explicit C-SIMD reduction (compile-aot-c :simd? true) ----
 
 ;; rms-norm with the variance reduction expressed as a reduce! SOAC (par/reduce),
-;; so :simd? true PRESERVES it and emits an AVX2 __m256 FMA loop (via csimd)
+;; so :simd? true PRESERVES it and emits an AVX2 __m256 mul/add loop (via csimd)
 ;; instead of a scalar loop left to clang auto-vec. Array output + reduction
 ;; intermediate = the real target shape (rms-norm / quant-GEMV).
 (deftm rmsnorm-red [x :- (Array double) w :- (Array double) n :- Long eps :- Double] :- (Array double)
@@ -208,11 +249,15 @@
 
 (deftest cpu-c-simd-reduction
   (when (clang-available?)
-    (testing ":simd? true emits an __m256 FMA reduction and matches the scalar path + interpreter"
+    (testing ":simd? true emits separately rounded vector products and matches the scalar path + interpreter"
       (let [f-simd (aot/compile-aot-c #'rmsnorm-red :double :simd? true)
             f-scal (aot/compile-aot-c #'rmsnorm-red :double)]
-        (is (re-find #"_mm256_fmadd_pd" (:c-source (meta f-simd)))
-            ":simd? true lowers the reduce! to a vector FMA loop")
+        (is (re-find #"_mm256_mul_pd" (:c-source (meta f-simd)))
+            ":simd? true retains the vector element product")
+        (is (re-find #"_mm256_add_pd" (:c-source (meta f-simd)))
+            ":simd? true retains the reassociated vector sum")
+        (is (not (re-find #"_mm256_fmadd_pd" (:c-source (meta f-simd))))
+            "reassociation alone does not authorize implicit FMA")
         (is (not (re-find #"_mm256_fmadd_pd" (:c-source (meta f-scal))))
             ":simd? false stays scalar (clang auto-vec only)")
         (doseq [n [16 64 257 1000]]

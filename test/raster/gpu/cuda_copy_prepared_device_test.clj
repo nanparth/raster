@@ -1,11 +1,11 @@
 (ns raster.gpu.cuda-copy-prepared-device-test
   "Public copy/prepared runtime proof; artifact installation is an explicit test fixture."
-  (:require [clojure.test :refer [deftest is]]
+  (:require [raster.gpu.device-probe :as device-probe]
+            [clojure.test :refer [deftest is]]
             [raster.compiler.backend.gpu.kernel-body-compile-fixtures :as fixtures]
             [raster.compiler.equation-first :as equation]
             [raster.gpu.core :as gpu]
             [raster.gpu.cuda-driver :as driver]
-            [raster.gpu.cuda-driver-probe :as probe]
             [raster.gpu.cuda-runtime :as runtime]
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.gpu.runtime-root :as root]))
@@ -65,14 +65,12 @@
         (is (= 0 (root/lease-count runtime/state)))))))
 
 (deftest required-resident-copy-float-and-encoded-half
-  (if (= :ready (:status (probe/probe)))
+  (if @device-probe/cuda-available?
     (doseq [dt [:float :half]] (copy-proof! dt))
-    (if (= "1" (System/getenv "RASTER_REQUIRE_CUDA_DEVICE"))
-      (is false "CUDA device required for resident copy proof")
-      (println "[CUDA SKIP] Resident copy proof"))))
+    (device-probe/cuda-skip! "Resident copy proof")))
 
 (deftest required-generated-map-public-prepared-async-replay-and-retirement
-  (if (= :ready (:status (probe/probe)))
+  (if @device-probe/cuda-available?
     (with-native-spy
       (fn [ops]
         (let [n 259 session (gpu/make-session :cuda:0)
@@ -132,6 +130,4 @@
                                                 :device (runtime/execution-device-info)})))
             (finally (gpu/close-session! session)))
           (is (= 0 (root/lease-count runtime/state))))))
-    (if (= "1" (System/getenv "RASTER_REQUIRE_CUDA_DEVICE"))
-      (is false "CUDA device required for prepared async generated-map proof")
-      (println "[CUDA SKIP] Prepared async proof"))))
+    (device-probe/cuda-skip! "Prepared async proof")))

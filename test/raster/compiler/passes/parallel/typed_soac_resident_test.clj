@@ -209,3 +209,23 @@
     (doseq [value transform-inputs]
       (is (not (resident/resident-scalar-value? (get-in (dialect/facts result) [:values value])))))
     (is (= result (dialect/validate! result)))))
+
+(deftest terminal-device-read-keeps-logical-rank-zero-resident-storage
+  ;; Exact terminal source operation captured from both loss wrappers in the corpus.
+  (let [source '(let* [write (raster.par/map-void! i n
+                          (clojure.core/aset out i (clojure.core/aget x i)))
+                       loss (clojure.core/double (clojure.core/aget out 0))] loss)
+        typed (frontend/form->program source
+                                      {:dtype :double :array-types {'out :double 'x :double}
+                                       :scalar-types {'loss :double 'n :long}})]
+    (is (some? typed) "the retained terminal read has a checked TypedSOAC equation")
+    (when typed
+      (let [[realized _] (resident/realize typed)
+            result 'loss
+            value (get-in (dialect/facts realized) [:values result])]
+        (is (= [] (:shape value)))
+        (is (= :double (:dtype value)))
+        (is (= {:kind :resident-scalar-buffer :elements 1} (:representation value)))
+        (is (= :device (:memory-space value)))
+        (is (= realized (dialect/validate! realized)))))))
+

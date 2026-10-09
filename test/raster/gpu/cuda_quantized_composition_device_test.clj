@@ -1,7 +1,8 @@
 (ns raster.gpu.cuda-quantized-composition-device-test
   "Resident public Q8_K quantization → expanded Q4_K projection.
    Independent literal reference data is bounded; seeded controls remain compatibility."
-  (:require [clojure.test :refer [deftest is]]
+  (:require [raster.gpu.device-probe :as device-probe]
+            [clojure.test :refer [deftest is]]
             [raster.quant.kernels-k :as kernels]
             [raster.quant.pack :as pack]
             [raster.compiler.backend.cpu.quant :as quant]
@@ -351,4 +352,4 @@
                       [(seeded-values 1280 210) (seeded-values 1280 212)
                        (let [x (seeded-values 1280 213)]
                          (java.util.Arrays/fill x 0 640 (float 0.0)) x)])))))
-    (println "[CUDA SKIP] required composition device proof not requested")))
+    (device-probe/cuda-skip! "required composition device proof not requested" :not-requested)))

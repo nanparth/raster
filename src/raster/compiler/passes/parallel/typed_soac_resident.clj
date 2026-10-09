@@ -300,7 +300,7 @@
         [(dialect/make facts rewritten (dialect/outputs program))
          {:resident-uniform-input-loads (count removed)}]))))
 
-(defn realize
+(defn- realize-reductions
   "Return `[program stats]`, realizing every eligible non-escaping scalar reduction.
 
    A root declines realization when it is a program result or is used as an element array,
@@ -403,3 +403,68 @@
             result (dialect/make facts rewritten (dialect/outputs program))]
         [result {:resident-reductions (count roots)
                  :inlined-scalars (count removed-scalars)}]))))
+
+(defn- realize-device-scalars
+  [program]
+  (let [facts (dialect/facts program)
+        equations (dialect/equations program)
+        infos (mapv operation-info equations)
+        uses (group-by first (use-sites equations))
+        consumer-kinds (into {} (map (juxt :id :kind)) infos)
+        roots
+        (reduce
+         (fn [roots {:keys [id kind results captures parameters locals body-results]}]
+           (let [result (first results)
+                 value (get-in facts [:values result])
+                 parameter-values (zipmap parameters captures)
+                 buffer-read? (some (fn [expression]
+                                      (when (descriptor/aget-call? expression)
+                                        (let [capture (get parameter-values
+                                                           (descriptor/aget-array-sym expression))]
+                                          (seq (get-in facts [:values capture :shape])))))
+                                    (tree-seq coll? seq
+                                              (concat (map :init locals) body-results)))
+                 resident-dependency? (some roots captures)
+                 scalar-uses (get uses result)]
+             (if (and (= :scalar kind) (= 1 (count results))
+                      (or buffer-read? resident-dependency?)
+                      (= :tensor (:kind value)) (= [] (:shape value))
+                      (contains? #{:float :double} (:dtype value))
+                      (empty? (get-in facts [:equations id :effects]))
+                      (every? #(and (= :capture (get-in % [1 :role]))
+                                    (contains? #{:scalar :map :effect-map :scatter :stencil
+                                                 :reduce :segmented-reduce :scan}
+                                               (get consumer-kinds (get-in % [1 :equation]))))
+                              scalar-uses)
+                      (= [result] (dialect/physical-results facts
+                                                          (first (filter #(= id (second %)) equations)))))
+               (conj roots result)
+               roots)))
+         #{} infos)]
+    (if (empty? roots)
+      [program {:resident-scalars 0}]
+      (let [values (reduce (fn [values root]
+                             (-> values
+                                 (assoc-in [root :representation]
+                                           {:kind resident-representation :elements 1})
+                                 (assoc-in [root :memory-space] :device)))
+                           (:values facts) roots)
+            rewritten (mapv (fn [equation info]
+                              (let [rewritten (rewrite-consumer info values {} #{} roots)]
+                                ;; Unaffected operations may have additional checked regions,
+                                ;; notably a product reduction's independent combine lambda.
+                                (if (= rewritten info) equation (emit-equation rewritten))))
+                            equations infos)
+            realized (dialect/make (assoc facts :values values) rewritten
+                                  (dialect/outputs program))]
+        [realized {:resident-scalars (count roots)}]))))
+
+(defn realize
+  "Realize checked reduction and retained sequential scalar results in existing rank-zero storage.
+
+   Retained floating scalar regions that read device arrays receive their own ordered device
+   schedule; their expression is not replaced by a parallel fold or evaluated on host tokens."
+  [program]
+  (let [[program reduction-stats] (realize-reductions program)
+        [program scalar-stats] (realize-device-scalars program)]
+    [program (merge reduction-stats scalar-stats)]))

@@ -20,3 +20,14 @@
     (is (nil? (target/kernel-body-c-dialect
                {:device-type :gpu :backend :opencl :vendor "AMD"}))))
   (is (nil? (target/kernel-body-c-dialect {:device-type :cpu :backend :cuda}))))
+
+(deftest canonical-source-family-does-not-grant-subgroup-capabilities
+  (let [descriptor {:device-type :gpu :backend :ocl :vendor "NVIDIA"}]
+    (is (nil? (target/kernel-body-c-dialect descriptor)))
+    (is (= :opencl-portable (target/source-dialect :ocl:0 :ocl descriptor)))
+    (is (not (target/intel-opencl-subgroup-dialect? descriptor))))
+  (doseq [[device backend expected] [[:ze:0 :ze :opencl-intel]
+                                    [:cuda:0 :cuda :cuda]
+                                    [:hip:0 :hip :hip]
+                                    [:unknown:0 :unknown nil]]]
+    (is (= expected (target/source-dialect device backend nil)))))

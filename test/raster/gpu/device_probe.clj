@@ -1,5 +1,5 @@
 (ns raster.gpu.device-probe
-  "Structured test gates for the OpenCL runtime.
+  "Structured test gates for optional native runtimes and explicit qualification lanes.
 
    A missing device is a legitimate, visible skip on generic CI.  A namespace load failure is a
    test failure.  Driver/query failures are visible skips unless RASTER_EXPECT_OPENCL declares
@@ -81,6 +81,7 @@
     :gpu-device (= :gpu (:type device))
     ;; Indexed attention and the scheduled reductions use sub-group lanes; an OpenCL 1.2 CPU
     ;; implementation without cl_khr_subgroups (PoCL 1.8 on CI images) cannot build them.
+    :intel-subgroups (contains? (extension-set device) "cl_intel_subgroups")
     :subgroups (let [extensions (extension-set device)]
                  (or (contains? extensions "cl_khr_subgroups")
                      (contains? extensions "cl_intel_subgroups")))
@@ -178,3 +179,81 @@
          (str "opencl-skip! called for " test-label " while OpenCL is available")))
 
        (throw (ex-info "Unknown OpenCL probe status" {:result result}))))))
+
+
+(defn probe-cuda-with
+  "Classify the context-free driver query without conflating a namespace failure with absence."
+  [{:keys [load! probe!]}]
+  (let [loaded (try (load!) {:ok true}
+                    (catch Throwable error {:ok false :error error}))]
+    (if-not (:ok loaded)
+      {:backend :cuda :status :load-failed :error (:error loaded)}
+      (try
+        (let [result (probe!)
+              status (:status result)]
+          (case status
+            :ready (if (seq (:devices result))
+                     (assoc result :backend :cuda :status :available)
+                     (throw (ex-info "ready CUDA probe has no device" {:result result})))
+            (:no-device :unavailable) (assoc result :backend :cuda)
+            :driver-error (assoc result :backend :cuda :status :probe-error
+                                 :error (ex-info "CUDA driver initialization failed" result))
+            (throw (ex-info "unknown CUDA driver probe status" {:result result}))))
+        (catch Throwable error {:backend :cuda :status :probe-error :error error})))))
+
+(def cuda-status
+  (delay
+    (probe-cuda-with
+     {:load! #(require 'raster.gpu.cuda-driver-probe)
+      :probe! #(let [probe (resolve 'raster.gpu.cuda-driver-probe/probe)]
+                 (when-not (ifn? probe)
+                   (throw (ex-info "CUDA driver probe API is incomplete" {})))
+                 (probe))})))
+
+(def cuda-available? (delay (= :available (:status @cuda-status))))
+
+(defonce ^:private native-skip-log (atom {}))
+
+(defonce ^:private native-summary-hook
+  (delay
+    (.addShutdownHook
+     (Runtime/getRuntime)
+     (Thread.
+      (fn []
+        ;; Explicitly unrequested tests must not start a driver probe at JVM shutdown.
+        (println
+         (str "  [NATIVE SUITE] recorded gate markers " (pr-str @native-skip-log))))))
+    true))
+
+(defn native-skip!
+  "Report one classified native gate. Unrequested is distinct from unavailable hardware;
+   required lanes and broken namespace loads fail. Available/unknown states cannot skip."
+  [{:keys [backend status error] :as result} label required?]
+  (when-not (contains? #{:cuda :nvrtc} backend)
+    (throw (ex-info "unknown native test backend" {:result result})))
+  (when-not (contains? #{:not-requested :no-device :unavailable :probe-error
+                        :missing-toolchain :load-failed} status)
+    (throw (ex-info "native skip needs an actual classified unavailable gate" {:result result})))
+  @native-summary-hook
+  (swap! native-skip-log update [backend status] (fnil inc 0))
+  (let [message (str "[" (name backend) " " (name status) "] " label
+                     (when error (str " — " (.getMessage error))))]
+    (if (or required? (= :load-failed status))
+      (is false (str message ". This lane must execute; no skip is permitted."))
+      (do
+        (println (str "  [NATIVE SKIP] " message))
+        (is true (str "native-skip-marker: " message))))))
+
+(defn cuda-skip!
+  ([label]
+   (native-skip! @cuda-status label (= "1" (System/getenv "RASTER_REQUIRE_CUDA_DEVICE"))))
+  ([label mode]
+   (when-not (= :not-requested mode)
+     (throw (ex-info "unknown CUDA qualification gate mode" {:mode mode})))
+   (native-skip! {:backend :cuda :status :not-requested} label
+                 (= "1" (System/getenv "RASTER_REQUIRE_CUDA_DEVICE")))))
+
+(defn nvrtc-skip!
+  [label]
+  (native-skip! {:backend :nvrtc :status :missing-toolchain} label
+                (= "1" (System/getenv "RASTER_REQUIRE_NVRTC"))))

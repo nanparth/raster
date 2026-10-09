@@ -1490,14 +1490,31 @@
    separately. Target emission retains this algorithm, so linking can use the same rule."
   [program-or-facts equation result]
   (let [f (if (program-form? program-or-facts) (facts program-or-facts) program-or-facts)
-        value (get-in f [:values result])]
+        value (get-in f [:values result])
+        kind (operation-kind equation)
+        equation-facts (get-in f [:equations (second equation)])
+        storage (get-in equation-facts [:attributes :result-storage])
+        ;; Only the separately scheduled, checked floating scalar subset owns one device
+        ;; element. Host scalars and arbitrary physical aliases do not acquire write credit.
+        resident-scalar?
+        (and (= 'scalar kind) (= [result] (vec (nth equation 2)))
+             (= :tensor (:kind value)) (= [] (:shape value))
+             (contains? #{:float :double} (:dtype value))
+             (= {:kind :resident-scalar-buffer :elements 1} (:representation value))
+             (= :device (:memory-space value))
+             (empty? (:effects equation-facts))
+             (or (empty? storage) (= [result] (mapv :destination storage)))
+             (let [alias (get-in equation-facts [:aliases result])]
+               (or (nil? alias) (= result alias))))]
     (when (and (some #{result} (nth equation 2))
-               (contains? '#{map stencil contract reduce segmented-reduce product-reduce
-                             segmented-fold-map scan} (operation-kind equation))
-               (or (= {:kind :plain} (:representation value))
-                   (and (= 'reduce (operation-kind equation)) (= [] (:shape value))
-                        (= {:kind :resident-scalar-buffer :elements 1} (:representation value))
-                        (= :device (:memory-space value))))
+               (or resident-scalar?
+                   (and (contains? '#{map stencil contract reduce segmented-reduce product-reduce
+                                      segmented-fold-map scan} kind)
+                        (or (= {:kind :plain} (:representation value))
+                            (and (= 'reduce kind) (= [] (:shape value))
+                                 (= {:kind :resident-scalar-buffer :elements 1}
+                                    (:representation value))
+                                 (= :device (:memory-space value))))))
                (nil? (:logical-layout value)))
       (:shape value))))
 

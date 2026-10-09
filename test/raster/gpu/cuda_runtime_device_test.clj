@@ -1,16 +1,16 @@
 (ns raster.gpu.cuda-runtime-device-test
   "Required-device proof of existing equation-first generated CUDA, never a handwritten replacement."
-  (:require [clojure.test :refer [deftest is]]
+  (:require [raster.gpu.device-probe :as device-probe]
+            [clojure.test :refer [deftest is]]
             [raster.compiler.backend.gpu.kernel-body-compile-fixtures :as fixtures]
             [raster.compiler.equation-first :as equation]
             [raster.compiler.ir.kernel-call :as call]
-            [raster.gpu.cuda-driver-probe :as probe]
             [raster.gpu.cuda-nvrtc :as nvrtc]
             [raster.gpu.cuda-runtime :as runtime]
             [raster.gpu.resource-cleanup :as cleanup]
             [raster.runtime.hardware :as hardware]))
 
-(defn- device-present? [] (= :ready (:status (probe/probe))))
+(defn- device-present? [] @device-probe/cuda-available?)
 
 (deftest generated-uneven-map-offset-replay-and-profiled-device-completion
   (if (device-present?)
@@ -90,6 +90,4 @@
             (runtime/close-kernel-arena! arena)
             (is (empty? (cleanup/pending (::cleanup/owner input))))
             (is (empty? (cleanup/pending (::cleanup/owner output))))))))
-    (if (= "1" (System/getenv "RASTER_REQUIRE_CUDA_DEVICE"))
-      (is false "CUDA device is required; this run cannot skip native coverage")
-      (println "[CUDA SKIP] No CUDA device for optional runtime proof"))))
+    (device-probe/cuda-skip! "No CUDA device for optional runtime proof")))

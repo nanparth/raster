@@ -143,6 +143,52 @@
             (lower-map-description description device-id :dtype result-dtype
                                    :target-descriptor target-descriptor)))))
 
+(defn lower-typed-scalar
+  "Schedule one checked resident floating scalar region with one active map work item.
+
+   The typed expression, including sequential Fold and explicit conversions, remains unchanged.
+   Logical rank zero is backed by the existing one-element resident storage contract."
+  [program device-id & {:keys [target-descriptor]}]
+  (let [program (soac-dialect/validate! program)
+        equations (soac-dialect/equations program)
+        equation (first equations)
+        [_ id results _] equation
+        {:keys [kind captures lambda]} (soac-dialect/operation-parts equation)
+        {:keys [parameters locals body-results]} (soac-dialect/lambda-parts lambda)
+        facts (soac-dialect/facts program)
+        values (:values facts)
+        result (first results)
+        result-value (get values result)
+        physical-results (soac-dialect/physical-results facts equation)]
+    (when-not (and (= 1 (count equations)) (= 'scalar kind)
+                   (= 1 (count results) (count body-results))
+                   (= (count parameters) (count captures))
+                   (= :tensor (:kind result-value)) (= [] (:shape result-value))
+                   (contains? #{:float :double} (:dtype result-value))
+                   (= {:kind :resident-scalar-buffer :elements 1} (:representation result-value))
+                   (= :device (:memory-space result-value))
+                   (= [result] physical-results)
+                   (empty? (get-in facts [:equations id :effects])))
+      (throw (ex-info "device scalar scheduling needs one checked resident floating region"
+                      {:reason :typed-soac-device-scalar-subset :equation id})))
+    (let [substitutions (zipmap parameters captures)
+          locals (mapv #(update % :init (fn [init] (util/subst-syms substitutions init))) locals)
+          expression (util/subst-syms substitutions (first body-results))
+          inputs (set (filter #(let [value (get values %)]
+                                (or (seq (:shape value))
+                                    (= :resident-scalar-buffer
+                                       (get-in value [:representation :kind])))) captures))
+          scalars (set (remove inputs captures))
+          description {:id id :bound 1 :idx (gensym "resident_scalar_index")
+                       :lambda (materialize-region-locals locals expression)
+                       :scalar-region {:locals locals :result expression}
+                       :inputs inputs :outputs #{result} :scalars scalars
+                       :elem-type (:dtype result-value) :out-sym result :cast-fn nil}]
+      (mapv #(assoc % :algorithm-dialect :typed-soac :algorithm-equation id)
+            (lower-map-description description device-id
+                                   :dtype (:dtype result-value)
+                                   :target-descriptor target-descriptor)))))
+
 (defn lower-typed-stencil
   "Lower one validated boundary-aware TypedSOAC stencil to a scheduled SegStencil."
   [program device-id & {:keys [dtype target-descriptor] :or {dtype :double}}]

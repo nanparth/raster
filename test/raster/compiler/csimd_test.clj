@@ -1,19 +1,32 @@
 (ns raster.compiler.csimd-test
   "The explicit CPU-C SIMD emitter (compile-segred-c) turns a SegRed reduction
-   into AVX2 __m256 intrinsic C that matches the scalar reduction bit-for-bit
-   across dtypes and non-multiple-of-stride sizes. This is the reusable core of
+   into AVX2 __m256 intrinsic C with explicitly reassociated sums and retained
+   element-product rounding across dtypes and non-multiple-of-stride sizes. This is the reusable core of
    #27 (the C analog of jvm/segop_simd), validated in isolation before the
    pipeline wiring. Guarded on clang + a machine that runs AVX2."
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.core :refer [deftm]]
+            [raster.par :as par]
+            [raster.numeric :as numeric]
+            [raster.compiler.backend.cpu.aot :as aot]
             [raster.compiler.backend.cpu.csimd :as cs]
             [raster.compiler.backend.cpu.codegen :as cpu]
             [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.backend.jvm.segop-simd :as ss]
             [raster.compiler.core.util :as util]
-            [raster.compiler.ir.reduction :as reduction]))
+            [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.soac-dialect :as dialect]))
 
 (defn- numeric-invk [impl & arguments]
   (util/make-invk impl arguments))
+
+(deftest missing-vector-intrinsics-cannot-become-identity
+  (doseq [elem [:f32 :f64]
+          expression ['(Math/exp (clojure.core/aget x i))
+                      '(unknown-operation 1.0)]]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no vector lowering"
+                         (cs/emit-c-vexpr expression 'i :avx2 elem "j" #{'x} :float)))))
 
 (deftest qualified-index-casts-retain-contiguous-simd-loads
   (doseq [cast '[long int clojure.core/long clojure.core/int]
@@ -55,6 +68,61 @@
   (let [out (first arrs)]
     (apply native (concat (rest arrs) [out (int n)]))
     (aget out 0)))
+
+(deftest reassociation-does-not-contract-element-products
+  ;; One vector accumulator makes the independently specified tree transparent.
+  ;; First visit contributes -1; second contributes a product rounded to +1.
+  ;; FMA instead produces a nonzero residual, despite the same addition tree.
+  (with-redefs-fn {#'cs/n-accumulators (constantly 1)}
+    (fn []
+      (doseq [[dt ct lanes castf gap]
+              [[:double "double" 4 double (Math/scalb (double 1.0) (int -27))]
+               [:float "float" 8 float (Math/scalb (double 1.0) (int -13))]]]
+        (let [{:keys [includes helpers block]}
+              (cs/compile-segred-c (dot-segred dt) :avx2 '#{a b})
+              make-array (if (= dt :double) double-array float-array)
+              source (str includes helpers "void rounded_dot(const " ct
+                          "* a, const " ct "* b, " ct "* out, int n){"
+                          ct " acc;" block "out[0]=acc;}")
+              native (cpu/load-kernel (cpu/compile-source! source) "rounded_dot" 3 [:int])]
+          (is (some? block))
+          (is (not (re-find #"_mm256_fmadd" block)))
+          (is (re-find #"_mm256_mul" block))
+          (doseq [sign [1.0 -1.0] tail [0 1 3]]
+            (let [n (+ (* 2 lanes) tail)
+                  a (make-array n) b (make-array n) out (make-array 1)]
+              (aset a 0 (castf (- sign)))
+              (aset b 0 (castf 1))
+              (aset a lanes (castf (* sign (+ 1.0 gap))))
+              (aset b lanes (castf (- 1.0 gap)))
+              (native a b out (int n))
+              (is (zero? (double (aget out 0)))
+                  (str dt " separately rounded product, changed sign=" sign ", tail=" tail)))))))))
+
+(deftest c-vector-admission-keeps-retained-floating-precision
+  (let [body (fn [tag] (with-meta '(+ (aget a i) gain) {:raster.type/tag tag}))
+        operation {:space {:dims [{:name 'i :bound 'n}]} :dtype :float
+                   :out-sym 'out :cast-fn 'float}]
+    (binding [ce/*emit-config* cpu/cpu-config ce/*scalar-type* "float"]
+      (is (some? (cs/compile-segmap-c (assoc operation :lambda (body 'float))
+                                     :avx2 '#{a out})))
+      (is (nil? (cs/compile-segmap-c (assoc operation :lambda (body 'double))
+                                    :avx2 '#{a out})))
+      (is (nil? (cs/compile-segmap-c
+                 (assoc operation :lambda
+                        (dialect/scalar-convert
+                         {:source-dtype :double :target-dtype :float
+                          :rounding :nearest-even :overflow :ieee
+                          :source-op 'clojure.core/float}
+                         '(+ (aget a i) gain)))
+                 :avx2 '#{a out}))
+          "conversion source precision is checked before source projection"))
+    (doseq [tag '[float double]]
+      (let [r (reduction/scalar
+               {:accumulator 'acc :neutral (float 0) :dtype :float :result 'out :index 'i
+                :step-result (with-meta '(+ acc (aget a i)) {:raster.type/tag tag})})]
+        (is (= (= tag 'float)
+               (some? (cs/compile-segred-c (assoc operation :reduction r) :avx2 '#{a}))))))))
 
 (deftest ssq-reduction-matches-scalar
   (testing "sum(x[i]^2) via compile-segred-c == scalar, f64 and f32"
@@ -108,6 +176,219 @@
                    (.invk raster.numeric/_star__m_double_double-impl (clojure.core/aget a (long L)) s)
                    (clojure.core/aget b (long L)))})
 
+(deftm mixed-storage-double-map!
+  [x :- (Array float), y :- (Array double), gain :- Double, cnt :- Long] :- (Array double)
+  (par/map! y i cnt double (+ (double (aget x i)) gain))
+  y)
+
+(deftm double-compute-float-store!
+  [x :- (Array float), y :- (Array float), gain :- Double, cnt :- Long] :- (Array float)
+  (par/map! y i cnt float (+ (double (aget x i)) (* gain gain)))
+  y)
+
+(deftm long-offset-float-map!
+  [x :- (Array int), y :- (Array float), offset :- Long, cnt :- Long] :- (Array float)
+  (par/map! y i cnt float (- (long (aget x i)) offset))
+  y)
+
+(deftm int-offset-float-map!
+  [x :- (Array int), y :- (Array float), offset :- Integer, cnt :- Long] :- (Array float)
+  (par/map! y i cnt float (numeric/- (aget x i) offset))
+  y)
+
+(deftest public-native-map-keeps-retained-i32-widening
+  (when (clang-avx2?)
+    (let [native (aot/compile-aot-c #'int-offset-float-map! :float :simd? true)
+          source (:c-source (meta native))]
+      (is (re-find #"_mm256_sub_epi32" source))
+      (is (re-find #"_mm256_cvtepi32_ps" source))
+      (doseq [n [7 8 9 17] offset [-5 5]]
+        (let [x (int-array (range n)) y (float-array n) jvm (float-array n)]
+          (native x y (int offset) (long n))
+          (int-offset-float-map! x jvm (int offset) (long n))
+          (is (= (mapv #(float (unchecked-subtract-int (int %) (int offset))) x)
+                 (vec jvm) (vec y))
+              "retained i32 arithmetic still vectorizes and matches the scalar tail"))))))
+
+(deftest integer-lane-arithmetic-requires-retained-width
+  (binding [cs/*array-types* '{x :int y :float}]
+    (doseq [step ['(- (aget x i) k)
+                 (with-meta '(- (aget x i) k) {:raster.type/tag 'long})]]
+      (is (nil? (cs/compile-segmap-c
+                 {:space {:dims [{:name 'i :bound 'n}]} :dtype :float
+                  :out-sym 'y :cast-fn 'float :lambda (list 'float step)}
+                 :avx2 '#{x y}))
+          "neither missing stamps nor retained Long width authorize i32 operations"))))
+
+(deftest public-native-map-does-not-narrow-long-arithmetic-to-i32
+  (when (clang-avx2?)
+    (let [native (aot/compile-aot-c #'long-offset-float-map! :float :simd? true)]
+      (is (not (re-find #"_mm256_sub_epi32" (:c-source (meta native)))))
+      (doseq [n [7 8 9 17] [value offset] [[Integer/MAX_VALUE -1]
+                                         [Integer/MIN_VALUE 1]
+                                         [0 4294967296]]]
+        (let [x (int-array (repeat n value)) y (float-array n) jvm (float-array n)
+              expected (vec (repeat n (float (- (long value) (long offset)))))]
+          (native x y (long offset) (long n))
+          (long-offset-float-map! x jvm (long offset) (long n))
+          (is (= expected (vec jvm) (vec y))
+              (str "retained Long arithmetic at changed-input boundaries, n=" n)))))))
+
+(deftest public-native-map-separates-compute-and-store-precision
+  (when (clang-avx2?)
+    (let [native (aot/compile-aot-c #'double-compute-float-store! :float :simd? true)
+          source (:c-source (meta native))]
+      (is (re-find #"_mm256_cvtps_pd\(_mm_loadu_ps" source))
+      (is (re-find #"_mm_storeu_ps\([^\n]*_mm256_cvtpd_ps" source))
+      (doseq [n [3 4 5 9 17] gain [1.00000006 0.300000005]]
+        (let [x (float-array (take n (cycle [0.0 -1.0 0.25 -0.5])))
+              y (float-array n)
+              jvm (float-array n)
+              bits #(Float/floatToRawIntBits (float %))
+              expected (mapv #(bits (+ (double %) (* gain gain))) x)]
+          (native x y (double gain) (long n))
+          (double-compute-float-store! x jvm (double gain) (long n))
+          (is (= expected (mapv bits jvm) (mapv bits y))
+              (str "Double operations and final Float rounding agree, n=" n))))
+      (is (not= (Float/floatToRawIntBits (float (* 1.00000006 1.00000006)))
+                (Float/floatToRawIntBits (float (* (float 1.00000006) (float 1.00000006)))))
+          "fixture distinguishes Double computation from all-Float computation"))))
+
+(deftest double-compute-float-store-requires-complete-narrowing-capability
+  (let [operation {:space {:dims [{:name 'i :bound 'n}]} :dtype :float
+                   :out-sym 'out :cast-fn 'float
+                   :lambda (with-meta '(+ (double (aget a i)) (double gain))
+                             {:raster.type/tag 'double})}
+        original intrinsics/simd-type-info]
+    (binding [cs/*array-types* '{a :float out :float}]
+      (is (some? (cs/compile-segmap-c operation :avx2 '#{a out})))
+      (doseq [missing [:to-f32 :to-f32-store]]
+        (with-redefs [intrinsics/simd-type-info
+                      (fn [isa elem] (dissoc (original isa elem) missing))]
+          (is (nil? (cs/compile-segmap-c operation :avx2 '#{a out}))))))
+    (binding [cs/*array-types* '{a :float out :float}]
+      (is (nil? (cs/compile-segmap-c
+                 (assoc operation :lambda '(double (float (+ (double (aget a i)) gain))))
+                 :avx2 '#{a out}))
+          "intervening Float rounding is not erased to make a uniform Double schedule"))))
+
+(deftest terminal-narrowing-preserves-declared-conversion-policy
+  (let [body (with-meta '(+ (double (aget a i)) (double gain)) {:raster.type/tag 'double})
+        operation {:space {:dims [{:name 'i :bound 'n}]} :dtype :float :out-sym 'out}
+        attributes {:source-dtype :double :target-dtype :float
+                    :rounding :nearest-even :overflow :ieee
+                    :source-op 'clojure.core/float}]
+    (binding [cs/*array-types* '{a :float out :float}]
+      (is (some? (cs/compile-segmap-c
+                  (assoc operation :lambda (dialect/scalar-convert attributes body))
+                  :avx2 '#{a out})))
+      (doseq [policy [(assoc attributes :rounding :toward-zero)
+                      (assoc attributes :overflow :saturate)
+                      (assoc attributes :unknown-policy true)
+                      (assoc attributes :source-op 'clojure.core/double)]]
+        (is (= :invalid-canonical-scalar-conversion
+               (try
+                 (cs/compile-segmap-c
+                  (assoc operation :lambda (dialect/scalar-convert policy body))
+                  :avx2 '#{a out})
+                 nil
+                 (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+            "a different conversion policy cannot acquire ordinary Float-store lowering")))))
+
+(deftest changing-arithmetic-species-requires-complete-operation-evidence
+  (let [operation {:space {:dims [{:name 'i :bound 'n}]} :dtype :float
+                   :out-sym 'out :cast-fn 'float}
+        mixed '(+ (double (aget a i)) (* (aget b i) (aget c i)))]
+    (binding [cs/*array-types* '{a :float b :float c :float out :float}]
+      (doseq [expression [mixed (with-meta mixed {:raster.type/tag 'double})]]
+        (is (nil? (cs/compile-segmap-c (assoc operation :lambda expression) :avx2 '#{a b c out}))
+            "an unstamped inner product cannot be promoted to Double merely because its parent is Double")))))
+
+(deftest public-native-map-retains-storage-and-arithmetic-precision
+  (when (clang-avx2?)
+    (let [native (aot/compile-aot-c #'mixed-storage-double-map! :double :simd? true)]
+      (is (re-find #"_mm256_cvtps_pd\(_mm_loadu_ps" (:c-source (meta native)))
+          "public typed source reaches the converting-load schedule")
+      (doseq [n [3 4 5 9 17] gain [1.0e-9 -0.125]]
+        (let [x (float-array (map #(float (/ (+ % 1) 7.0)) (range n)))
+              y (double-array n)
+              jvm (double-array n)
+              expected (mapv #(+ (double %) gain) x)]
+          (native x y (double gain) (long n))
+          (mixed-storage-double-map! x jvm (double gain) (long n))
+          (is (= expected (vec jvm) (vec y))
+              (str "public JVM/native changed-input parity, n=" n)))))))
+
+(deftest mixed-floating-storage-uses-converting-vector-loads
+  (when (clang-avx2?)
+    (let [operation {:space {:dims [{:name 'i :bound 'n}]} :dtype :double
+                     :out-sym 'y :cast-fn 'double
+                     :lambda '(+ (double (aget x i)) (double gain))}
+          {:keys [includes block]}
+          (binding [cs/*array-types* '{x :float y :double}
+                    ce/*emit-config* cpu/cpu-config ce/*scalar-type* "double"]
+            (cs/compile-segmap-c operation :avx2 '#{x y}))
+          native (cpu/load-kernel
+                  (cpu/compile-source!
+                   (str includes "void mixed(const float* x, double* y, double gain, int n){"
+                        block "}")) "mixed" 2 [:double :int])]
+      (is (re-find #"_mm256_cvtps_pd\(_mm_loadu_ps" block))
+      (doseq [n [3 4 5 9 17] gain [1.0e-9 -0.125]]
+        (let [x (float-array (map #(float (/ (+ % 1) 7.0)) (range n)))
+              y (double-array n)]
+          (native x y (double gain) (int n))
+          (is (= (mapv #(+ (double %) gain) x) (vec y))
+              (str "Float loads, Double arithmetic and scalar tail agree, n=" n)))))
+    (let [{:keys [includes helpers block]}
+          (binding [cs/*array-types* '{x :float}]
+            (cs/compile-segred-c (ssq-segred :double) :avx2 '#{x}))
+          native (cpu/load-kernel
+                  (cpu/compile-source!
+                   (str includes helpers "void mixed_ssq(const float* x, double* out, int n){"
+                        "double acc;" block "out[0]=acc;}")) "mixed_ssq" 2 [:int])]
+      (is (re-find #"_mm256_cvtps_pd\(_mm_loadu_ps" block))
+      (doseq [n [3 4 5 17 33]]
+        (let [x (float-array (map #(float (/ (+ % 1) 7.0)) (range n)))
+              y (double-array 1)
+              expected (reduce + 0.0 (map #(* (double %) (double %)) x))]
+          (native x y (int n))
+          (is (< (Math/abs (- expected (aget y 0))) (* 1e-14 (max 1.0 expected)))
+              (str "Double products remain Double in reduction tail, n=" n)))))))
+
+(deftest unsupported-storage-widths-decline-before-vector-emission
+  (doseq [storage [:byte :long :double]]
+    (binding [cs/*array-types* {'a storage 'out :float}]
+      (is (nil? (cs/compile-segmap-c
+                 {:space {:dims [{:name 'i :bound 'n}]} :dtype :float
+                  :out-sym 'out :cast-fn 'float :lambda '(float (aget a i))}
+                 :avx2 '#{a out})))))
+  (doseq [storage [:byte :long :int]]
+    (binding [cs/*array-types* {'x storage}]
+      (is (nil? (cs/compile-segred-c (ssq-segred :double) :avx2 '#{x})))))
+  (binding [cs/*array-types* '{a :float out :double}]
+    (is (nil? (cs/compile-segmap-c
+               {:space {:dims [{:name 'i :bound 'n}]} :dtype :float
+                :out-sym 'out :cast-fn 'float :lambda '(float (aget a i))}
+               :avx2 '#{a out})))
+        "store pointer width must match the declared output dtype"))
+
+(deftest partial-storage-environments-fail-closed
+  (let [operation {:space {:dims [{:name 'i :bound 'n}]} :dtype :double
+                   :out-sym 'y :cast-fn 'double :lambda '(double (aget x i))}]
+    (doseq [environment ['{y :double} '{x :float} '{other :double}]]
+      (binding [cs/*array-types* environment]
+        (is (nil? (cs/compile-segmap-c operation :avx2 '#{x y}))
+            "a partial retained environment cannot guess a missing input or output width")))
+    (binding [cs/*array-types* '{other :double}]
+      (is (nil? (cs/compile-segred-c (ssq-segred :double) :avx2 '#{x}))
+          "reductions also require every accessed storage fact"))
+    (let [original intrinsics/simd-type-info]
+      (binding [cs/*array-types* '{x :float y :double}]
+        (with-redefs [intrinsics/simd-type-info
+                      (fn [isa elem] (dissoc (original isa elem) :from-f32-load))]
+          (is (nil? (cs/compile-segmap-c operation :avx2 '#{x y}))
+              "converting loads require both load and conversion facet entries"))))))
+
 (deftest segmap-elementwise-matches-scalar
   (testing "y[L]=a[L]*s+b[L] via compile-segmap-c == scalar, f64 and f32"
     (if-not (clang-avx2?)
@@ -138,13 +419,16 @@
   (testing "mixed int/float map via compile-segmap-c emits cvtepi32_ps + epi32 ops, matches scalar"
     (if-not (clang-avx2?)
       (println "[csimd-test] clang/AVX2 unavailable — skipping")
-      (let [segmap {:space {:dims [{:name 'L :bound 'n}]} :dtype :float :out-sym 'acc :cast-fn 'float
-                    :lambda '(.invk raster.numeric/_plus__m_float_float-impl
-                                    (clojure.core/aget acc (long L))
-                                    (.invk raster.numeric/_star__m_float_float-impl
-                                           (clojure.core/aget scale (long L))
-                                           (float (.invk raster.numeric/_minus__m_long_long-impl
-                                                         (long (clojure.core/aget iarr (long L))) k))))}
+      (let [integer-step (with-meta
+                           '(.invk raster.numeric/_minus__m_int_int-impl
+                                   (clojure.core/aget iarr (long L)) k)
+                           {:raster.type/tag 'int})
+            segmap {:space {:dims [{:name 'L :bound 'n}]} :dtype :float :out-sym 'acc :cast-fn 'float
+                    :lambda (list '.invk 'raster.numeric/_plus__m_float_float-impl
+                                  '(clojure.core/aget acc (long L))
+                                  (list '.invk 'raster.numeric/_star__m_float_float-impl
+                                        '(clojure.core/aget scale (long L))
+                                        (list 'float integer-step)))}
             {:keys [includes block]}
             (binding [cs/*array-types* '{acc :float scale :float iarr :int}
                       ce/*emit-config* cpu/cpu-config ce/*scalar-type* "float" ce/*int-vars* '#{n k}]

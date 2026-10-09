@@ -1893,11 +1893,30 @@
       (.invokestatic code math-cd op mm-mt))
     target))
 
+(declare emit-boxed-ifn-call tag->jvm-info)
+
+(defn- emit-retained-array-checkcast
+  [code tag stack-type verified? ctx]
+  (when (and (= stack-type :ref) (not verified?))
+    (.checkcast code (:class-desc (tag->jvm-info tag (:source-ns ctx))))))
+
+(defn- emit-untyped-array-call
+  "Use Clojure's existing runtime array dispatch when no array storage type is retained.
+   Unknown reference storage is not evidence of Object[]. Evaluate operands once in source
+   order through the shared boxed-call emitter; known array types never enter this path."
+  [code operation args locals ctx]
+  (emit-var-constant! code "clojure.core" operation)
+  (.invokevirtual code var-cd "getRawRoot" (MethodTypeDesc/of obj-cd no-cd))
+  (.checkcast code ifn-cd)
+  (emit-boxed-ifn-call code args locals ctx))
+
 (defn- emit-aget-intrinsic
   "Emit bytecode for aget (array read). Handles typed array checkcast and
    dispatches to the correct JVM *aload instruction based on arr-tag."
   [code args locals ctx]
-  (let [[arr idx] args
+  (if-not (and (= 2 (count args)) (array-read-stack-type (first args) locals))
+    (emit-untyped-array-call code "aget" args locals ctx)
+    (let [[arr idx] args
         arr-tag (or (:tag (meta arr))
                     (:raster.type/tag (meta arr))
                     (when (symbol? arr) (:hint (get locals arr))))
@@ -1907,18 +1926,7 @@
         arr-type (emit-form code arr locals ctx)]
     ;; Checkcast array to correct type when on stack as Object ref.
     ;; Skip when the type is already verified by the method descriptor.
-    (when (and (= arr-type :ref) (not arr-verified?))
-      (let [arr-cls (case arr-tag
-                      objects (Class/forName "[Ljava.lang.Object;")
-                      doubles (Class/forName "[D")
-                      floats  (Class/forName "[F")
-                      longs   (Class/forName "[J")
-                      ints    (Class/forName "[I")
-                      bytes   (Class/forName "[B")
-                      shorts  (Class/forName "[S")
-                      ;; Unknown arr-tag: assume Object[] for aaload
-                      (Class/forName "[Ljava.lang.Object;"))]
-        (.checkcast code (class-desc-of arr-cls))))
+    (emit-retained-array-checkcast code arr-tag arr-type arr-verified? ctx)
     (let [t (emit-form code idx locals ctx)]
       (when (not= t :int) (emit-coerce code t :int)))
     (case (array-read-stack-type arr locals)
@@ -1926,39 +1934,23 @@
       :float  (do (.faload code) :float)
       :long   (do (.laload code) :long)
       :int    (do (case arr-tag bytes (.baload code) shorts (.saload code) (.iaload code)) :int)
-      :ref    (do (.aaload code) :ref)
-      (do (when arr-tag
-            (binding [*out* *err*]
-              (println "WARNING: emit-aget-intrinsic: unrecognized arr-tag" (pr-str arr-tag)
-                       "for" arr "— falling back to aaload (Object[])")))
-          (.aaload code) :ref))))
+      :ref    (do (.aaload code) :ref)))))
 
 (defn- emit-aset-intrinsic
   "Emit bytecode for aset (array write). Handles typed array checkcast,
    void-context optimization (plain store vs temp-local for return value),
    and dispatches to the correct JVM *astore instruction based on arr-tag."
   [code args locals ctx]
-  (let [[arr idx val] args
+  (if-not (and (= 3 (count args)) (array-read-stack-type (first args) locals))
+    (emit-untyped-array-call code "aset" args locals ctx)
+    (let [[arr idx val] args
         arr-tag (or (:tag (meta arr))
                     (:raster.type/tag (meta arr))
                     (when (symbol? arr) (:hint (get locals arr))))
         arr-verified? (when (symbol? arr) (:verified (get locals arr)))
         arr-type (emit-form code arr locals ctx)]
-    ;; Checkcast array — skip when type verified by method descriptor.
-    ;; Unknown arr-tag defaults to Object[] so aastore has a typed array
-    ;; reference (otherwise verifier rejects: 'Object' isn't an array type).
-    (when (and (= arr-type :ref) (not arr-verified?))
-      (let [arr-cls (case arr-tag
-                      objects (Class/forName "[Ljava.lang.Object;")
-                      doubles (Class/forName "[D")
-                      floats  (Class/forName "[F")
-                      longs   (Class/forName "[J")
-                      ints    (Class/forName "[I")
-                      bytes   (Class/forName "[B")
-                      shorts  (Class/forName "[S")
-                      ;; Unknown arr-tag: assume Object[] for aastore
-                      (Class/forName "[Ljava.lang.Object;"))]
-        (.checkcast code (class-desc-of arr-cls))))
+    ;; Known storage only; unknown references use runtime dispatch above.
+    (emit-retained-array-checkcast code arr-tag arr-type arr-verified? ctx)
     (let [t (emit-form code idx locals ctx)]
       (when (not= t :int) (emit-coerce code t :int)))
     ;; In void context (non-last statement), emit plain store (1 instr).
@@ -2014,11 +2006,7 @@
                      (swap! (:next-slot ctx) inc)
                      (.istore code tmp) (.iload code tmp)
                      (.sastore code) (.iload code tmp) :int)))
-        (do (when (and arr-tag (not= arr-tag 'objects))
-              (binding [*out* *err*]
-                (println "WARNING: emit-aset-intrinsic: unrecognized arr-tag" arr-tag
-                         "for" arr "— falling back to aastore (Object[])")))
-            (let [val-type (emit-form code val locals ctx)]
+        (let [val-type (emit-form code val locals ctx)]
               (when (not= val-type :ref)
                 (emit-coerce code val-type :ref))
               (if void?
@@ -5105,19 +5093,6 @@
   [form bound]
   (util/free-syms form bound))
 
-(defn- optimize-chunk
-  "Apply normalize pass to chunk body before bytecoding.
-   Converts .invk calls to direct ops (Math/fma, clojure.core/+, etc.)
-   which the bytecoder compiles to smaller, tighter bytecode.
-   This reduces the total inlined code size so C2's compilation unit
-   stays within its node budget after chain-inlining."
-  [walked-body]
-  (try
-    (let [normalize (requiring-resolve 'raster.compiler.passes.scalar.normalize/normalize)]
-      (mapv normalize walked-body))
-    (catch Exception _
-      walked-body)))
-
 (defn- split-body-into-helpers
   "Extract par forms from a let-body into helper static methods.
    Scans both body forms and let-binding init expressions for par forms.
@@ -5127,7 +5102,9 @@
    Uses descriptors/par-form? for detection (centralized, not hardcoded).
    Each helper receives only its free variables as typed params.
    Primitive-constant vars are excluded (bytecoder constant-folds them to LDC).
-   Normalize pass is applied to extracted par forms for tighter bytecode.
+   Extracted forms retain their typed call boundaries. Replacing a typed call
+   with generic arithmetic can lose operand conversions and recurrence width;
+   method partitioning must not change the numerical program.
 
    Returns {:main-bindings [sym init ...], :main-body [forms], :helpers [fn-spec...]}"
   [body-forms let-bindings fn-params fn-tags source-ns _target-chunk-size]
@@ -5211,7 +5188,7 @@
                                    {:name helper-name
                                     :params helper-params
                                     :return-tag ret-tag
-                                    :walked-body (optimize-chunk [form])
+                                    :walked-body [form]
                                     :source-ns source-ns})
                             (apply list helper-name ordered-free))
                           ;; Not a par form — keep as-is

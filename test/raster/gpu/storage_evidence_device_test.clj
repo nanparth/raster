@@ -62,11 +62,16 @@
                 registry (ns-resolve (case target :ze:0 'raster.gpu.ze-runtime
                                                 :ocl:0 'raster.gpu.ocl-runtime) 'kernel-registry)
                 registry-entry (fn [name] (get @(deref registry) name))
-                cached-kernel (:kernel-handle (registry-entry "rstr_storage_probe_float"))]
+                foreign-kernel (:kernel-handle (registry-entry "rstr_storage_probe_float"))]
+            (is (some? foreign-kernel))
             (compiled/measure-storage-representation! c :float)
-            (is (some? cached-kernel))
-            (is (identical? cached-kernel (:kernel-handle (registry-entry "rstr_storage_probe_float")))
-                "repeated probe registration retains the module's cached kernel")
+            (let [cached-kernel (:kernel-handle (registry-entry "rstr_storage_probe_float"))]
+              (is (some? cached-kernel))
+              (is (not (identical? foreign-kernel cached-kernel))
+                  "a different owner replaces the foreign arena's probe kernel")
+              (compiled/measure-storage-representation! c :float)
+              (is (identical? cached-kernel (:kernel-handle (registry-entry "rstr_storage_probe_float")))
+                  "consecutive registrations by the same owner retain its cached kernel"))
             (is (= completed @(:completed-replays (:executable c))))
             (is (nil? @(:live-outputs c)))
             (is (some? (error-of #(value/->host output)))))

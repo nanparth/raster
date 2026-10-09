@@ -20,6 +20,7 @@
             [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.equation-first :as equation-first]
             [raster.compiler.fixtures.checked-casts :as checked-casts]
+            [raster.compiler.fixtures.extrema :as extrema]
             [raster.compiler.fixtures.mixed-storage :as mixed-storage]
             [raster.compiler.fixtures.staged-contracts :as staged-public]
             [raster.compiler.fixtures.symbolic-storage :as symbolic-storage]
@@ -28,12 +29,14 @@
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.paged-kv-append :as paged-append]
+            [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.passes.parallel.attention-route :as attention-route]
             [raster.compiler.passes.parallel.contract-lower :as contract-lower]
             [raster.compiler.passes.parallel.contract-route :as contract-route]
+            [raster.compiler.passes.parallel.collective-combine :as collective-combine]
             [raster.compiler.passes.parallel.indexed-attention-recognize :as indexed-recognize]
             [raster.compiler.passes.parallel.segmap-capacity-fixture :as capacity-fixture]
             [raster.compiler.passes.parallel.carried-effect-loop-fixture :as carried-fixture]
@@ -321,7 +324,10 @@
      (:body planned) :target-dialect dialect :kernel-name-prefix "mixed_contraction")))
 
 (defn- register-tiled-contraction-source
-  [dialect]
+  ([dialect] (register-tiled-contraction-source dialect :decomposed))
+  ([dialect multiply-add]
+   (register-tiled-contraction-source dialect multiply-add :nn))
+  ([dialect multiply-add layout]
   (let [epilogue {:acc 'acc
                   :expr '(raster.numeric/*
                           (raster.numeric/+ acc (clojure.core/aget bias j)) scale)
@@ -333,14 +339,18 @@
                {:out 'C
                 :free-axes [['i 64] ['j 64]]
                 :contract-axes [['k 32]]
-                :body '(raster.numeric/*
-                        (clojure.core/aget A (clojure.core/+ (clojure.core/* i 32) k))
-                        (clojure.core/aget B (clojure.core/+ (clojure.core/* k 64) j)))
+                :body (case layout
+                        :nn '(raster.numeric/*
+                              (clojure.core/aget A (clojure.core/+ (clojure.core/* i 32) k))
+                              (clojure.core/aget B (clojure.core/+ (clojure.core/* k 64) j)))
+                        :tn '(raster.numeric/*
+                              (clojure.core/aget A (clojure.core/+ (clojure.core/* k 64) i))
+                              (clojure.core/aget B (clojure.core/+ (clojure.core/* k 64) j))))
                 :opts {:epilogue epilogue}
                 :dtype :float})
-        kernel-body (:kernel-body (register-tiled-body/lower facts {}))]
+        kernel-body (:kernel-body (register-tiled-body/lower facts {:multiply-add multiply-add}))]
     (body-emit/emit-scalar-kernel
-     "register_tiled_contraction" kernel-body {:target-dialect dialect})))
+     "register_tiled_contraction" kernel-body {:target-dialect dialect}))))
 
 (defn- symbolic-register-tiled-contraction-source
   [dialect]
@@ -482,6 +492,12 @@
       (:kernels (equation-first/compile
                  #'mixed-storage/double-reduction-float-result
                  (merge mixed-storage/policy {:target device-id :dtype :double})))
+      (:kernels (equation-first/compile
+                 #'mixed-storage/double-fold-float-storage
+                 (merge mixed-storage/policy {:target device-id :dtype :double})))
+      (:kernels (equation-first/compile
+                 #'mixed-storage/double-exponential-float-storage
+                 (merge mixed-storage/policy {:target device-id :dtype :float})))
       (:kernels (equation-first/compile
                  #'mixed-storage/mixed-scale-energy-gradient
                  (merge mixed-storage/policy {:target device-id :dtype :double})))
@@ -641,7 +657,10 @@
                  #'dl-attention/gqa-causal-mha {:target device-id :dtype :float}))
       (:kernels (equation-first/compile
                  #'dl-attention/gqa-causal-mha-jvp
-                 {:target device-id :dtype :float}))))))
+                 {:target device-id :dtype :float}))
+      (mapcat (fn [[source dtype]]
+                (:kernels (equation-first/compile source {:target device-id :dtype dtype})))
+              extrema/cases)))))
 
 (defn- write-artifact!
   [directory suffix label artifact]
@@ -654,6 +673,16 @@
   (let [file (io/file directory (str label suffix))]
     (spit file source)
     (.getAbsolutePath file)))
+
+(defn- collective-combine-artifact [operator identity dialect descriptor]
+  (let [algebra (scan/certify-reassociation
+                 {:acc 'acc :init identity :lambda (list operator 'acc 'element)} :float)
+        device (keyword (str (name dialect) ":collective-compile-gate"))
+        emitted (collective-combine/emit
+                 algebra 37 {:target-device device :target-dialect dialect
+                             :target-descriptor (assoc descriptor :device-id device)})]
+    (collective-combine/validate! algebra 37 emitted)
+    (get-in emitted [:graph :nodes 0 :operation])))
 
 (defn emit-target!
   [root target]
@@ -688,6 +717,10 @@
         tiled (attention-emit/emit-fp16-tiled-history plan tiled-schedule dialect)
         public-artifacts (equation-first-artifacts target descriptor)]
     (into [(write-artifact! directory suffix "reference-attention" reference)
+           (write-artifact! directory suffix "typed-collective-sum"
+                            (collective-combine-artifact '+ 0.0 dialect descriptor))
+           (write-artifact! directory suffix "typed-collective-product"
+                            (collective-combine-artifact '* 1.0 dialect descriptor))
            (write-artifact! directory suffix "cooperative" cooperative)
            (write-artifact! directory suffix "pipelined-attention" pipelined)
            (write-artifact! directory suffix "swizzled-pipelined-attention"
@@ -729,6 +762,10 @@
                             (cooperative-segmented-fold-map-artifact dialect))
            (write-source! directory suffix "register-tiled-contraction"
                           (register-tiled-contraction-source dialect))
+           (write-source! directory suffix "fused-register-tiled-contraction"
+                          (register-tiled-contraction-source dialect :fused))
+           (write-source! directory suffix "transposed-left-register-tiled-contraction"
+                          (register-tiled-contraction-source dialect :decomposed :tn))
            (write-source! directory suffix "symbolic-register-tiled-contraction"
                           (symbolic-register-tiled-contraction-source dialect))
            (write-source! directory suffix "layout-cast"
@@ -879,6 +916,17 @@
              [(write-artifact! directory suffix "typed-equation-mma"
                                (typed-equation-matrix-artifact :cuda))
               (write-source!
+               directory suffix "matrix-source-extrema-epilogue"
+               (:source (matrix-target/emit-matrix-kernel
+                         "matrix_source_extrema_epilogue"
+                         (contraction-schedule/matrix-body
+                          {:id :matrix-source-extrema :row 'a :col 'b :out 'c
+                           :dimensions [64 64 64] :result-dtype :float
+                           :tile {:block-m 64 :block-n 64 :sg-m 32 :sg-n 32 :block-k 32
+                                  :num-stages 3 :matrix {:family :mma :m 16 :n 16 :k 16 :subgroup 32}}
+                           :epilogue {:acc 'acc :expr '(raster.numeric/max acc (float 0.0))}})
+                         :cuda)))
+              (write-source!
                directory suffix "matrix-uniform-epilogue"
                (cuda-emit/emit-matrix-kernel
                 "matrix_uniform_epilogue"
@@ -895,6 +943,31 @@
                (:source (matrix-target/emit-matrix-kernel
                          "mma_verified_contract"
                          (verified-direct-matrix-body :mma) :cuda)))])
+           (for [[type label] [[:float "f32"] [:double "f64"]]
+                 fused? [false true]]
+             (write-source! directory suffix
+                            (str "scalar-product-" label "-"
+                                 (if fused? "fused" "decomposed"))
+                            (body-emit/emit-scalar-kernel
+                             "scalar_product"
+                             (body-fixtures/scalar-product-body type fused?)
+                             {:target-dialect dialect})))
+           (for [operator [:min :max]
+                 [label make-body] [["half-extremum" body-fixtures/half-extremum-body]
+                                    ["local-half-extremum" body-fixtures/local-half-extremum-body]]]
+             (write-source! directory suffix (str label "-" (name operator))
+                            (body-emit/emit-scalar-kernel
+                             "half_extremum" (make-body operator)
+                             {:target-dialect dialect})))
+           (for [type [:float :double]
+                 operator [:min :max]]
+             (write-source! directory suffix
+                            (str "subgroup-extremum-" (name type) "-" (name operator))
+                            (body-emit/emit-scalar-kernel
+                             "subgroup_extremum"
+                             (body-fixtures/floating-extrema-collective-body
+                              type operator (:subgroup-size descriptor))
+                             {:target-dialect dialect})))
            (map (fn [dt]
                   (write-artifact! directory suffix (str "storage-probe-" (name dt))
                                    (storage-probe/emit-artifact dt dialect)))

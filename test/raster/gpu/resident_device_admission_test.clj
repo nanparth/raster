@@ -1,6 +1,7 @@
 (ns raster.gpu.resident-device-admission-test
   "Opt-in native qualification of the public CUDA Compiled/LinkPlan path."
-  (:require [clojure.test :refer [deftest is]]
+  (:require [raster.gpu.device-probe :as device-probe]
+            [clojure.test :refer [deftest is]]
             [raster.arrays :as arrays]
             [raster.core :refer [deftm]]
             [raster.gpu.compiled :as compiled]
@@ -16,7 +17,7 @@
 
 (deftest public-cuda-compiled-map-replays-and-releases-output-values
   (if-not (= "1" (System/getenv "RASTER_REQUIRE_CUDA_DEVICE"))
-    (println "SKIP public CUDA admission execution; set RASTER_REQUIRE_CUDA_DEVICE=1")
+    (device-probe/cuda-skip! "public CUDA admission execution; set RASTER_REQUIRE_CUDA_DEVICE=1" :not-requested)
     (let [probe (cuda-probe/probe)]
       (is (= :ready (:status probe)) "required CUDA device discovery must succeed")
       (when (= :ready (:status probe))

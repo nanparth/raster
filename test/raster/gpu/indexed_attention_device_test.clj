@@ -420,9 +420,7 @@
     (device-probe/opencl-skip! "compiled resident dispatch tuning" :gpu-device)
     (if-not (= :supported (:status (capability/score-reuse
                                    (:plan (test-case)) (hardware/descriptor-for :ocl:0))))
-      (do
-        (println "  [OPENCL SKIP] compiled resident dispatch tuning requires supported Intel subgroup score reuse")
-        (is true "opencl-skip-marker: Intel dispatch tuning is unrun"))
+      (device-probe/opencl-skip! "compiled resident dispatch tuning" :intel-subgroups)
       (let [{:keys [buffers]} (test-case)
             args [(get buffers 'Q) (get buffers 'K) (get buffers 'V)
                   (get buffers 'dst) (get buffers 'src) 3 4 5 2]

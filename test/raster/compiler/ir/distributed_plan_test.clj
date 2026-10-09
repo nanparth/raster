@@ -283,11 +283,80 @@
     (is (= 128 (:transferred-bytes simulation)))
     (is (= {:id :gradient-all-reduce :kind :all-reduce :group :data
             :value :weights :algorithm :direct-exchange
+            :reduction (get-in collective [:operation :reduction]) :root nil
+            :numerical-mode {}
             :steps [[:gradient-all-reduce :round 0 :leg 0]
                     [:gradient-all-reduce :round 0 :leg 1]]
             :completions [[:gradient-all-reduce :round 0 :leg 0]
                           [:gradient-all-reduce :round 0 :leg 1]]}
            (first (:collectives certificate))))))
+
+(defn- collective-plan [collective]
+  (distributed/plan
+   {:id :collective-semantic-proof
+    :mesh (distributed/mesh [{:name :data :size 2}] [:gpu-0 :gpu-1])
+    :topology (two-device-topology) :values (training-values) :shards (training-shards)
+    :collective-groups {:data (distributed/collective-group :data [:gpu-0 :gpu-1])}
+    :collectives [collective]
+    :steps (into [(distributed/compute-step {:id :gradient-0 :device :gpu-0 :duration-ns 100})
+                  (distributed/compute-step {:id :gradient-1 :device :gpu-1 :duration-ns 100})]
+                 (:steps collective))
+    :outputs (:completions collective)}))
+
+(deftest explicit-copy-bindings-do-not-turn-collective-legs-into-copies
+  (let [plan (collective-plan (two-device-all-reduce))
+        leg (first (get-in plan [:collectives 0 :steps]))
+        endpoint {:step :gradient-0 :local-value :gradient
+                  :region {:offsets [0] :shape [16]}}]
+    (is (= :distributed-copy-binding
+           (:reason (ex-data
+                      (try (distributed/validate!
+                             (assoc plan :copy-bindings
+                                    {(:id leg) {:source endpoint :target endpoint}}))
+                           (catch clojure.lang.ExceptionInfo e e))))))))
+
+(deftest collective-certificates-bind-algebra-and-numerical-policy
+  (let [plan (collective-plan (two-device-all-reduce))
+        certified (distributed/certify plan)]
+    (testing "a record with its reduction removed is not an algebra certificate"
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (distributed/validate!
+                    (assoc-in plan [:collectives 0 :operation :reduction] nil)))))
+    (testing "a valid different monoid or numerical policy invalidates old evidence"
+      (doseq [[path replacement]
+              [[[:operation :reduction]
+                (scan/certify {:acc 'acc :init 1.0 :lambda '(* acc element)} :float)]
+               [[:schedule :numerical-mode]
+                {:mode :reassociated :policy :parallel-tree
+                 :rounding :toward-zero :accumulator-dtype :float}]]]
+        (let [changed (assoc-in plan (into [:collectives 0] path) replacement)]
+          (is (distributed/distributed-plan? (distributed/validate! changed)))
+          (is (= :distributed-certificate
+                 (:reason (ex-data (try (distributed/verify! (assoc certified :plan changed))
+                                       (catch clojure.lang.ExceptionInfo e e)))))))))
+    (testing "a forged retained numerical facet is independently rederived"
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (distributed/validate!
+                    (assoc-in plan [:collectives 0 :operation :reduction :nan-policy]
+                              :forged-policy)))))
+    (testing "reconstruction does not silently authorize unknown retained leg fields"
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (distributed/validate!
+                    (assoc-in plan [:collectives 0 :schedule :rounds 0 0 :unverified-policy]
+                              :extra)))))))
+
+(deftest collective-certificates-bind-broadcast-root
+  (let [original (two-device-all-reduce)
+        broadcast (distributed/schedule-collective
+                   (assoc (:operation original) :kind :broadcast :reduction nil :root :gpu-0)
+                   (:schedule original) (:dependencies original))
+        plan (collective-plan broadcast)
+        certified (distributed/certify plan)
+        changed (assoc-in plan [:collectives 0 :operation :root] :gpu-1)]
+    (is (distributed/distributed-plan? (distributed/validate! changed)))
+    (is (= :distributed-certificate
+           (:reason (ex-data (try (distributed/verify! (assoc certified :plan changed))
+                                 (catch clojure.lang.ExceptionInfo e e))))))))
 
 (deftest reducing-collectives-require-an-associativity-certificate
   (let [error (try
@@ -295,6 +364,35 @@
                  {:id :unchecked :kind :all-reduce :group :data :value :weights})
                 (catch clojure.lang.ExceptionInfo exception exception))]
     (is (= :distributed-collective-reduction (:reason (ex-data error))))))
+
+(deftest collective-numerical-declarations-use-the-shared-contract
+  (let [base (:schedule (two-device-all-reduce))
+        valid [{:mode :exact :policy :retained-tree}
+               {:mode :reassociated :policy :parallel-tree
+                :rounding :nearest-even :accumulator-dtype :float}
+               {:mode :bounded-error :policy :measured-tree
+                :rounding :nearest-even :accumulator-dtype :float
+                :error-model {:kind :caller-bound}}]]
+    (is (= {} (:numerical-mode (distributed/collective-schedule base)))
+        "unspecified analytical policy must not silently become exact execution consent")
+    (doseq [contract valid]
+      (is (= contract (:numerical-mode
+                        (distributed/collective-schedule
+                         (assoc base :numerical-mode contract))))))
+    (doseq [contract [{:rounding :toward-zero}
+                     {:mode :exact}
+                     {:mode :unknown :policy :tree}
+                     {:mode :reassociated :policy :tree :accumulator-dtype :float}
+                     {:mode :reassociated :policy :tree :rounding :nearest-even
+                      :accumulator-dtype :f32}
+                     {:mode :bounded-error :policy :tree :rounding :nearest-even
+                      :accumulator-dtype :float}]]
+      (let [plan (assoc-in (collective-plan (two-device-all-reduce))
+                          [:collectives 0 :schedule :numerical-mode] contract)]
+        (is (= :distributed-collective-numerical-contract
+               (:reason (ex-data (try (distributed/validate! plan)
+                                     (catch clojure.lang.ExceptionInfo e e)))))
+            "retained records are revalidated, not trusted as policy evidence")))))
 
 (deftest parallel-collective-legs-cannot-oversubscribe-one-directed-link
   (let [error (try
@@ -497,8 +595,18 @@
            (get-in forward [:attributes :destination-region])))
     (is (= {:frame :global :offsets [3 0] :shape [1 4]}
            (get-in backward [:attributes :destination-region])))
-    (is (= {:combine (:combine combine) :identity (:identity combine) :dtype :float}
-           (get-in certificate [:halos 0 :combine])))
+    (is (= combine (get-in certificate [:halos 0 :combine])))
+    (doseq [facet [:overflow :nan-policy :signed-zero-policy]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (distributed/validate!
+                    (assoc-in plan [:halos 0 :exchange :combine facet] :forged-policy)))
+          (str "retained halo algebra independently checks " facet)))
+    (is (= :distributed-certificate
+           (:reason (ex-data
+                     (try (distributed/verify!
+                           (assoc (distributed/certify plan) :certificate
+                                  (assoc-in certificate [:halos 0 :combine :nan-policy] :forged-policy)))
+                          (catch clojure.lang.ExceptionInfo e e))))))
     (is (distributed/certified-plan? (distributed/verify! (distributed/certify plan))))))
 
 (deftest accumulating-halos-require-a-certified-monoid-of-the-value-dtype

@@ -31,6 +31,64 @@
 (defn- vt3 [f64 f32 i32] (cond-> {} f64 (assoc :f64 f64) f32 (assoc :f32 f32) i32 (assoc :i32 i32)))
 (defn- math1 [f64 f32 cfn] {:arity 1 :kind :fn :wasm (vt3 f64 f32 nil) :c {:fn cfn} :wgsl {:fn cfn}})
 
+(defn- target-math
+  "C-family elementary math calls carry target-library accuracy independently
+   of their retained operand/result precision. WASM's polynomial is a separate facet."
+  ([arity cfn] (target-math arity cfn nil))
+  ([arity cfn wgsl]
+   (cond-> {:arity arity :kind :fn :wasm :poly :c {:fn cfn}
+            :kernel-body-math-realization :target-library}
+     wgsl (assoc :wgsl {:fn wgsl}))))
+
+(defn- extremum-return-source
+  [op floating?]
+  (str (when floating?
+         (str " if (isnan(a)) return a; if (isnan(b)) return b;\n"
+              " if (a == 0 && b == 0) return signbit(a) ? "
+              (if (= :min op) "a : b" "b : a") ";\n"))
+       " return a " (if (= :min op) "<=" ">=") " b ? a : b;\n"))
+
+(defn- native-extremum
+  "Native C overloads preserve source NaNs and signed-zero ties. Function
+   arguments are evaluated once; _Generic's controlling expression is unevaluated."
+  [op]
+  (let [name (str "rstr_native_" (name op))]
+    {:fn name
+     :source
+     (str
+      (apply str
+             (for [[suffix type] [["f32" "float"] ["f64" "double"]
+                                 ["i32" "int"] ["long" "long"] ["i64" "long long"]]]
+               (str "static inline " type " " name "_" suffix "(" type " a, " type " b) {\n"
+                    (extremum-return-source op (#{"f32" "f64"} suffix)) "}\n")))
+      "#define " name "(a,b) _Generic(((a)+(b)), "
+      "float: " name "_f32, double: " name "_f64, "
+      "int: " name "_i32, long: " name "_long, long long: " name "_i64)((a),(b))\n")}))
+
+(defn- native-absolute
+  "C abs has undefined signed-minimum behavior, while JVM Math.abs returns the
+   minimum unchanged. Floating overloads must not narrow Double or widen Float."
+  []
+  {:fn "rstr_native_abs"
+   :source
+   (str "#include <limits.h>\n"
+        (apply str
+               (for [[suffix type minimum] [["i32" "int" "INT_MIN"]
+                                            ["long" "long" "LONG_MIN"]
+                                            ["i64" "long long" "LLONG_MIN"]]]
+                 (str "static inline " type " rstr_native_abs_" suffix "(" type " value) {\n"
+                      " return value == " minimum " ? value : (value < 0 ? -value : value);\n}\n")))
+        ;; Unary + applies only integral promotion. Float remains Float; the controlling
+        ;; expression is unevaluated, and the actual function argument is evaluated once.
+        "#if defined(__FLT16_MANT_DIG__)\n"
+        "static inline _Float16 rstr_native_abs_f16(_Float16 value) {\n"
+        " return (_Float16)fabsf((float)value);\n}\n"
+        "#define RSTR_NATIVE_ABS_HALF _Float16: rstr_native_abs_f16,\n"
+        "#else\n#define RSTR_NATIVE_ABS_HALF\n#endif\n"
+        "#define rstr_native_abs(a) _Generic((+(a)), RSTR_NATIVE_ABS_HALF "
+        "float: fabsf, double: fabs, int: rstr_native_abs_i32, "
+        "long: rstr_native_abs_long, long long: rstr_native_abs_i64)((a))\n")})
+
 ;; ---------------------------------------------------------------------------
 ;; CROSS-BACKEND SEMANTICS DECISION TABLE (A2)
 ;; Where backends could diverge on the same op, the CHOICE is recorded here —
@@ -81,7 +139,8 @@
    :quot {:arity 2 :kind :infix :wasm {:i32 :i32.div_s} :c "/" :wgsl "/"}
    ;; math — unary
    :sqrt  (math1 :f64.sqrt :f32.sqrt "sqrt")
-   :abs   {:arity 1 :kind :fn :wasm (vt3 :f64.abs :f32.abs nil) :c {:fn "fabs" :glsl "abs"} :wgsl {:fn "abs"}}
+   :abs   {:arity 1 :kind :fn :wasm (vt3 :f64.abs :f32.abs nil) :c {:fn "fabs" :glsl "abs"} :wgsl {:fn "abs"}
+           :native-c (native-absolute)}
    :floor (math1 :f64.floor :f32.floor "floor")
    :ceil  {:arity 1 :kind :fn :wasm :poly :c {:fn "ceil"} :wgsl {:fn "ceil"}}   ; -floor(-x)
    :trunc {:arity 1 :kind :fn :wasm (vt3 :f64.trunc :f32.trunc nil) :c {:fn "trunc"} :wgsl {:fn "trunc"}}
@@ -91,17 +150,19 @@
            :typed-expansion :java-round :source-signatures {:float :int :double :long}}
    :neg   {:arity 1 :kind :fn :wasm (vt3 :f64.neg :f32.neg nil) :c {:prefix "-"} :wgsl {:prefix "-"}}
    ;; math — binary
-   :min {:arity 2 :kind :fn :wasm (vt3 :f64.min :f32.min nil) :c {:fn "fmin" :glsl "min"} :wgsl {:fn "min"}}
-   :max {:arity 2 :kind :fn :wasm (vt3 :f64.max :f32.max nil) :c {:fn "fmax" :glsl "max"} :wgsl {:fn "max"}}
+   :min {:arity 2 :kind :fn :wasm (vt3 :f64.min :f32.min nil) :c {:fn "fmin" :glsl "min"} :wgsl {:fn "min"}
+         :native-c (native-extremum :min)}
+   :max {:arity 2 :kind :fn :wasm (vt3 :f64.max :f32.max nil) :c {:fn "fmax" :glsl "max"} :wgsl {:fn "max"}
+         :native-c (native-extremum :max)}
    ;; transcendentals — wasm has no opcode; all lower to an inline polynomial
    ;; (:wasm :poly, see backend.wasm.transcendental): sin/cos/tan + exp via
    ;; squaring, log via sqrt-reduction, pow=exp(y·log x), fma=a·b+c. No bit ops.
-   :sin {:arity 1 :kind :fn :wasm :poly :c {:fn "sin"} :wgsl {:fn "sin"}}
-   :cos {:arity 1 :kind :fn :wasm :poly :c {:fn "cos"} :wgsl {:fn "cos"}}
-   :tan {:arity 1 :kind :fn :wasm :poly :c {:fn "tan"} :wgsl {:fn "tan"}}
-   :exp {:arity 1 :kind :fn :wasm :poly :c {:fn "exp"} :wgsl {:fn "exp"}}
-   :log {:arity 1 :kind :fn :wasm :poly :c {:fn "log"} :wgsl {:fn "log"}}
-   :pow {:arity 2 :kind :fn :wasm :poly :c {:fn "pow"} :wgsl {:fn "pow"}}
+   :sin (target-math 1 "sin" "sin")
+   :cos (target-math 1 "cos" "cos")
+   :tan (target-math 1 "tan" "tan")
+   :exp (target-math 1 "exp" "exp")
+   :log (target-math 1 "log" "log")
+   :pow (target-math 2 "pow" "pow")
    :fma {:arity 3 :kind :fn :wasm :poly :c {:fn "fma"} :wgsl {:fn "fma"}}
    ;; widening int8 multiply-accumulate: int8×int8 → int32 lane accumulate. The
    ;; ONE canonical quant primitive; scalar :c is a plain int-widening mul-add,
@@ -156,24 +217,24 @@
    ;; broader elementary set — all wasm via composition/polynomial (see
    ;; backend.wasm.transcendental); GPU facet set only where it's a builtin (else
    ;; omitted → GPU keeps its generated-helper fallback, no regression).
-   :asin  {:arity 1 :kind :fn :wasm :poly :c {:fn "asin"} :wgsl {:fn "asin"}}
-   :acos  {:arity 1 :kind :fn :wasm :poly :c {:fn "acos"} :wgsl {:fn "acos"}}
-   :atan  {:arity 1 :kind :fn :wasm :poly :c {:fn "atan"} :wgsl {:fn "atan"}}
-   :atan2 {:arity 2 :kind :fn :wasm :poly :c {:fn "atan2"} :wgsl {:fn "atan2"}}
-   :sinh  {:arity 1 :kind :fn :wasm :poly :c {:fn "sinh"} :wgsl {:fn "sinh"}}
-   :cosh  {:arity 1 :kind :fn :wasm :poly :c {:fn "cosh"} :wgsl {:fn "cosh"}}
-   :tanh  {:arity 1 :kind :fn :wasm :poly :c {:fn "tanh"} :wgsl {:fn "tanh"}}
-   :asinh {:arity 1 :kind :fn :wasm :poly :c {:fn "asinh"} :wgsl {:fn "asinh"}}
-   :acosh {:arity 1 :kind :fn :wasm :poly :c {:fn "acosh"} :wgsl {:fn "acosh"}}
-   :atanh {:arity 1 :kind :fn :wasm :poly :c {:fn "atanh"} :wgsl {:fn "atanh"}}
-   :cbrt  {:arity 1 :kind :fn :wasm :poly :c {:fn "cbrt"}}
-   :log2  {:arity 1 :kind :fn :wasm :poly :c {:fn "log2"} :wgsl {:fn "log2"}}
-   :log10 {:arity 1 :kind :fn :wasm :poly :c {:fn "log10"}}
-   :exp2  {:arity 1 :kind :fn :wasm :poly :c {:fn "exp2"} :wgsl {:fn "exp2"}}
+   :asin  (target-math 1 "asin" "asin")
+   :acos  (target-math 1 "acos" "acos")
+   :atan  (target-math 1 "atan" "atan")
+   :atan2 (target-math 2 "atan2" "atan2")
+   :sinh  (target-math 1 "sinh" "sinh")
+   :cosh  (target-math 1 "cosh" "cosh")
+   :tanh  (target-math 1 "tanh" "tanh")
+   :asinh (target-math 1 "asinh" "asinh")
+   :acosh (target-math 1 "acosh" "acosh")
+   :atanh (target-math 1 "atanh" "atanh")
+   :cbrt  (target-math 1 "cbrt")
+   :log2  (target-math 1 "log2" "log2")
+   :log10 (target-math 1 "log10")
+   :exp2  (target-math 1 "exp2" "exp2")
    :exp10 {:arity 1 :kind :fn :wasm :poly}
-   :expm1 {:arity 1 :kind :fn :wasm :poly :c {:fn "expm1"}}
-   :log1p {:arity 1 :kind :fn :wasm :poly :c {:fn "log1p"}}
-   :hypot {:arity 2 :kind :fn :wasm :poly :c {:fn "hypot"}}
+   :expm1 (target-math 1 "expm1")
+   :log1p (target-math 1 "log1p")
+   :hypot (target-math 2 "hypot")
    :deg2rad {:arity 1 :kind :fn :wasm :poly :wgsl {:fn "radians"}}
    :rad2deg {:arity 1 :kind :fn :wasm :poly :wgsl {:fn "degrees"}}
    :clamp {:arity 3 :kind :fn :wasm :poly :wgsl {:fn "clamp"}}
@@ -293,6 +354,34 @@
 (defn kind [op] (:kind (descriptor op)))
 (defn arity [op] (:arity (descriptor op)))
 
+(defn native-c-helper-sources
+  "Native-only implementations referenced by the emitted source. Other C-family
+   targets keep their own facet; this does not certify their min/max semantics."
+  [body]
+  (str/join "\n"
+            (for [[_ {:keys [native-c]}] table
+                  :when (and native-c (str/includes? body (str (:fn native-c) "(")))]
+              (:source native-c))))
+
+(defn c-floating-extremum-name
+  "Name a source-semantic floating extremum at its verified operand dtype."
+  [op dtype]
+  (when-not (and (#{:min :max} op) (#{:float :double} dtype))
+    (throw (ex-info "unsupported source floating extremum"
+                    {:reason :unsupported-floating-extremum :op op :dtype dtype})))
+  (str "rstr_source_" (name op) "_" ({:float "f32" :double "f64"} dtype)))
+
+(defn c-floating-extremum-helper-sources
+  "Demand-driven shared C-family floating extrema. The dialect owner adds device
+   qualifiers; source arithmetic and numerical policy are not target choices."
+  [body]
+  (apply str
+         (for [op [:min :max] dtype [:float :double]
+               :let [fn-name (c-floating-extremum-name op dtype)]
+               :when (str/includes? body (str fn-name "("))]
+           (str "inline " (name dtype) " " fn-name "(" (name dtype) " a, " (name dtype) " b) {\n"
+                (extremum-return-source op true) "}\n"))))
+
 ;; ---------------------------------------------------------------------------
 ;; C / OpenCL / GLSL accessor — for the GPU c-emit backend.
 ;; Resolves a *mangled* devirtualized impl name (prefix before _m_) and returns
@@ -352,7 +441,9 @@
 (def simd-isa
   {:avx2
    {:f64 {:vtype "__m256d" :lanes 4 :set1 "_mm256_set1_pd" :loadu "_mm256_loadu_pd"
-          :storeu "_mm256_storeu_pd" :setzero "_mm256_setzero_pd"}
+          :storeu "_mm256_storeu_pd" :setzero "_mm256_setzero_pd"
+          :from-f32-load "_mm_loadu_ps" :from-f32 "_mm256_cvtps_pd"
+          :to-f32-store "_mm_storeu_ps" :to-f32 "_mm256_cvtpd_ps"}
     :f32 {:vtype "__m256"  :lanes 8 :set1 "_mm256_set1_ps" :loadu "_mm256_loadu_ps"
           :storeu "_mm256_storeu_ps" :setzero "_mm256_setzero_ps"
           ;; widening conversion i32×8 → f32×8 (the int8-MAC/quant fold boundary)
@@ -367,11 +458,38 @@
     :-   {:f64 "_mm256_sub_pd" :f32 "_mm256_sub_ps" :i32 "_mm256_sub_epi32"}
     :*   {:f64 "_mm256_mul_pd" :f32 "_mm256_mul_ps"}
     :div {:f64 "_mm256_div_pd" :f32 "_mm256_div_ps"}
-    :min {:f64 "_mm256_min_pd" :f32 "_mm256_min_ps"}
-    :max {:f64 "_mm256_max_pd" :f32 "_mm256_max_ps"}
+    :min {:f64 "rstr_avx2_min_f64" :f32 "rstr_avx2_min_f32"}
+    :max {:f64 "rstr_avx2_max_f64" :f32 "rstr_avx2_max_f32"}
     :sqrt {:f64 "_mm256_sqrt_pd" :f32 "_mm256_sqrt_ps"}
+    :abs {:f64 "rstr_avx2_abs_f64" :f32 "rstr_avx2_abs_f32"}
     ;; a·b+c fused; only where the ISA has a true FMA (AVX2 implies FMA3)
     :fma {:f64 "_mm256_fmadd_pd" :f32 "_mm256_fmadd_ps"}}})
+
+(defn simd-helper-sources
+  "AVX2 source extrema and sign-bit absolute value helpers."
+  [isa]
+  (when (= :avx2 isa)
+    (str "#ifndef RASTER_AVX2_SOURCE_EXTREMA\n#define RASTER_AVX2_SOURCE_EXTREMA\n"
+         (apply str
+           (for [op [:min :max]
+                 [elem type suffix] [[:f32 "__m256" "ps"] [:f64 "__m256d" "pd"]]
+                 :let [fn-name (get-in simd-ops [isa op elem])
+                       intrinsic #(str "_mm256_" % "_" suffix)]]
+             (str "static inline " type " " fn-name "(" type " a, " type " b) {\n"
+                  " " type " z = " (intrinsic "setzero") "();\n"
+                  " " type " both_zero = " (intrinsic "and") "("
+                  (intrinsic "cmp") "(a,z,_CMP_EQ_OQ),"
+                  (intrinsic "cmp") "(b,z,_CMP_EQ_OQ));\n"
+                  " " type " v = " (intrinsic "blendv") "("
+                  (intrinsic (name op)) "(a,b),"
+                  (intrinsic (if (= :min op) "or" "and")) "(a,b),both_zero);\n"
+                  " return " (intrinsic "blendv") "(v,a,"
+                  (intrinsic "cmp") "(a,a,_CMP_UNORD_Q));\n}\n")))
+         "static inline __m256 rstr_avx2_abs_f32(__m256 a) {\n"
+         " return _mm256_andnot_ps(_mm256_set1_ps(-0.0f), a);\n}\n"
+         "static inline __m256d rstr_avx2_abs_f64(__m256d a) {\n"
+         " return _mm256_andnot_pd(_mm256_set1_pd(-0.0), a);\n}\n"
+         "#endif\n")))
 
 (def ^:private simd-widen
   "Widening int8-MAC (:wi8-dot) vector lowering per ISA. On AVX2 it is the

@@ -2,7 +2,8 @@
   "Existing expanded Q4_K projection on checked Int32/Byte/Float public leaves.
    The bounded dyadic data extends the independently reviewed hand-calculated fixture;
    it does not qualify arbitrary quantizers, model logits or native floating lane policy."
-  (:require [clojure.test :refer [deftest is]]
+  (:require [raster.gpu.device-probe :as device-probe]
+            [clojure.test :refer [deftest is]]
             [raster.quant.kernels-k :as kernels]
             [raster.quant.pack :as pack]
             [raster.compiler.backend.cpu.quant :as quant]
@@ -154,7 +155,7 @@
 
 (deftest required-cuda-product-projection-executes-and-replays-checked-packed-inputs
   (if-not (= "1" (System/getenv "RASTER_REQUIRE_CUDA_DEVICE"))
-    (println "[CUDA SKIP] projection qualification requires RASTER_REQUIRE_CUDA_DEVICE=1")
+    (device-probe/cuda-skip! "projection qualification requires RASTER_REQUIRE_CUDA_DEVICE=1" :not-requested)
     (let [device (probe/probe)]
       (is (= :ready (:status device)))
       (when (= :ready (:status device)) (native-projection!)))))

@@ -1,6 +1,7 @@
 (ns raster.gpu.cuda-mixed-matrix-device-test
   "Public Float storage with explicitly requested f16-product/f32 matrix scheduling."
-  (:require [clojure.test :refer [deftest is]]
+  (:require [raster.gpu.device-probe :as device-probe]
+            [clojure.test :refer [deftest is]]
             [clojure.string :as string]
             [raster.core :refer [deftm]]
             [raster.gpu.compiled :as compiled]
@@ -194,7 +195,7 @@
 
 (deftest required-public-cuda-mixed-matrix-converts-raw-inputs-and-replays
   (if-not (= "1" (System/getenv "RASTER_REQUIRE_CUDA_DEVICE"))
-    (println "[CUDA SKIP] mixed qualification requires RASTER_REQUIRE_CUDA_DEVICE=1")
+    (device-probe/cuda-skip! "mixed qualification requires RASTER_REQUIRE_CUDA_DEVICE=1" :not-requested)
     (let [device (probe/probe)]
       (is (= :ready (:status device)))
       (when (= :ready (:status device)) (prove-public-mixed-replay!)))))
@@ -241,7 +242,7 @@
 
 (deftest required-generated-mixed-graph-preserves-aligned-pointer-views-and-guards
   (if-not (= "1" (System/getenv "RASTER_REQUIRE_CUDA_DEVICE"))
-    (println "[CUDA SKIP] mixed offset qualification requires RASTER_REQUIRE_CUDA_DEVICE=1")
+    (device-probe/cuda-skip! "mixed offset qualification requires RASTER_REQUIRE_CUDA_DEVICE=1" :not-requested)
     (let [device (probe/probe)]
       (is (= :ready (:status device)))
       (when (= :ready (:status device)) (prove-generated-mixed-offsets!)))))

@@ -2,11 +2,15 @@
   (:require [clojure.test :refer [deftest testing is]]
             [clojure.string]
             [raster.core :refer [deftm]]
+            [raster.arrays :as arrays]
+            [raster.numeric :as numeric]
+            [raster.compiler.pipeline :as pipeline]
             [raster.par :as par]
             [raster.compiler.ir.par :as ir.par]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.backend.jvm.segop-simd :as segop-simd]
             [raster.compiler.ir.soac :as soac]
+            [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.materialize :as materialize]))
@@ -14,6 +18,101 @@
 ;; ================================================================
 ;; Body analysis tests (segop-simd)
 ;; ================================================================
+
+(deftm mixed-precision-square-map
+  [src :- (Array float) gain :- Double] :- (Array float)
+  (let [out (arrays/alloc-like src (arrays/alength src))]
+    (par/map! out i (arrays/alength src) float
+      (numeric/+ (arrays/aget src i) (float (numeric/* gain gain))))
+    out))
+
+(deftm double-comparison-map
+  [src :- (Array float) lo :- Double hi :- Double] :- (Array float)
+  (let [out (arrays/alloc-like src (arrays/alength src))]
+    (par/map! out i (arrays/alength src) float
+      (if (numeric/< lo hi) (float 1) (float 2)))
+    out))
+
+(deftest simd-preserves-selected-comparison-domain
+  (let [scalar (pipeline/compile-aot #'double-comparison-map :simd? false)
+        vectorized (pipeline/compile-aot #'double-comparison-map :simd? true)
+        input (float-array 65)]
+    ;; Each pair collapses to a single Float, but remains distinct in Double.
+    (doseq [[lo hi] [[1.00000006 1.00000007] [1.00000007 1.00000006]]]
+      (let [expected (if (< (double lo) (double hi)) (float 1) (float 2))
+            reference (vec (scalar input lo hi))
+            actual (vec (vectorized input lo hi))]
+        (is (= (vec (repeat 65 expected)) reference))
+        (is (= reference actual))))))
+
+(deftest comparison-admission-uses-declared-parameters-not-boolean-result
+  (let [expression
+        (fn [tags]
+          (segop-simd/normalize-invk
+           (list 'if
+                 (with-meta
+                   (list '.invk
+                         (with-meta 'declared-comparison-impl
+                           {:raster.type/fn-info {:param-tags tags}})
+                         'lo 'hi)
+                   {:raster.op/original 'raster.numeric/< :raster.type/tag 'boolean})
+                 '(float 1) '(float 2))))]
+    (is (segop-simd/simd-able? (expression '[float float]) 'i :float))
+    (is (not (segop-simd/simd-able? (expression '[double double]) 'i :float)))
+    (is (not (segop-simd/simd-able? (expression '[long long]) 'i :float)))
+    (is (not (segop-simd/simd-able? (expression nil) 'i :float)))
+    (is (not (segop-simd/simd-able? (expression '[float]) 'i :float)))
+    (is (not (segop-simd/simd-able?
+              (list 'if (with-meta '(< lo hi) {:raster.type/tag 'boolean})
+                    '(float 1) '(float 2)) 'i :float)))
+    (is (segop-simd/simd-able? '(if (< lo hi) (float 1) (float 2)) 'i)
+        "untyped compatibility syntax is not a typed signature proof")))
+
+(deftest simd-keeps-double-computation-before-float-narrowing
+  (let [scalar (pipeline/compile-aot #'mixed-precision-square-map :simd? false)
+        vectorized (pipeline/compile-aot #'mixed-precision-square-map :simd? true)]
+    ;; Non-multiple lengths exercise vector lanes and the original scalar tail.
+    ;; Changed inputs rule out a fixture-specific constant or cached result.
+    (doseq [length [65 129] gain [1.00000006 1.00000018]]
+      (let [input (float-array (repeat length 0.0))
+            expected (float (* (double gain) (double gain)))
+            reference (scalar input gain)
+            actual (vectorized input gain)]
+        (is (every? #(= (Float/floatToRawIntBits expected)
+                       (Float/floatToRawIntBits (float %))) reference))
+        (is (= (vec reference) (vec actual)))))))
+
+(deftest simd-admission-respects-retained-operation-precision
+  (let [typed (fn [tag form] (with-meta form {:raster.type/tag tag}))
+        wide (typed 'double '(* gain gain))
+        narrow (typed 'float '(+ (aget src i) gain))]
+    (is (segop-simd/simd-able? narrow 'i :float)
+        "homogeneous typed arithmetic keeps the vector fast path")
+    (is (segop-simd/simd-able? wide 'i :double))
+    (is (not (segop-simd/simd-able? (list 'float wide) 'i :float))
+        "a narrowing cast does not license early narrowing of its computation")
+    (is (not (segop-simd/simd-able? (list 'double narrow) 'i :double))
+        "a widening cast does not license erasing inner Float rounding")))
+
+(deftest stencil-admission-keeps-the-active-species
+  (let [stencil {:space {:dims [{:name 'i :bound 'n}]} :dtype :float
+                 :out-sym 'out :inputs '#{a} :cast-fn 'float
+                 :radius 1 :boundary :dirichlet}
+        body (fn [tag] (with-meta '(+ (aget a i) gain) {:raster.type/tag tag}))]
+    (is (some? (par-simd/compile-segstencil (assoc stencil :lambda (body 'float)))))
+    (is (nil? (par-simd/compile-segstencil (assoc stencil :lambda (body 'double)))))))
+
+(deftest reduction-admission-checks-the-root-operation
+  (let [operation (fn [tag]
+                    {:space {:dims [{:name 'i :bound 'n}]} :dtype :float :inputs '#{x}
+                     :reduction
+                     (reduction/scalar
+                      {:accumulator 'acc :neutral (float 0) :dtype :float
+                       :result 'out :index 'i
+                       :step-result (with-meta '(+ acc (aget x i))
+                                      {:raster.type/tag tag})})})]
+    (is (some? (segop-simd/compile-segred (operation 'float))))
+    (is (nil? (segop-simd/compile-segred (operation 'double))))))
 
 (deftest simd-able-simple-ops
   (testing "Simple arithmetic ops are SIMD-able"
@@ -170,9 +269,11 @@
   (testing "compile-segmap handles fma"
     (let [form '(raster.par/map! out i 100 double
                                  (Math/fma dt (aget k i) (aget u i)))
-          segmap (par->segmap form)]
-      (is (segop-simd/compile-segmap segmap 'out 'double)
-          "Should produce SIMD form for fma"))))
+          segmap (par->segmap form)
+          generated (segop-simd/compile-segmap segmap 'out 'double)]
+      (is generated "Should produce SIMD form for fma")
+      (is (some #(and (seq? %) (= '.fma (first %))) (all-nodes generated))
+          "explicit source FMA remains fused"))))
 
 (deftest compile-segmap-compare-blend
   (testing "compile-segmap handles if+comparison via compare+blend"
@@ -209,6 +310,33 @@
           segred (par->segred form)]
       (is (segop-simd/compile-segred segred)
           "Should produce SIMD form for dot product"))))
+
+(deftest dot-reassociation-retains-product-rounding
+  (let [segred (par->segred
+               '(raster.par/reduce acc 0.0 i n (+ acc (* (aget a i) (aget b i)))))
+        generated (segop-simd/compile-segred segred)
+        nodes (all-nodes generated)]
+    (is generated "the dot stays vectorized")
+    (is (some #(and (seq? %) (= '.mul (first %))) nodes))
+    (is (not-any? #(and (seq? %) (= '.fma (first %))) nodes)
+        "parallel addition does not authorize contraction")
+    (let [native (eval (list 'fn [(with-meta 'a {:tag 'doubles})
+                                 (with-meta 'b {:tag 'doubles}) 'n] generated))
+          lanes (.length jdk.incubator.vector.DoubleVector/SPECIES_PREFERRED)
+          nacc (#'segop-simd/effective-n-accumulators :double)
+          stride (* lanes nacc)
+          gap (Math/scalb (double 1.0) (int -27))]
+      (is (not (zero? (Math/fma (+ 1.0 gap) (- 1.0 gap) -1.0)))
+          "fixture distinguishes FMA from a rounded product")
+      (doseq [sign [1.0 -1.0] tail [0 1 3]]
+        (let [n (+ (* 2 stride) tail)
+              a (double-array n) b (double-array n)]
+          (aset-double a 0 (- sign))
+          (aset-double b 0 1.0)
+          (aset-double a stride (* sign (+ 1.0 gap)))
+          (aset-double b stride (- 1.0 gap))
+          (is (zero? (double (native a b n)))
+              (str "changed sign=" sign ", tail=" tail)))))))
 
 (deftest compile-segred-qualified-ops
   (testing "compile-segred handles qualified core ops"

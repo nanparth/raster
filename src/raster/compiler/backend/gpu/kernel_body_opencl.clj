@@ -258,7 +258,7 @@
                                           {:accumulator (acc-id m n)})
                                 (str "        acc" m n " = intel_sub_group_f16_f16_matrix_mad_k16(sa" m ", bp" n ", acc" m n ");\n"))))))]
     (str
-     (c-dialect/preamble (c-dialect/resolve! :opencl-intel) {})
+     (c-dialect/scalar-arithmetic-preamble (c-dialect/resolve! :opencl-intel))
      "#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable\n"
      "#pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable\n\n"
      "// Tiled GEMM (parametric): WG " block-m "x" block-n ", SG " sg-m "x" sg-n
@@ -356,10 +356,21 @@
                                 (lower-scalar-ssa-region
                                  kernel-body input-region parameter-names))])))
                (:input-regions plan))]
-     (emit-plan kernel-name plan
-                (assoc (or (lower-store-region kernel-body parameter-names) {})
-                       :input-values input-values
-                       :parameter-names parameter-names)))))
+     (let [source (emit-plan kernel-name plan
+                             (assoc (or (lower-store-region kernel-body parameter-names) {})
+                                    :input-values input-values
+                                    :parameter-names parameter-names))
+           helpers (ce/intrinsic-helper-module source :opencl-intel {})]
+       (when (seq (:compilation helpers))
+         (throw (ex-info "matrix OpenCL helper requires an unsupported compilation contract"
+                         {:reason :kernel-body-matrix-helper-compilation
+                          :compilation (:compilation helpers)})))
+       (str (when (some #(str/includes? source
+                                        (str (intrinsics/c-floating-extremum-name % :double) "("))
+                         [:min :max])
+              "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
+            (when (seq (:source helpers)) (str (:source helpers) "\n"))
+            source)))))
 
 ;; ---------------------------------------------------------------------------
 ;; General scalar/control KernelBody lowering
@@ -702,6 +713,22 @@
       (and integral? (contains? #{:min :max} op))
       (str (name op) "(" (str/join ", " arguments) ")")
 
+      ;; Native fmin/fmax discard a lone NaN. The source Math/numeric operation
+      ;; propagates it and has a signed-zero tie rule, independent of the target.
+      (contains? #{:min :max} op)
+      (if (= :half operand-type)
+        ;; Half operands widen exactly, and extrema select one of those values.
+        ;; Reuse the verified conversion emitter for target half representation
+        ;; and nearest-even narrowing instead of inventing another helper family.
+        (emit-cast
+         (body/cast-expression
+          (body/scalar-expression op :float
+            (mapv #(body/cast-expression % :float :exact :exact) (:arguments expression)))
+          :half :nearest-even :ieee)
+         context)
+        (str (intrinsics/c-floating-extremum-name op operand-type)
+             "(" (str/join ", " arguments) ")"))
+
       ;; Word shifts have the JVM/WASM width-masked count contract, independent of the
       ;; source language's choice to widen an operand. Unsigned shifts also avoid signed
       ;; left-shift overflow; arithmetic right shift explicitly restores the sign bits.
@@ -724,6 +751,15 @@
       (throw (ex-info "OpenCL integral abs disagrees with the KernelBody result type"
                       {:reason :kernel-body-opencl-intrinsic
                        :operation op :operand-type operand-type}))
+
+      ;; Keep two explicitly scheduled scalar operations as two roundings. CUDA's default
+      ;; compiler otherwise contracts even named SSA temporaries; a rounded multiply has a
+      ;; documented non-contraction guarantee. AMD HIP uses its register-fence helper instead
+      ;; of its identically named, contractible header intrinsic. Canonical :fma is untouched.
+      (and (= :* op)
+           (c-dialect/noncontracting-multiply-name *scalar-dialect* operand-type))
+      (str (c-dialect/noncontracting-multiply-name *scalar-dialect* operand-type)
+           "(" (str/join ", " arguments) ")")
 
       :else
       (case (:kind lowering)
@@ -1377,15 +1413,41 @@
                             "OpenCL subgroup builtin cannot preserve an explicit reduction tree"
                             {:reason :kernel-body-opencl-collective-association
                              :association association})))
-                      builtin (c-dialect/opencl-reduction-builtin operator)]
+                      builtin (c-dialect/opencl-reduction-builtin operator)
+                      _ (when (and (contains? #{:min :max} operator)
+                                   (dtype/fp-dtype? result-type)
+                                   (not (contains? #{:float :double} result-type)))
+                          (throw (ex-info "OpenCL source extrema collective requires Float or Double arithmetic"
+                                          {:reason :kernel-body-opencl-collective-dtype
+                                           :operator operator :dtype result-type})))]
                   (when-not builtin
                     (throw (ex-info "OpenCL has no matching subgroup reduction builtin"
                                     {:reason :kernel-body-opencl-collective
                                      :operator (:operator operation)})))
-                  (str (indent-lines depth
-                                     (str working-type " " working-name " = "
-                                          builtin "(" working-input ");"))
-                       finish))
+                  (if (and (contains? #{:min :max} operator)
+                           (contains? #{:float :double} result-type))
+                    ;; Native OpenCL extrema ignore a NaN paired with a number.
+                    ;; Evaluate the operand once and execute every predicate collective
+                    ;; uniformly, before selecting the source-semantic result. A zero
+                    ;; result must also retain the preferred sign among zero operands.
+                    (let [operand-name (str result-name "__operand")
+                          nan-name (str result-name "__any_nan")
+                          zero-name (str result-name "__preferred_zero")
+                          negative? (= :min operator)]
+                      (str
+                       (indent-lines depth (str working-type " " operand-name " = " working-input ";"))
+                       (indent-lines depth (str working-type " " working-name " = " builtin "(" operand-name ");"))
+                       (indent-lines depth (str "int " nan-name " = sub_group_any(isnan(" operand-name "));"))
+                       (indent-lines depth (str "int " zero-name " = sub_group_any(" operand-name " == 0 && "
+                                                (when-not negative? "!") "signbit(" operand-name "));"))
+                       (indent-lines depth (str working-name " = " nan-name " ? (" working-type ")NAN : ("
+                                                working-name " == 0 ? (" zero-name " ? "
+                                                (when negative? "-") "(" working-type ")0.0 : "
+                                                (when-not negative? "-") "(" working-type ")0.0) : " working-name ");"))))
+                    (str (indent-lines depth
+                                       (str working-type " " working-name " = "
+                                            builtin "(" working-input ");"))
+                         finish)))
                 (let [distances (if (= :implementation-defined association)
                                   (when (zero? (bit-and width (dec width)))
                                     (vec (take-while pos?
@@ -1404,12 +1466,8 @@
                                   :bit-or (str working-name " |= " rhs ";")
                                   :bit-xor (str working-name " ^= " rhs ";")
                                   (:min :max)
-                                  (let [fn-name (case [operator result-type]
-                                                  [:min :float] "fminf"
-                                                  [:max :float] "fmaxf"
-                                                  [:min :double] "fmin"
-                                                  [:max :double] "fmax"
-                                                  nil)]
+                                  (let [fn-name (when (contains? #{:float :double} result-type)
+                                                  (intrinsics/c-floating-extremum-name operator result-type))]
                                     (when-not fn-name
                                       (throw (ex-info "CUDA/HIP min/max collective dtype is unsupported"
                                                       {:reason :kernel-body-c-collective
@@ -1647,7 +1705,8 @@
         helper-source
         (c-dialect/helper-source
          *scalar-dialect*
-         (str (apply str
+         (str (c-dialect/scalar-arithmetic-helper-source *scalar-dialect* operation-source)
+              (apply str
                      (map (fn [[operation type]]
                             (c-dialect/trapping-arithmetic-helper-source
                              *scalar-dialect* operation type))
@@ -1667,13 +1726,27 @@
                 ce/opencl-atomic-add-float-helper)
               (:source intrinsic-module)))
         storage-declarations (concat parameters (:allocations kernel-body))
+        retained-scalar-types
+        (set (keep (fn [value]
+                     (let [type (cond
+                                  (or (record-kind? "ValueSpec" value) (record-kind? "Literal" value))
+                                  (:type value)
+                                  (record-kind? "ScalarExpr" value) (:result-type value))]
+                       (when type
+                         (if (= :predicate type) :predicate (dtype/canon type)))))
+                   (tree-seq coll? seq (:operations kernel-body))))
         stable-reads (set (map :buffer (:stable-reads kernel-body)))
-        uses-half? (some #(= :half (dtype/canon (:dtype %))) storage-declarations)
+        uses-half? (or (some #(= :half (dtype/canon (:dtype %))) storage-declarations)
+                       (contains? retained-scalar-types :half))
         uses-double? (or (some #(= :double (dtype/canon (:dtype %))) storage-declarations)
+                         (contains? retained-scalar-types :double)
                          (some #{:double} (vals value-types))
                          ;; Expression-valued operands need no named ValueSpec. This exact
-                         ;; emitted helper demand also covers their narrowing boundary.
-                         (str/includes? operation-source "rstr_narrow_f64_f32_rte("))
+                         ;; emitted helper demand also covers their narrowing/extrema boundaries.
+                         (str/includes? operation-source "rstr_narrow_f64_f32_rte(")
+                         (some #(str/includes? operation-source
+                                               (str (intrinsics/c-floating-extremum-name % :double) "("))
+                               [:min :max]))
         collective (first (filter #(record-kind? "Collective" %) operations))
         uses-subgroups? (or collective
                             (some #(and (record-kind? "IndexBinding" %)

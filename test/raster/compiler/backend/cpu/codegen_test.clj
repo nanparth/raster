@@ -1,6 +1,85 @@
 (ns raster.compiler.backend.cpu.codegen-test
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.compiler.backend.cpu.codegen :as cpu]))
+            [raster.compiler.backend.cpu.codegen :as cpu]
+            [raster.compiler.backend.intrinsics :as intrinsics]))
+
+(deftest native-extrema-evaluate-operands-once
+  (doseq [op [:min :max]
+          :let [name (get-in intrinsics/table [op :native-c :fn])
+                body (str "void extrema_once(float *x, float *out) {\n"
+                          "out[0] = " name "(x[0]++, x[1]++);\n"
+                          "out[1] = x[0]; out[2] = x[1];\n}\n")
+                source (str "#include <math.h>\n"
+                            (intrinsics/native-c-helper-sources body) body)
+                native (cpu/load-kernel (cpu/compile-source! source) "extrema_once" 2 [])
+                x (float-array [-2.0 -3.0])
+                out (float-array 3)]]
+    (native x out)
+    (is (= [(if (= :min op) -3.0 -2.0) -1.0 -2.0] (vec out)))))
+
+(deftest native-extrema-preserve-integral-operands
+  (doseq [op ['Math/min 'Math/max]
+          :let [native (cpu/compile-elementwise "extrema_long" :long (list op 'x 'y) 2)
+                a (long-array [Long/MAX_VALUE Long/MIN_VALUE 9007199254740993])
+                b (long-array [(dec Long/MAX_VALUE) (inc Long/MIN_VALUE) 9007199254740992])
+                out (long-array 3)]]
+    (native a b out 3)
+    (is (= (mapv (if (= op 'Math/min) min max) a b) (vec out)))))
+
+(deftest native-absolute-evaluates-once-and-retains-result-type
+  (let [name (get-in intrinsics/table [:abs :native-c :fn])
+        body (str "void abs_once(float *x, float *out) {"
+                  "out[0] = " name "(x[0]++); out[1] = x[0];"
+                  "out[2] = _Generic(" name "(x[0]), float: 1, default: 0);}")
+        helpers (intrinsics/native-c-helper-sources body)]
+    ;; Optional half support must not infect ordinary Float/Double/integer helpers.
+    ;; Exercise both the real target and a forced absence of its half capability.
+    (doseq [capability-prefix ["" "#undef __FLT16_MANT_DIG__\n"]]
+      (let [source (str "#include <math.h>\n" capability-prefix helpers body)
+            native (cpu/load-kernel (cpu/compile-source! source) "abs_once" 2 [])
+            x (float-array [-2.0]) out (float-array 3)]
+        (native x out)
+        (is (= [2.0 -1.0 1.0] (vec out)))))))
+
+(deftest native-absolute-retains-half-boundary
+  ;; Native half arithmetic already widens through Float and rounds back to half.
+  ;; Inputs here are exactly half-representable, so Float comparison is independent
+  ;; of a second host implementation of the half conversion.
+  (let [name (get-in intrinsics/table [:abs :native-c :fn])
+        body (str "#if defined(__FLT16_MANT_DIG__)\n"
+                  "void abs_half(float *x, float *out, int n) {"
+                  "for (int i=0;i<n;i++) out[i]=(float)" name "((_Float16)x[i]);"
+                  "out[n]=_Generic(" name "((_Float16)0), _Float16: 1, default: 0);out[n+1]=1;}\n"
+                  "#else\nvoid abs_half(float *x, float *out, int n) {"
+                  "for (int i=0;i<n;i++) out[i]=" name "(x[i]);out[n]=0;out[n+1]=0;}\n#endif\n")
+        source (str "#include <math.h>\n" (intrinsics/native-c-helper-sources body) body)
+        native (cpu/load-kernel (cpu/compile-source! source) "abs_half" 2 [:int])
+        values [-0.0 -1.0 1.0 -65504.0 Float/NEGATIVE_INFINITY
+                Float/POSITIVE_INFINITY Float/NaN (- (Math/scalb (double 1.0) (int -24)))]
+        x (float-array values) out (float-array (+ 2 (count values)))]
+    (native x out (int (count values)))
+    (doseq [i (range (count values))]
+      (let [expected (Math/abs (aget x i)) actual (aget out i)]
+        (is (if (Float/isNaN expected) (Float/isNaN actual)
+                (= (Float/floatToRawIntBits expected) (Float/floatToRawIntBits actual))))))
+    (let [capability (double (aget out (inc (count values))))
+          half-supported? (= 1.0 capability)]
+      (is (contains? #{0.0 1.0} capability))
+      (is (= capability (double (aget out (count values))))
+          "supported targets must retain the half result type")
+      (println "[NATIVE ABS] half boundary supported:" half-supported?
+               "(without half support, the ordinary Float fallback is exercised)"))))
+
+(deftest native-absolute-preserves-integral-width-and-minima
+  (doseq [[dtype make-array values reference]
+          [[:int int-array [Integer/MIN_VALUE Integer/MAX_VALUE -16777217 -1 0 1]
+            #(Math/abs (int %))]
+           [:long long-array [Long/MIN_VALUE Long/MAX_VALUE -9007199254740993 -1 0 1]
+            #(Math/abs (long %))]]]
+    (let [native (cpu/compile-elementwise "abs_integral" dtype '(Math/abs x) 1)
+          x (make-array values) out (make-array (count values))]
+      (native x out (count values))
+      (is (= (mapv reference values) (vec out))))))
 
 (deftest native-source-cache-key-test
   (let [key-fn (ns-resolve 'raster.compiler.backend.cpu.codegen 'source-cache-key)
@@ -15,3 +94,26 @@
       (is (not= key
                 (with-redefs-fn {identity-var (delay {:schema :test/different-toolchain})}
                   #(key-fn source)))))))
+
+(deftest native-default-preserves-floating-point-operations
+  ;; Runtime inputs prevent constant folding from hiding permissive compiler
+  ;; flags. This exercises the actual compile/load boundary, not a flags regex.
+  (let [source (str "#include <math.h>\n"
+                    "void fp_semantics(const float *x, float *out) {\n"
+                    " out[0] = isnan(x[0]) ? 1.0f : 0.0f;\n"
+                    " out[1] = x[1] * 0.0f;\n"
+                    " out[2] = x[2] * x[2] + x[3];\n"
+                    "}\n")
+        native (cpu/load-kernel (cpu/compile-source! source) "fp_semantics" 2 [])
+        x (float-array [Float/NaN -1.0 1.0000001192092896 -1.000000238418579])
+        out (float-array 3)]
+    (native x out)
+    (testing "NaN tests remain observable"
+      (is (= 1.0 (aget out 0))))
+    (testing "negative zero remains observable"
+      (is (= (Float/floatToRawIntBits -0.0)
+             (Float/floatToRawIntBits (aget out 1)))))
+    (testing "separate multiply and add do not become an implicit FMA"
+      (is (= 0.0 (aget out 2)))
+      (is (not= (double (aget out 2))
+                (double (Math/fma (aget x 2) (aget x 2) (aget x 3))))))))

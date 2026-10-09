@@ -134,25 +134,6 @@
             :scalar-types (:scalar-types parameter-types)}
            (when param-env {:param-env param-env}))))
 
-(defn- target-source-dialect
-  "Select source spelling from the same hardware descriptor used by scheduling.
-
-   A missing optional descriptor still has a conservative family default: Level Zero is the
-   explicit Intel path, while generic OpenCL uses portable subgroup spelling."
-  [target backend descriptor]
-  (or (try
-        (some-> descriptor gpu-target/kernel-body-c-dialect)
-        (catch Throwable _ nil))
-      (case (device/device-type target)
-        :ze :opencl-intel
-        :ocl :opencl-portable
-        :cuda :cuda
-        :hip :hip
-        (case backend
-          :cuda :cuda
-          :hip :hip
-          nil))))
-
 (defn ^:no-doc validate-target-description!
   "Check the identity of a captured compilation target before cache lookup or scheduling."
   [target descriptor]
@@ -320,8 +301,13 @@
                              :numerical-mode (if mixed? :approximate-model :reassociated)
                              :tuning {:schedule-path [:typed-contraction :measured-selectors]
                                       :schedule-key id
-                                      :numerical-mode (assoc numerical-policy :precision
-                                                             (if mixed? :mixed-f16-f32 :f32))
+                                      :numerical-mode
+                                      (cond-> (assoc numerical-policy :precision
+                                                     (if mixed? :mixed-f16-f32 :f32))
+                                        (not mixed?)
+                                        (assoc :multiply-add
+                                               (get-in options [:schedule :typed-contraction :multiply-add]
+                                                       :decomposed)))
                                       :layout {:external-interface interface}}}})
                            measured-selector (kernel-dispatch/with-selector measured-selector))
                          certified (equation-dispatch/make
@@ -453,7 +439,7 @@
                                          projection))
          scheduled (structured-route/schedule-program semantic compiler-options)
          backend (device/select-runtime-backend target true nil)
-         target-dialect (target-source-dialect target backend target-descriptor)
+         target-dialect (gpu-target/source-dialect target backend target-descriptor)
          reference-emission
          (if target-dialect
            (program-c-family/emit-program

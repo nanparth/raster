@@ -1,6 +1,7 @@
 (ns raster.compiler.ir.kernel-body-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.kernel-body-fixtures :as fixtures]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-body :as body]
@@ -397,6 +398,31 @@
     (is (= :predicate (get-in kernel [:operations 1 :result :type])))
     (is (= :full (get-in kernel [:operations 4 :participation :kind])))
     (is (launch/launch-spec? (:launch kernel)))))
+
+(deftest elementary-math-realization-is-explicit-not-a-bitwise-attestation
+  (let [operators (into #{} (keep (fn [[op descriptor]]
+                                  (when (= :target-library (:kernel-body-math-realization descriptor))
+                                    op))) intrinsics/table)]
+    (is (= #{:sin :cos :tan :exp :log :pow :asin :acos :atan :atan2
+             :sinh :cosh :tanh :asinh :acosh :atanh :cbrt :log2 :log10
+             :exp2 :expm1 :log1p :hypot} operators))
+    (doseq [operator operators dt [:float :double]]
+      (let [arguments (vec (repeat (:arity (intrinsics/descriptor operator))
+                                   (body/literal 0.5 dt)))
+            expression (body/scalar-expression operator dt arguments)
+            compute #(scalar-body [(body/->ScalarCompute (body/value 'result dt) %)])]
+        (is (= {:math-realization {:kind :target-library :accuracy :implementation-defined}}
+               (:options expression)))
+        (is (body/kernel-body? (compute expression)))
+        (doseq [options [{}
+                         {:math-realization {:kind :target-library :accuracy :correctly-rounded}}
+                         {:math-realization {:kind :target-library :accuracy :implementation-defined}
+                          :overflow :wrap}]]
+          (try
+            (compute (assoc expression :options options))
+            (is false "serialized expressions cannot invent or drop the math realization")
+            (catch clojure.lang.ExceptionInfo e
+              (is (= :kernel-body-math-realization (:reason (ex-data e)))))))))))
 
 (deftest scalar-ssa-and-conversion-policies-fail-loudly
   (testing "SSA values cannot be used before definition"

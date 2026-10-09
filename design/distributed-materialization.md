@@ -321,3 +321,158 @@ preserved expression order. Invariant attestations are subject to that model; th
 exact real-arithmetic conservation for arbitrary FP values. Callers must establish assumptions
 again after resident producers update input values; the structural certificate does not inspect
 device contents. Structural manifest fixtures in this acceptance are not durable publication tests.
+
+## Explicit copy regions and generated arithmetic
+
+`DistributedPlan` can bind an ordinary transfer to regions of existing local LinkValues:
+
+```clojure
+:copy-bindings
+{:move {:source {:step :producer :local-value :gradient
+                 :region {:offsets [2] :shape [3]}}
+        :target {:step :consumer :local-value :scratch
+                 :region {:offsets [4] :shape [3]}}}}
+```
+
+The endpoint step identifies a local entry's storage contract, not proof that that compute has
+already executed. The ordinary DAG and readiness analysis still prove initialization and order.
+The source must realize the transfer's global value and, in a padded domain, stay within its owned
+rectangle. Ghost copies need separate freshness evidence and are not admitted through this seam.
+The target can be scratch or other mutable local storage; no constant storage may be overwritten,
+including overlapping constant views in other bound entries. Both regions must be contiguous,
+non-overlapping, equally shaped and typed, and match the declared payload bytes. Strided regions
+require ordinary generated pack/unpack compute, not a bounding-span copy. Region validation uses
+the existing BufferView algebra; halo and explicit copies share the physical copy checks.
+
+Explicit bindings cannot override any ScheduledHalo or ScheduledCollective leg. In particular,
+adding a physical binding does not make an analytic all-reduce executable. Checked collective
+realizations instead bind ordinary scratch-copy and generated-combine steps to the semantic
+operation and its numerical policy. Runtime transport remains a copy operation.
+The current numerical fixture uses generated `acopy!`, a resident scratch-region transfer, then
+generated `axpy!`. Its independent output checks include both the copied region and untouched
+sentinels; co-located workers validate composition, not fabric performance or collective semantics.
+
+Certificates retain the copy bindings alongside the existing local plans. Changing a valid
+endpoint rectangle invalidates old evidence even when payload size and analytic cost are unchanged.
+Constructing plans through `plan` defaults to no explicit copies; retained record/certificate
+values from the previous schema must be rebuilt. Surface numerical function semantics are unchanged.
+
+Collective schedules use the shared `numerical-contract` schema when `:numerical-mode` is
+nonempty. An empty map remains an unspecified analytical policy, not consent to execute or
+reassociate floating-point arithmetic. A bare rounding map is no longer a valid declaration:
+use a named `:mode` and `:policy`, with accumulator/rounding/error-model fields as required by
+the shared validator. Retained schedule records are revalidated at plan admission. This checks
+the declaration only; lowering must still bind generated combines and their evaluation tree to
+that policy and prove complete, nonduplicated contributions.
+
+### Compiler-generated local collective arithmetic
+
+`collective-combine/algorithm` projects a revalidated `AssociativeScan` into an ordinary
+functional TypedSOAC map: two dense immutable inputs and one fresh result, with an explicit
+typed scalar combine. It uses the existing monoid authority, not a collective operator registry.
+The certificate's original element expression is not evaluated again; this projection combines
+two already-produced contribution arrays.
+
+Emission uses `typed-soac-route/program-envelope`, the shared typed scheduler and C-family
+emitter. A matching device identity and frozen GPU descriptor are required; the existing target
+authority derives the source dialect. Validation binds the emitted equation back to the requested
+typed monoid, extent, scalar schedule and target snapshot. The private flattened-index binder may
+be fresh, but scalar computation, logical dimensions and launch grid cannot drift.
+
+These local maps alone are not an all-reduce implementation. The checked distributed realization
+proves per-output complete, nonduplicated contribution ancestry, checks derived dependencies and
+physical copy/combine bindings, and retains numerical consent for the global evaluation tree.
+Local CPU/device comparisons and CUDA/HIP compile fixtures exercise generated binary arithmetic;
+they do not establish fabric performance or distributed reduction completion.
+
+### Semantic contribution refinement
+
+`collective-refinement` describes an immutable SSA DAG for a full-array all-reduce. It retains
+the collective operation, participant group, plain replicated tensor type and explicit shared
+numerical policy. There is exactly one input per participant. Copies preserve contribution
+ancestry; local binary combines require co-located inputs with disjoint ancestry. Every output
+must reside at its declared participant and contain every participant's contribution exactly
+once. Fan-out is legal: uniqueness is checked within each output's ancestry, not by globally
+consuming inputs once.
+
+`refinement-facts` independently reconstructs ancestry, evaluation expressions and producer
+dependencies from the closed nodes. Caller-supplied lineage or dependency assertions are not
+accepted. The first tree contract requires explicit reassociation with unchanged accumulation
+dtype; a monoid certificate alone is not a bitwise floating-point guarantee.
+
+This witness alone is not an executable DistributedPlan and does not unlock semantic-leg copy
+overrides. Projection validates routes against topology; checked realization binds copies to
+physical regions, combines to generated local arithmetic, and completion to the whole
+arithmetic-and-broadcast DAG. Storage donation and transport capabilities remain
+separate, later refinements. No existing surface numerical semantics change.
+
+`project-refinement` derives ordinary DistributedSteps and per-SSA tensor/shard declarations
+from that witness. Input dependencies name retained same-worker compute producers. Copy bytes
+come from the complete typed tensor extent, with checked representability; routes use the same
+directional topology validation as other transfers. Combine resource costs must be explicitly
+supplied analytical estimates. Each output completion follows its actual producer: root
+arithmetic or a completed broadcast copy, rather than an unrelated last communication round.
+
+This structural projection can be simulated through the existing DistributedPlan model; it does
+not admit execution or assert measured costs. Checked realization retains the semantic witness
+in its certificate and binds each local combine to generated arithmetic and every SSA identity
+to physical storage. Ordinary consumers can retain broadcast outputs as resident values. Existing
+readiness and runtime checks remain mandatory; no second executor is introduced.
+
+`collective-combine/bind-local` binds the generated arithmetic to an ordinary LinkPlan using
+the enclosing compiler's explicit left/right/result LinkNodes. Exact dense typed extents are
+required; tensor rank is retained while the map traverses ordered flat cells. Operands become
+caller-input roles and the result is a fresh non-aliasing output without a startup initializer.
+The plan contains a direct GraphLinkInstance, not a synthetic resident descriptor.
+
+`validate-local!` independently checks both the emitted monoid schedule and its exact LinkPlan
+against the original storage-role request. A generally valid LinkPlan with swapped operands
+does not satisfy that request. OpenCL and Level Zero acceptance exercises changed-input replay,
+ranked tensors and immutable operands through the existing linked runtime. This supplies the
+local arithmetic binding boundary; checked realization connects it to contribution SSA identities
+and retains the complete refinement in executable-plan evidence.
+
+### Checked collective realizations
+
+A DistributedPlan's optional `:refinements` map associates a semantic operation ID with a closed
+realization containing `:refinement`, `:input-producers`, `:combine-costs`, `:storage` and
+`:combines`. Storage maps every contribution SSA ID to `{:step step-id :local-value value-id}`;
+combines retain emitted equations, not a second copy of the bound LinkPlans.
+
+Admission rederives the projection and checks its owned steps, values and shards against the
+enclosing plan. Unrelated workflow entries are allowed, but projected node IDs cannot be shared
+between realizations. The participant group must match the declared group and mesh; the same
+operation cannot also be declared as a legacy ScheduledCollective.
+
+Every SSA version resolves through ordinary compute bindings to one dense, correctly typed
+physical LinkNode on its logical worker. Logical workers may be co-located on one physical
+device. This first contract requires the canonical LinkNode to be shared between bound entries,
+not merely independently named equal views. Copies bind exact whole-tensor regions. Each
+combine's actual bound LinkPlan is revalidated against its monoid and resolved operand/result
+roles, and the result must be a public output of that compute entry.
+
+The retained operation's `:value` names the semantic tensor family; actual storage is declared
+for its contribution SSA versions. No phantom allocation for the family name is introduced.
+Execution currently requires explicit reassociation, unchanged accumulation dtype and
+`:nearest-even` rounding. This is not a serial-order or bitwise floating-point guarantee.
+
+Shared readiness validation checks initialization, dependencies and physical races. In addition,
+only a contribution's declared producer may write its physical storage: unrelated enclosing
+calls cannot mutate it, even after its last consumer. Storage donation needs a later liveness
+proof. Input source objects are retained by identity, not certified as byte snapshots; callers
+must keep them stable through initialization.
+
+Certificates retain the complete realization. A valid change to its numerical policy or storage
+bindings invalidates previous evidence. Constructor defaults preserve analytical plans with an
+empty map; retained records and certificates from the previous schema must be rebuilt.
+
+Device acceptance uses two and three logical workers on both OpenCL and Level Zero, generated
+input producers and binary combines, resident copies and generated output consumers, checked
+against independent CPU sums. These co-located tests do not establish multi-host transport,
+fabric throughput, collective scalability or training convergence.
+
+The same fixture also checks FP32 products of non-exact fractions and FP32/FP64 cancellation.
+The independent oracle rounds input storage and every binary node of the declared tree. In the
+cancellation cases the exact real sum is one while the admitted left-associated floating tree
+returns zero; acceptance therefore checks the retained numerical policy, not an accidentally
+different high-precision reduction. The fixture remains an ordinary generated map/copy program.
