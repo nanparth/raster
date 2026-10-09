@@ -209,3 +209,69 @@
                  (mixed-body/split-k-matrix-spec (assoc spec :kc :kc :splits :splits)))]
       (is (nil? (matrix-plan/leading-batch-result-write-domain split))
           "a reduction partition is not an independent full-K batch"))))
+
+(deftest cuda-whole-fragment-stores-prove-only-complete-static-blocks
+  (let [tile {:block-m 64 :block-n 64 :block-k 32 :sg-m 32 :sg-n 32
+              :num-stages 3 :matrix {:family :mma :m 16 :n 16 :k 16 :subgroup 32}}
+        make-kernel (fn [dimensions]
+                      (schedule/matrix-body {:id :cuda-mixed-write-domain
+                                             :row 'a :col 'b :out 'c
+                                             :dimensions dimensions :result-dtype :float
+                                             :tile tile}))
+        kernel (make-kernel [64 64 64])]
+    (is (= {'c [64 64]} (matrix-plan/dense-result-write-domain kernel))
+        "all analyzed WMMA accumulator fragments cover one complete static block")
+    (doseq [dimensions [[65 64 64] [64 65 64] [64 64 63] '[m n k]]]
+      (is (nil? (matrix-plan/dense-result-write-domain (make-kernel dimensions)))
+          "whole-fragment stores do not prove partial or dynamic surface coverage"))
+    (is (nil? (matrix-plan/dense-result-write-domain
+               (assoc-in kernel [:launch :group-count] [2 1]))))
+    (is (nil? (matrix-plan/dense-result-write-domain
+               (schedule/matrix-body {:id :cuda-split-write-domain :row 'a :col 'b :out 'c
+                                      :dimensions [64 64 64] :result-dtype :float
+                                      :k-range [0 32] :tile tile}))))
+    (is (nil? (matrix-plan/dense-result-write-domain
+               (schedule/matrix-body {:id :unknown-fragment-write-domain
+                                      :row 'a :col 'b :out 'c :dimensions [64 64 64]
+                                      :result-dtype :float
+                                      :tile (assoc-in tile [:matrix :family] :mfma)}))))
+    (doseq [field [:coordinates :mask]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (matrix-plan/dense-result-write-domain
+                    (walk/postwalk
+                     (fn [node]
+                       (if (instance? raster.compiler.ir.kernel_body.TileStore node)
+                         (assoc node field (if (= field :coordinates) [0 0] :tile-active)) node))
+                     kernel)))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (matrix-plan/dense-result-write-domain
+                  (update kernel :parameters
+                          #(mapv (fn [parameter]
+                                   (if (= :result (:role parameter))
+                                     (assoc parameter :kind :inout) parameter)) %)))))))
+
+(deftest matrix-analysis-rejects-shifted-or-lane-dependent-m-tile-origins
+  (doseq [family [:dpas :mma] term [1 'lane-id]]
+    (let [kernel (matrix-body family)
+          forged (update kernel :indices
+                         #(mapv (fn [index]
+                                  (if (and (instance? raster.compiler.ir.kernel_body.IndexCompute index)
+                                           (= 'm-base (:id index)))
+                                    (update index :expression (fn [expression]
+                                                                (body/expression :add expression term)))
+                                    index)) %))]
+      (is (= forged (body/validate! forged))
+          "well-typed origins still require the numerical topology proof")
+      (is (thrown? clojure.lang.ExceptionInfo (matrix-plan/analyze forged))
+          "coefficient extraction alone cannot erase a shifted or nonuniform origin"))))
+
+(deftest whole-fragment-coverage-requires-actual-static-storage-dimensions
+  (let [tile {:block-m 64 :block-n 64 :block-k 32 :sg-m 32 :sg-n 32
+              :num-stages 3 :matrix {:family :mma :m 16 :n 16 :k 16 :subgroup 32}}
+        dynamic (schedule/matrix-body {:id :dynamic-wmma-specialization
+                                       :row 'a :col 'b :out 'c :dimensions '[M N K]
+                                       :result-dtype :float :tile tile})
+        specialized (assoc-in dynamic [:attributes :dimension-values] {'M 64 'N 64 'K 64})]
+    (is (= specialized (body/validate! specialized)))
+    (is (nil? (matrix-plan/dense-result-write-domain specialized))
+        "specialization metadata cannot replace proof of actual static buffer dimensions")))

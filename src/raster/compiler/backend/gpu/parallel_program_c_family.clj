@@ -96,8 +96,17 @@
   [reference {:keys [target-descriptor target-dialect schedule]
               :or {target-dialect :opencl-intel}}]
   (cond
-    (not= :opencl-intel (:id (c-dialect/resolve! target-dialect)))
+    (not (contains? #{:opencl-intel :cuda} (:id (c-dialect/resolve! target-dialect))))
     {:ok false :reason :mixed-matrix-target-dialect}
+    (and (= :cuda (:id (c-dialect/resolve! target-dialect)))
+         (not= :cuda (:backend target-descriptor)))
+    {:ok false :reason :mixed-matrix-target-dialect}
+    (and (= :opencl-intel (:id (c-dialect/resolve! target-dialect)))
+         (not (contains? #{:ze :ocl :opencl} (:backend target-descriptor))))
+    {:ok false :reason :mixed-matrix-target-capability}
+    (and (= :cuda (:id (c-dialect/resolve! target-dialect)))
+         (not= :materialized (get-in schedule [:typed-contraction :input-fusion])))
+    {:ok false :reason :mixed-matrix-input-fusion-policy}
     (not (emitted-equation/contraction-write-domains reference))
     {:ok false :reason :not-single-plain-fp32-contraction}
     :else

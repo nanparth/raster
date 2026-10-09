@@ -343,6 +343,10 @@
         sg-m (coefficient (:expression m-base) (:id subgroup-row))
         block-n (coefficient (:expression (first n-base-computes)) group-n)
         sg-n (coefficient (:expression (first n-base-computes)) (:id subgroup-col))
+        _ (require! (affine= (:expression m-base) 0
+                            {group-m block-m (:id subgroup-row) sg-m})
+                    "M tile origin must preserve the exact uniform block/subgroup partition"
+                    {:origin m-base :block-m block-m :sg-m sg-m})
         _ (require! (= [sg-m sg-n] [(* (count lhs-ids) mi) (* (count rhs-ids) ni)])
                     "fragment topology and subgroup tile geometry disagree"
                     {:derived [sg-m sg-n]
@@ -477,17 +481,30 @@
 
 (defn- full-k-result-partition
   [plan]
-  (let [{:keys [dimension-parameters dimension-values block-m block-n sg-m sg-n
-                ni subgroup k-lower k-upper]} plan
+  (let [{:keys [dimension-parameters dimension-values block-m block-n block-k sg-m sg-n
+                instruction ni subgroup k-lower k-upper buffer-offsets
+                group-z schedule-parameters]} plan
         {:keys [m n k]} dimension-parameters
         result (first (filter #(= :result (:role %)) (:parameters plan)))
-        geometry [block-m block-n sg-m sg-n]]
+        geometry [block-m block-n sg-m sg-n]
+        dimensions (mapv dimension-values [m n k])
+        ;; The analyzed fragment coordinates/topology/masks are mandatory for either branch.
+        ;; WMMA stores the complete accumulator fragment cooperatively. Its closed emitter
+        ;; subset has uniform participation and complete static blocks, so no partial mask
+        ;; can discard a result element. Do not generalize this to dynamic/tail/batched stores.
+        whole-wmma-fragments?
+        (and (= {:family :mma :m 16 :n 16 :k 16 :subgroup 32} instruction)
+             (= dimensions (:dimensions plan))
+             (nil? group-z) (empty? schedule-parameters)
+             (every? nil? (vals buffer-offsets))
+             (every? #(and (integer? %) (pos? %)) (concat dimensions [block-m block-n block-k]))
+             (every? zero? (map mod dimensions [block-m block-n block-k])))]
     (when (and (= :output (:kind result)) (= :float (:dtype result))
                (every? #(contains? dimension-values %) [m n k])
                (every? #(and (integer? %) (pos? %)) geometry)
                (zero? (mod block-m sg-m)) (zero? (mod block-n sg-n))
-               ;; The currently proved direct store distribution owns one column per lane.
-               (= ni subgroup)
+               ;; Intel's existing lane-column partition remains unchanged.
+               (or (= ni subgroup) whole-wmma-fragments?)
                (= 0 (mathematical-index k-lower))
                (= k (mathematical-index k-upper)))
       {:result result :slice-shape [m n]

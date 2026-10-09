@@ -14,11 +14,13 @@
             [raster.compiler.passes.parallel.typed-contraction-context :as context]))
 
 (defn target-schedule
-  "Select existing Intel matrix hardware facts; other instruction families decline honestly."
+  "Select existing Intel DPAS or CUDA MMA hardware facts; unsupported families decline."
   [descriptor requested-tile]
   (let [{:keys [family m n k subgroup]} (:matrix descriptor)]
-    (when (and (contains? #{:ze :ocl :opencl} (:backend descriptor))
-               (= :dpas family) (= [8 16 16] [m n k]) (= 16 subgroup)
+    (when (and (or (and (contains? #{:ze :ocl :opencl} (:backend descriptor))
+                        (= :dpas family) (= [8 16 16] [m n k]) (= 16 subgroup))
+                   (and (= :cuda (:backend descriptor))
+                        (= :mma family) (= [16 16 16] [m n k]) (= 32 subgroup)))
                (contains? (hardware/supported-subgroup-sizes descriptor) (long subgroup)))
       (let [tile (or requested-tile (hardware/gemm-tile-for descriptor))
             maximum (hardware/maximum-workgroup-size descriptor)]

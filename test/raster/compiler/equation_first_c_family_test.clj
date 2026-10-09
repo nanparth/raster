@@ -33,6 +33,7 @@
             [raster.compiler.passes.parallel.full-reduction-device-test :as full-reduction]
             [raster.compiler.passes.parallel.gemm-epilogue-device-test :as gemm]
             [raster.gpu.compiled :as compiled]
+            [raster.perf.production-canary :as canary]
             [raster.gpu.parallel-program :as program-runtime]
             [raster.core :refer [deftm]]
             [raster.dl.attention :as attention]
@@ -440,6 +441,20 @@
           fallback-link (equation-first/lower fallback [(float-array 4096) (float-array 4096)])]
       (is (= :sequential-segments
              (executable/strategy (-> fallback-link :instances first :call :steps last :graph)))))
+    (let [cuda-options (-> options (assoc :target cuda-target)
+                           (assoc-in [:schedule :typed-contraction :input-fusion] :materialized)
+                           (assoc-in [:schedule :typed-contraction :tile]
+                                     {:block-m 64 :block-n 64 :block-k 32
+                                      :sg-m 32 :sg-n 32 :num-stages 3
+                                      :matrix {:family :mma :m 16 :n 16 :k 16 :subgroup 32}}))
+          cuda-compilation (equation-first/compile #'c-family-mixed-matmul cuda-options)
+          cuda-operation (-> cuda-compilation :emitted :equations last :operations first)]
+      (is (equation-dispatch/emitted-equation-dispatch? cuda-operation))
+      (is (= #{:exact :approximate-model}
+             (get-in cuda-operation [:numerical-policy :permitted-modes])))
+      (is (= 1 (count (get-in cuda-operation [:numerical-policy :permitted-models])))))
+    ;; CUDA's transformed tile-input policy remains unsupported; only existing materialization
+    ;; supplies the checked physical half storage consumed by WMMA.
     (doseq [target [cuda-target hip-target ocl-target]]
       (let [declined (equation-first/compile #'c-family-mixed-matmul (assoc options :target target))]
         (is (not (equation-dispatch/emitted-equation-dispatch?
@@ -2267,3 +2282,39 @@
                                   (bview/subview (get-in linked [:nodes base :view]) {:shape [2]})
                                   (get-in linked [:nodes token :view]))))))))
       (is (zero? @binds) "missing resolver and wrong logical shape fail before binding"))))
+
+(deftest mixed-dispatch-retains-a-certified-prefix-of-physical-caller-output
+  (let [compilation (equation-first/compile
+                     #'canary/gemm64!
+                     {:target cuda-target :dtype :float
+                      :schedule {:precision :mixed-f16-f32
+                                 :typed-contraction
+                                 {:strategy :dispatch-mixed-matrix :input-fusion :materialized
+                                  :tile {:block-m 64 :block-n 64 :block-k 32
+                                         :sg-m 32 :sg-n 32 :num-stages 3
+                                         :matrix {:family :mma :m 16 :n 16 :k 16 :subgroup 32}}}}})
+        operation (-> compilation :emitted :equations last :operations first)
+        linked (try {:plan (equation-first/lower
+                           compilation [(float-array 4096) (float-array 4096) (float-array 4099)])}
+                    (catch clojure.lang.ExceptionInfo error {:error (ex-data error)}))]
+    (is (equation-dispatch/emitted-equation-dispatch? operation))
+    (is (nil? (:error linked)) "checked dispatch may bind a certified4096-element prefix of physical4099")
+    (when-let [plan (:plan linked)]
+      (let [call (:call (first (:instances plan)))
+            result (first (get-in call [:steps 0 :equation :results]))
+            prefix (get (:buffers call) result)
+            base (get (:buffers call) 'C)]
+        (is (not= base prefix))
+        (is (= 4096 (reduce *' 1 (get-in plan [:nodes prefix :view :shape]))))
+        (is (= [4099] (get-in plan [:nodes base :view :shape])))
+        (is (= (get-in plan [:nodes prefix :view :allocation])
+               (get-in plan [:nodes base :view :allocation])))
+        (is (= :program-link-result-view
+               (:reason (reason-of #(link-plan/validate!
+                                     (assoc-in plan [:nodes prefix :view :byte-offset] 4))))))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (link-plan/validate! (assoc-in plan [:nodes prefix :view :shape] [4099]))))
+        (doseq [declarations [{result 'A} {:unrelated-result 'C}]]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (program-call/make (:program call) (:entry-buffers call)
+                                          (:scalar-values call) {} nil declarations))))))))

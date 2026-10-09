@@ -2829,3 +2829,22 @@
     (is (nil? (:declined routed)))
     (is (= 2 (count (:equations program))) "y and z remain separate equations")
     (is (= 1 (count (filter #{'y} binders))) "y is materialized exactly once")))
+
+(deftest mixed-materialized-cuda-target-schedule-preserves-capability-gates
+  (let [instruction {:family :mma :m 16 :n 16 :k 16 :subgroup 32}
+        tile {:block-m 64 :block-n 64 :block-k 32
+              :sg-m 32 :sg-n 32 :num-stages 3 :matrix instruction}
+        descriptor {:backend :cuda :matrix instruction
+                    :execution {:subgroup-sizes #{32} :max-workgroup-size 1024}
+                    :warp-size 32 :sm-count 40 :max-warps-per-sm 48}]
+    (is (= instruction (:matrix (mixed-candidate/target-schedule descriptor tile))))
+    (is (nil? (gpu-gemm/mixed-dpas-schedule descriptor tile))
+        "legacy Intel-only schedules cannot reuse generic CUDA MMA admission")
+    (doseq [unsupported [(assoc descriptor :backend :hip)
+                         (assoc-in descriptor [:matrix :family] :mfma)
+                         (assoc-in descriptor [:matrix :k] 8)
+                         (assoc-in descriptor [:execution :subgroup-sizes] #{16})
+                         (assoc-in descriptor [:execution :max-workgroup-size] 127)
+                         (assoc-in descriptor [:execution :max-workgroup-size] 0)]]
+      (is (nil? (mixed-candidate/target-schedule unsupported tile))))
+    (is (nil? (mixed-candidate/target-schedule descriptor (assoc tile :block-m 63))))))

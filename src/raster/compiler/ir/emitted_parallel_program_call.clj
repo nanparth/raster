@@ -673,7 +673,8 @@
         _ (when-not (and (map? result-views)
                          (every? (set (mapcat :results
                                              (filter #(emitted-equation/emitted-equation?
-                                                       (first (:operations %)))
+                                                       (equation-dispatch/boundary-equation
+                                                        (first (:operations %))))
                                                      (:equations parallel-program))))
                                  (keys result-views)))
             (fail! :emitted-program-result-views

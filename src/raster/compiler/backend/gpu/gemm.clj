@@ -455,7 +455,9 @@
    lowering rows over the same typed contraction; an arbitrary `:matrix` capability must never be
    emitted with Intel DPAS source."
   [desc requested-tile]
-  (mixed-candidate/target-schedule desc requested-tile))
+  (when (and (contains? #{:ze :ocl :opencl} (:backend desc))
+             (= :dpas (get-in desc [:matrix :family])))
+    (mixed-candidate/target-schedule desc requested-tile)))
 
 (defn- validate-split-factors!
   [split-factors]
