@@ -5,6 +5,7 @@
             [raster.compiler.backend.gpu.kernel-body-fixtures :as fixtures]
             [raster.compiler.backend.gpu.kernel-body-opencl :as opencl]
             [raster.compiler.backend.gpu.kernel-body-target :as target]
+            [raster.gpu.cuda-nvrtc :as nvrtc]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-body :as body]
@@ -990,3 +991,45 @@
           (do (is (str/starts-with? source "#pragma OPENCL FP_CONTRACT OFF\n"))
               (is (= 1 (count (re-seq #"#pragma OPENCL FP_CONTRACT OFF" source)))))
           (is (not (str/includes? source "#pragma OPENCL"))))))))
+
+(defn- nonfinite-literal-body []
+  (let [parameters (for [[id type] [['float-out :float] ['double-out :double] ['half-out :half]]]
+                     (body/->KernelParameter id :output type [4] :global
+                                             (layout/row-major [4] type) :result))]
+    (body/make
+     {:id :nonfinite-literal-test :parameters (vec parameters)
+      :operations (vec (for [[id type] [['float-out :float] ['double-out :double] ['half-out :half]]
+                             [index value] (map-indexed vector [Double/POSITIVE_INFINITY
+                                                               Double/NEGATIVE_INFINITY Double/NaN 1.25])]
+                         (body/->ScalarStore id [index] (body/literal value type) nil)))
+      :schedule {:subgroup-size 1}
+      :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+      :provenance {:dialect :test} :attributes {:kind :scalar}})))
+
+(deftest typed-cuda-nonfinite-literals-use-the-official-device-constant-provider
+  (let [kernel (nonfinite-literal-body)
+        cuda (opencl/emit-scalar-kernel "nonfinite_literals" kernel {:target-dialect :cuda})]
+    (doseq [spelling ["#include <math_constants.h>" "CUDART_INF_F" "(-CUDART_INF_F)"
+                      "CUDART_NAN_F" "CUDART_INF" "(-CUDART_INF)" "CUDART_NAN"
+                      "__float2half_rn(CUDART_INF_F)" "1.25f" "1.25"]]
+      (is (str/includes? cuda spelling) spelling))
+    (doseq [dialect [:opencl-intel :opencl-portable :hip]
+            :let [source (opencl/emit-scalar-kernel "nonfinite_literals" kernel {:target-dialect dialect})]]
+      (is (str/includes? source "INFINITY"))
+      (is (str/includes? source "(-INFINITY)"))
+      (is (str/includes? source "NAN"))
+      (is (not (str/includes? source "CUDART_")))
+      (is (not (str/includes? source "math_constants.h"))))))
+
+(deftest installed-nvrtc-compiles-checked-typed-nonfinite-literals
+  (let [cuda-home (System/getenv "CUDA_HOME")]
+    (if (and cuda-home (nvrtc/available?))
+      (let [source (opencl/emit-scalar-kernel "nonfinite_literals" (nonfinite-literal-body)
+                                            {:target-dialect :cuda})
+            result (nvrtc/compile-ptx source "nonfinite_literals" "compute_86"
+                                      :include-paths [(str cuda-home "/include")])]
+        (is (pos? (alength (:ptx result))))
+        (is (some #{"--fmad=false"} (:compiler-options result))))
+      (if (= "1" (System/getenv "RASTER_REQUIRE_NVRTC"))
+        (is false "Typed non-finite compile proof requires NVRTC and explicit CUDA_HOME")
+        (println "[NVRTC SKIP] typed non-finite source compile requires toolkit headers")))))

@@ -165,6 +165,21 @@
       (str "__attribute__((reqd_sub_group_size(" subgroup-width ")))\n")
       (:cuda :hip) "")))
 
+(defn nonfinite-literal
+  "Spell non-finite typed scalar values using the target language's constant provider.
+   CUDA runtime compilation exposes device constants rather than host math macros."
+  [dialect value type]
+  (let [value (double value)
+        cuda? (= :cuda (:id dialect))
+        double? (= :double (dtype/canon type))
+        infinity (if cuda? (if double? "CUDART_INF" "CUDART_INF_F") "INFINITY")
+        nan (if cuda? (if double? "CUDART_NAN" "CUDART_NAN_F") "NAN")]
+    (cond
+      (Double/isNaN value) nan
+      (= Double/POSITIVE_INFINITY value) infinity
+      (= Double/NEGATIVE_INFINITY value) (str "(-" infinity ")")
+      :else nil)))
+
 (defn preamble
   [dialect {:keys [uses-half? uses-double? uses-subgroups?]}]
   (if (opencl? dialect)
@@ -193,7 +208,7 @@
          (when (or uses-half? uses-double? uses-subgroups?) "\n"))
     (str "#include <stdint.h>\n#include <math.h>\n"
          (case (:id dialect)
-           :cuda "#include <cuda_fp16.h>\n#include <cuda_runtime.h>\n"
+           :cuda "#include <cuda_fp16.h>\n#include <cuda_runtime.h>\n#include <math_constants.h>\n"
            :hip (str "#include <hip/hip_runtime.h>\n"
                      "#include <hip/hip_fp16.h>\n"))
          "\n")))

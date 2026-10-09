@@ -501,11 +501,9 @@
   (c-dialect/type-name *scalar-dialect* type))
 
 (defn- emit-floating-literal [value suffix]
-  (cond
-    (Double/isNaN (double value)) "NAN"
-    (= Double/POSITIVE_INFINITY (double value)) "INFINITY"
-    (= Double/NEGATIVE_INFINITY (double value)) "(-INFINITY)"
-    :else (str (Double/toString (double value)) suffix)))
+  (or (c-dialect/nonfinite-literal *scalar-dialect* value
+                                 (if (empty? suffix) :double :float))
+      (str (Double/toString (double value)) suffix)))
 
 (defn- emit-literal
   [{:keys [value type]}]
