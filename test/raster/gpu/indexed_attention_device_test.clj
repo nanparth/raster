@@ -369,9 +369,19 @@
     (gp/gpu-skip! "public Compiled indexed dispatch on Level Zero")
     (run-public-compiled-dispatch-case :ze:0)))
 
+(defn- resident-dispatch-step
+  [descriptor]
+  (let [steps (filterv :dispatch (:steps descriptor))]
+    (case (count steps)
+      0 nil
+      1 (first steps)
+      (throw (ex-info "indexed fixture requires at most one descriptor dispatch"
+                      {:dispatch-phases (mapv :phase steps)})))))
+
 (defn- production-case
   [descriptor total-dim]
-  (let [{:keys [arguments expected]} (synthetic-indexed-case 4 total-dim)]
+  (let [{:keys [arguments expected]} (synthetic-indexed-case 4 total-dim)
+        dispatch-step (resident-dispatch-step descriptor)]
     (gpu/with-gpu-session [session :ocl:0]
       (let [lowering (resident-plan/lower
                       {:id (random-uuid) :target :ocl:0 :descriptor descriptor
@@ -379,16 +389,23 @@
             executable (link/instantiate! (:plan lowering) {:session session})
             result-node (get-in lowering [:certificate :bindings (:result-sym descriptor)])]
         (try
-          (let [binding (link/dispatch-arguments executable arguments)
-                selected (-> (kdispatch/select-alternative
-                              (:dispatch binding) (:arguments binding))
-                             :attributes :strategy)
+          (let [selected (when dispatch-step
+                           (let [binding (link/dispatch-arguments executable arguments)]
+                             (-> (kdispatch/select-alternative
+                                  (:dispatch binding) (:arguments binding))
+                                 :attributes :strategy)))
                 _ (link/run! executable)
-                result (link/download executable result-node)
+                result (vec (link/download executable result-node))
                 max-error (reduce max 0.0
                                   (map #(Math/abs (- (double %1) (double %2)))
                                        expected result))]
-            {:selected selected :max-error max-error})
+            {:selected selected :max-error max-error
+             :expected-count (count expected) :actual-count (count result)
+             :tails-zero? (or (even? total-dim)
+                              (and (= (count expected) (count result))
+                                   (every? zero? (map #(nth result (+ (* % total-dim)
+                                                                    (dec total-dim)))
+                                                     (range 3)))))})
           (finally
             (link/close! executable)))))))
 
@@ -401,62 +418,82 @@
 (deftest compiled-resident-dispatch-tunes-and-returns-a-baked-schedule
   (if-not @device-probe/opencl-gpu-available?
     (device-probe/opencl-skip! "compiled resident dispatch tuning" :gpu-device)
-    (let [{:keys [buffers]} (test-case)
-          args [(get buffers 'Q) (get buffers 'K) (get buffers 'V)
-                (get buffers 'dst) (get buffers 'src) 3 4 5 2]
-          descriptor (pipeline/compile-gpu-program
-                      #'resident-indexed-attention-probe :ocl:0 :dtype :float)]
-      (binding [cache/*cache-root* (temporary-cache-root)]
-        (gpu/with-gpu-session [session :ocl:0]
-          (let [lowering (resident-plan/lower
-                          {:id (random-uuid) :target :ocl:0 :descriptor descriptor
-                           :arguments args :outputs [(:result-sym descriptor)]})
-                executable (link/instantiate! (:plan lowering) {:session session})
-                result-node (get-in lowering
-                                    [:certificate :bindings (:result-sym descriptor)])]
-            (try
-              (let [result
-                    (benchmark/tune-linked-dispatch!
-                     executable (hardware/descriptor-for :ocl:0) [2]
-                     (fn [components]
-                       {:descriptor-arguments args
-                        :validate!
-                        (fn [{:keys [case]}]
-                          (let [binding (:linked-binding case)
-                                plan (get-in binding
-                                             [:dispatch :attributes :tuning :reference :plan])
-                                expected (reference/evaluate plan (:reference-inputs binding))
-                                actual ^floats (link/download executable result-node)
-                                max-error
-                                (reduce max 0.0
-                                        (map #(Math/abs (- (double %1) (double %2)))
-                                             expected actual))]
-                            {:passed? (< max-error 2.0e-5)
-                             :oracle-hash (str "compiled-segmented-reference-v1-" components)
-                             :max-error max-error}))
-                        :measurement {:warmup-iterations 0 :budget-ms 1
-                                      :min-samples 3 :max-samples 5
-                                      :cv-threshold 100.0}})
-                     :force? true)]
-                (is (= 2 (count (get-in result [:tuning :measurements]))))
-                (is (= (:selector result)
-                       (get-in result
-                               [:schedule-override :segmented-weighted-reduction
-                                :measured-selectors
-                                (get-in descriptor [:steps 0 :dispatch :id])])))
-                (is (= :gpu-step-0 (:phase result))))
-              (finally
-                (link/close! executable)))))))))
+    (if-not (= :supported (:status (capability/score-reuse
+                                   (:plan (test-case)) (hardware/descriptor-for :ocl:0))))
+      (do
+        (println "  [OPENCL SKIP] compiled resident dispatch tuning requires supported Intel subgroup score reuse")
+        (is true "opencl-skip-marker: Intel dispatch tuning is unrun"))
+      (let [{:keys [buffers]} (test-case)
+            args [(get buffers 'Q) (get buffers 'K) (get buffers 'V)
+                  (get buffers 'dst) (get buffers 'src) 3 4 5 2]
+            descriptor (pipeline/compile-gpu-program
+                        #'resident-indexed-attention-probe :ocl:0 :dtype :float)]
+        (binding [cache/*cache-root* (temporary-cache-root)]
+          (gpu/with-gpu-session [session :ocl:0]
+            (let [lowering (resident-plan/lower
+                            {:id (random-uuid) :target :ocl:0 :descriptor descriptor
+                             :arguments args :outputs [(:result-sym descriptor)]})
+                  executable (link/instantiate! (:plan lowering) {:session session})
+                  result-node (get-in lowering
+                                      [:certificate :bindings (:result-sym descriptor)])]
+              (try
+                (let [result
+                      (benchmark/tune-linked-dispatch!
+                       executable (hardware/descriptor-for :ocl:0) [2]
+                       (fn [components]
+                         {:descriptor-arguments args
+                          :validate!
+                          (fn [{:keys [case]}]
+                            (let [binding (:linked-binding case)
+                                  plan (get-in binding
+                                               [:dispatch :attributes :tuning :reference :plan])
+                                  expected (reference/evaluate plan (:reference-inputs binding))
+                                  actual ^floats (link/download executable result-node)
+                                  max-error
+                                  (reduce max 0.0
+                                          (map #(Math/abs (- (double %1) (double %2)))
+                                               expected actual))]
+                              {:passed? (< max-error 2.0e-5)
+                               :oracle-hash (str "compiled-segmented-reference-v1-" components)
+                               :max-error max-error}))
+                          :measurement {:warmup-iterations 0 :budget-ms 1
+                                        :min-samples 3 :max-samples 5
+                                        :cv-threshold 100.0}})
+                       :force? true)]
+                  (is (= 2 (count (get-in result [:tuning :measurements]))))
+                  (is (= (:selector result)
+                         (get-in result
+                                 [:schedule-override :segmented-weighted-reduction
+                                  :measured-selectors
+                                  (get-in descriptor [:steps 0 :dispatch :id])])))
+                  (is (= :gpu-step-0 (:phase result))))
+                (finally
+                  (link/close! executable))))))))))
 
 (deftest resident-compiler-selects-from-runtime-component-width
   (if-not @device-probe/opencl-gpu-available?
     (device-probe/opencl-skip! "runtime component-width dispatch" :gpu-device)
-    (let [descriptor (pipeline/compile-gpu-program
+    (let [score-reuse (capability/score-reuse (:plan (test-case))
+                                            (hardware/descriptor-for :ocl:0))
+          descriptor (pipeline/compile-gpu-program
                       #'resident-indexed-attention-probe :ocl:0 :dtype :float)
+          dispatch-step (resident-dispatch-step descriptor)
           small (production-case descriptor 4)
           ;; 257 components require a partial seventeenth tile, plus one unused row tail.
           wide (production-case descriptor 515)]
-      (is (= :indexed-segmented-reduction-reference (:selected small)))
-      (is (= :indexed-segmented-reduction-subgroup-score-reuse (:selected wide)))
-      (is (< (:max-error small) 2.0e-5))
-      (is (< (:max-error wide) 2.0e-5)))))
+      (if (= :supported (:status score-reuse))
+        (do
+          (is (some? dispatch-step))
+          (is (= 2 (count (get-in dispatch-step [:dispatch :alternatives]))))
+          (is (= :indexed-segmented-reduction-reference (:selected small)))
+          (is (= :indexed-segmented-reduction-subgroup-score-reuse (:selected wide))))
+        (do
+          (is (= :declined (:status score-reuse)))
+          (is (nil? dispatch-step) "one legal candidate remains an ordinary executable")
+          (is (= 1 (count (:steps descriptor))))
+          (is (nil? (:selected small)))
+          (is (nil? (:selected wide)))))
+      (doseq [[width result] [[4 small] [515 wide]]]
+        (is (= (* 3 width) (:expected-count result) (:actual-count result)))
+        (is (< (:max-error result) 2.0e-5))
+        (is (:tails-zero? result) "unused wide-row tails remain exactly zero")))))
