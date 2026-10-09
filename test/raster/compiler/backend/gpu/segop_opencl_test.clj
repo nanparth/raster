@@ -630,6 +630,46 @@
                  (scheduled-body/validate-artifact-projection!
                   certificate artifact))))))))
 
+(deftest scalar-segred-graph-retains-checked-product-extent-alias
+  (let [source (list 'let*
+                     ['count (with-meta '(clojure.core/* rows width)
+                               {:raster.type/tag 'long})
+                      'result '(raster.par/reduce acc 0.0 i count
+                                                 (+ acc (clojure.core/aget a i)))]
+                     'result)
+        options {:dtype :double :resident-reductions? true :array-types {'a :double}
+                 :scalar-types {'rows :long 'width :long}}
+        route-result (typed-route/attempt source :double {'a :double} options)
+        _ (when-not (:program route-result)
+            (throw (ex-info "product-alias fixture must enter the typed route" route-result)))
+        typed (:program route-result)
+        scheduled (:form (segop-lower/segop-lower-pass typed options))
+        numerical (filterv (comp seq :operations) (:equations scheduled))
+        {:keys [algorithm body graph]} (equation-graph/make-for-equations scheduled numerical)
+        definitions (equation-graph/derived-scalar-expressions
+                     (:values body)
+                     (take-while #(true? (get-in % [:attributes :host-only])) (:equations body)))
+        emit (fn [owner-body]
+               (sg/generate-kernel-graph
+                graph :array-types {'a :double}
+                :scalar-types (into {} (keep (fn [[id value]]
+                                              (when (empty? (:shape value)) [id (:dtype value)])))
+                                    (:values body))
+                :scheduled-equation-algorithm algorithm :scheduled-equation-body owner-body))]
+    (is (contains? definitions 'count) "a validated leading host scalar supplies the alias")
+    (is (every? kart/kernel-artifact? (map :operation (:nodes (emit body))))
+        "source/body/graph spellings must close over their checked extent definition")
+    (doseq [[expected-reason invalid-body]
+            [[:parallel-program-use-before-definition (update body :equations #(vec (rest %)))]
+             [:scheduled-equation-prefix (assoc-in body [:values 'count :dtype] :int)]
+             [:parallel-program-equation-values
+              (assoc-in body [:equations 0 :operands] ['width 'width])]]]
+      (try
+        (emit invalid-body)
+        (is false "invalid owner definitions cannot qualify the graph")
+        (catch clojure.lang.ExceptionInfo error
+          (is (= expected-reason (:reason (ex-data error)))))))))
+
 (deftest scalar-segred-schedule-rejects-a-forged-graph-source
   (let [source '(let* [result (raster.par/reduce acc 0.0 i n
                                                  (+ acc (clojure.core/aget a i)))]
@@ -795,14 +835,62 @@
       (is (= source (get-in certificate [:numerics :accumulator-dtype])))
       (is (= target (get-in certificate [:numerics :result-transform :result-dtype])))
       (is (= source (:dtype (first (get-in certificate [:body :allocations])))))
+      (when (= :float source)
+        ;; The historical 0.25 Double literal makes this addition genuinely Double.
+        ;; Preserve it as a positive for the independently certified terminal class.
+        (let [double-arithmetic (assoc-in terminal
+                                         [:reduction :attributes :result-region :expression]
+                                         '(double (+ completed 0.25)))
+              arithmetic-certificate (segred-body/schedule double-arithmetic nil options)
+              operations (filter #(instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                                 (tree-seq coll? seq (:body arithmetic-certificate)))]
+          (is (= :float (get-in arithmetic-certificate [:numerics :accumulator-dtype])))
+          (is (= :double (get-in arithmetic-certificate
+                                 [:numerics :result-transform :result-dtype])))
+          (is (some #(and (= :+ (get-in % [:expression :op]))
+                          (= :double (get-in % [:result :type]))) operations))))
       (doseq [candidate [base
                          (assoc-in terminal [:reduction :attributes :result-region :expression]
-                                   (list (symbol (name target)) '(+ completed 0.25)))]]
+                                   (list (symbol (name target))
+                                         (list '+ 'completed
+                                               (if (= :float source) (float 0.25) 0.25))))]]
         (try
           (segred-body/schedule candidate nil options)
-          (is false "mixed output storage requires a direct certified terminal conversion")
+          (is false "mixed output storage must preserve the source intermediate precision")
           (catch clojure.lang.ExceptionInfo error
             (is (= :uniform-scalar-storage (:missing-rule (ex-data error))))))))))
+
+(deftest completed-arithmetic-cannot-retag-checked-operands
+  (let [form (with-meta
+               '(raster.par/reduce acc 0.0 i 32 (+ acc (clojure.core/aget a i)))
+               {:raster.type/elem-type :float})
+        base (first (lower/lower-reduce (soac/par-form->soac 'result form 91 :dtype :float)
+                                       nil :dtype :float))
+        options {:array-types {'a :float 'result :double}
+                 :scalar-types {'scale :float 'counter :long}}
+        schedule (fn [parameters expression]
+                   (segred-body/schedule
+                    (assoc-in (assoc base :scalars (set (rest parameters)))
+                              [:reduction :attributes :result-region]
+                              (kernel-body/->ScalarRegion parameters expression [] :double))
+                    nil options))]
+    (testing "genuine Double arithmetic remains admitted with checked Float operands"
+      (is (= :double (get-in (schedule '[completed counter]
+                                      '(double (/ completed (double counter))))
+                            [:numerics :result-transform :result-dtype]))))
+    (doseq [metadata-key [:raster.type/tag :tag]
+            [parameters operand other]
+            [['[completed] 'completed (float 1)]
+             ['[completed scale] 'scale 'completed]
+             ['[completed counter] 'counter 'completed]]]
+      (let [tagged (with-meta operand {metadata-key 'double})
+            expression (list 'double (list 'clojure.core/+ tagged other))]
+        (testing (str "checked operand " operand " overrides " metadata-key)
+          (try
+            (schedule parameters expression)
+            (is false "metadata cannot turn checked Float arithmetic into Double arithmetic")
+            (catch clojure.lang.ExceptionInfo error
+              (is (= :uniform-scalar-storage (:missing-rule (ex-data error)))))))))))
 
 (deftest unproved-affine-loads-decline-the-pointwise-reduction-route
   (let [form '(raster.par/reduce acc 0.0 i n

@@ -408,6 +408,82 @@
     (is (= {:overflow :trap} (get-in result [:operations 0 :expression :options]))
         "typed emission does not invent a no-overflow proof for this owner")))
 
+(deftest completed-double-division-retains-source-precision-and-cast-policies
+  ;; Independent exact-bit discriminator: widening before 1/3 division differs
+  ;; from Float division followed by widening. No Raster numerical oracle calls.
+  (let [region (body/->ScalarRegion ['acc 'n] '(double (/ acc (double n))) [] :double)
+        result (result-region/lower
+                region {:accumulator 'carry :accumulator-dtype :float :store-dtype :double
+                        :parameters {'n (body/->KernelParameter 'n :scalar :long [] nil nil
+                                                               :parameter)}})
+        operations (:operations result)
+        [widen count-cast divide] operations
+        values (reduce
+                (fn [environment operation]
+                  (let [expression (:expression operation)
+                        arguments (mapv #(if (symbol? %) (get environment %) (:value %))
+                                        (:arguments expression))
+                        actual (case (:op expression)
+                                 :cast (double (first arguments))
+                                 :div (/ (double (first arguments))
+                                         (double (second arguments))))]
+                    (assoc environment (get-in operation [:result :id]) actual)))
+                {'carry (float 1) 'n (long 3)} operations)
+        actual (get values (:result result))]
+    (is (result-region/completed-double-arithmetic? region :float {'n :long}))
+    (is (= [:cast :cast :div] (mapv #(get-in % [:expression :op]) operations)))
+    (is (= [:double :double :double] (mapv #(get-in % [:result :type]) operations)))
+    (is (= {:rounding :exact :overflow :exact} (get-in widen [:expression :options])))
+    (is (= {:rounding :nearest-even :overflow :exact}
+           (get-in count-cast [:expression :options])))
+    (is (= :double (:result-dtype result)))
+    (is (= "3fd5555555555555" (format "%016x" (Double/doubleToRawLongBits actual))))
+    (is (not= "3fd5555560000000" (format "%016x" (Double/doubleToRawLongBits actual))))))
+
+(deftest double-terminal-admission-cannot-promote-a-float-intermediate
+  (let [float-add (list 'clojure.core/+ 'acc (float 1))
+        region (body/->ScalarRegion ['acc] (list 'double float-add) [] :double)
+        source-result (double (float (+ (double (float 16777216)) (double (float 1)))))]
+    (is (= "4170000000000000"
+           (format "%016x" (Double/doubleToRawLongBits source-result))))
+    (is (not (result-region/completed-double-arithmetic? region :float {})))
+    ;; Even a claimed enclosing annotation cannot supply intermediate precision.
+    (is (not (result-region/completed-double-arithmetic?
+              (assoc region :expression
+                     (list 'double (with-meta float-add {:raster.type/tag 'double})))
+              :float {})))
+    (doseq [expression ['(double (/ acc unknown)) '(float acc)
+                        '(double (let* [v acc] v)) '(if true (double acc) (double acc))
+                        '(double (aset target 0 acc))]]
+      (is (not (result-region/completed-double-arithmetic?
+                (assoc region :expression expression) :float {}))))))
+
+(deftest completed-arithmetic-proof-uses-checked-operand-environments
+  (doseq [metadata-key [:raster.type/tag :tag]]
+    (let [acc (with-meta 'acc {metadata-key 'double})
+          scale (with-meta 'scale {metadata-key 'double})
+          region (fn [parameters expression]
+                   (body/->ScalarRegion parameters expression [] :double))]
+      (is (not (result-region/completed-double-arithmetic?
+                (region '[acc] (list 'double (list '+ acc (float 1)))) :float {})))
+      (is (not (result-region/completed-double-arithmetic?
+                (region '[acc scale] (list 'double (list '+ acc scale)))
+                :float {'scale :float})))
+      (is (not (result-region/completed-double-arithmetic?
+                (region '[acc scale] (list 'double (list '+ acc scale))) :float {}))
+          "an untyped declared operand cannot use metadata as a substitute for a checked binding")
+      (is (result-region/completed-double-arithmetic?
+           (region '[acc scale] (list 'double (list '/ (list 'double acc)
+                                                  (list 'double scale))))
+           :float {'scale :long})
+          "explicit conversions of checked operands remain valid")
+      (is (not (result-region/completed-double-arithmetic?
+                (region '[acc] (list 'double
+                                     (list '+ (with-meta (list '+ acc (float 1))
+                                                        {metadata-key 'double}) 0.25)))
+                :float {}))
+          "a nested operation annotation cannot hide a Float intermediate"))))
+
 (deftest scalar-casts-use-the-shared-descriptor-vocabulary
   (doseq [[head target source overflow]
           [['byte :byte :long :trap] ['int :int :long :trap]

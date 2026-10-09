@@ -630,7 +630,11 @@
                      (and (contains? #{:float :double}
                                      (first (get-in producer [:attributes :dtypes])))
                           (scalar-region/completed-floating-conversion?
-                           (scalar-region/from-typed-result-transform transform))))
+                           (scalar-region/from-typed-result-transform transform)))
+                     (scalar-region/completed-double-arithmetic?
+                      (scalar-region/from-typed-result-transform transform)
+                      (first (get-in producer [:attributes :dtypes]))
+                      (into {} (map (juxt :value :dtype)) (:scalars transform))))
            :when (fusible-equation? program (:id producer))
            :when (fusible-equation? program (:id consumer))
            ;; A direct Float/Double conversion cannot trap or observe memory. It can move

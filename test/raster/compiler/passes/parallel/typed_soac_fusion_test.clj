@@ -5,7 +5,13 @@
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as typed-fusion]
-            [raster.compiler.passes.parallel.typed-soac-projection :as projection]))
+            [raster.compiler.passes.parallel.typed-soac-projection :as projection]
+            [raster.core :refer [deftm]]
+            [raster.dl.nn :as nn]
+            [raster.dl.loss :as loss]
+            [raster.gpu.compiled :as compiled]
+            [raster.hardware-fixture :as hardware-fixture]
+            [raster.runtime.hardware :as hardware]))
 
 (def ^:private map-map-source
   '(let* [y (raster.par/pmap i n float (* (aget x i) (aget x i)))
@@ -763,6 +769,63 @@
     (is (= :float (:result-dtype transform)))
     (is (= :float (get-in (dialect/facts result) [:values 'result :dtype])))
     (is (= result (dialect/validate! result)))))
+
+(deftm faithful-linear-terminal-loss
+  [W :- (Array float) x :- (Array float) tgt :- (Array float)
+   batch :- Long in-f :- Long out-f :- Long] :- Double
+  (let [pred (nn/linear-nb x W batch in-f out-f)]
+    (loss/mse-loss pred tgt (* batch out-f))))
+
+(defn- float-reduction-double-consumer [program]
+  (let [infos (mapv typed-fusion/equation-info (dialect/equations program))]
+    (first
+     (for [producer infos
+           :when (and (= :reduce (:kind producer))
+                      (= [:float] (get-in producer [:attributes :dtypes])))
+           consumer infos
+           :when (and (= :scalar (:kind consumer))
+                      (some #{(first (:results producer))} (:captures consumer))
+                      (= :double (get-in (dialect/facts program)
+                                         [:values (first (:results consumer)) :dtype])))]
+       {:producer producer :consumer consumer}))))
+
+(deftest completed-float-reduction-admits-retained-double-division
+  (let [captured (volatile! nil)
+        original typed-fusion/fusion-fixpoint]
+    (hardware-fixture/isolated
+     (fn []
+       (hardware/register-target-device!
+        :cuda:0 {:name "synthetic terminal loss compiler fixture"
+                 :capabilities {:compute-capability [8 6] :sm-count 40 :warp-size 32
+                                :max-threads-per-block 1024 :max-warps-per-sm 48
+                                :max-blocks-per-sm 16 :shared-memory-per-block 49152}})
+       (with-redefs [typed-fusion/fusion-fixpoint
+                     (fn [program & options]
+                       (when (float-reduction-double-consumer program)
+                         (vreset! captured (dialect/validate! program)))
+                       (apply original program options))]
+         (try
+           (compiled/lower #'faithful-linear-terminal-loss
+                           [(float-array [1 -0.5 0.25 -1 0.75 0.5])
+                            (float-array [0.5 -1 1.5 -0.75 0.25 1])
+                            (float-array [0.25 -0.5 1 -0.25]) (long 2) (long 3) (long 2)]
+                           {:compiler :equation-first :target :cuda:0 :dtype :float
+                            :constants '[x tgt]})
+           (catch clojure.lang.ExceptionInfo error
+             (when-not (= :emitted-program-host-device-dependency (:reason (ex-data error)))
+               (throw error)))))))
+    (is (some? @captured) "the actual typed Float-reduction/Double-consumer pair must exist")
+    (when @captured
+      (let [{:keys [producer consumer]} (float-reduction-double-consumer @captured)
+            [result _] (original @captured)
+            output (first (:results consumer))
+            reduced (some #(when (and (= :reduce (:kind %)) (= [output] (:results %))) %)
+                          (map typed-fusion/equation-info (dialect/equations result)))]
+        (is (= [:float] (get-in producer [:attributes :dtypes])))
+        (is (= [:double] (get-in consumer [:attributes :dtypes])))
+        (is (some? reduced) "the original typed Double division must become a terminal transform")
+        (is (= [:float] (get-in reduced [:attributes :dtypes])))
+        (is (= :double (get-in reduced [:attributes :result-transform :result-dtype])))))))
 
 (deftest mixed-width-arithmetic-is-not-a-completed-conversion
   (let [program (frontend/form->program

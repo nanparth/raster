@@ -68,6 +68,29 @@
                     (not (util/effectful? body)))
                (value-ctor-call? body)))))
 
+(defn- scalar-wrapped-parallel-result?
+  "Admit a pure scalar wrapper around an existing scalar parallel result.
+
+   The parallel frontend still validates the primitive's body. Array helpers
+   without such a result retain their existing opacity policy."
+  [body]
+  (letfn [(admitted? [expression]
+            (if (seq? expression)
+              (let [info (form/form-info expression)]
+                (or (and (= :par (:kind info))
+                         (= 'raster.par/reduce (:head info))
+                         (= 1 (:return-type-arg info)))
+                    (and (op/scalar-op? (op/semantic-op expression))
+                         (every? admitted? (op/call-args expression)))))
+              (or (symbol? expression) (number? expression)
+                  (nil? expression) (boolean? expression) (char? expression))))]
+    (and (seq? body)
+         (op/scalar-op? (op/semantic-op body))
+         (not (util/effectful? body))
+         (admitted? body)
+         (some #(and (seq? %) (= 'raster.par/reduce (:head (form/form-info %))))
+               (tree-seq coll? seq body)))))
+
 (def ^:private prim-or-array-tags
   "Tags that are safe for inlining even when body has scoped forms.
    Reference-typed params (Dual, Complex, records) may have host interop
@@ -230,7 +253,8 @@
         ;; changing the existing intrinsic implementation expansion of this pipeline.
         (when (binding [*inline-scalar-bodies?*
                         (and *inline-scalar-bodies?*
-                             (not-any? types/primitive-array-tags tags)
+                             (or (not-any? types/primitive-array-tags tags)
+                                 (scalar-wrapped-parallel-result? (first effective-wb)))
                              (let [callee (symbol (str (:ns metadata)) (str (:name metadata)))]
                                (not (canonical-callee callee))))]
                 (inlinable-body? (first effective-wb)))

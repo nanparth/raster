@@ -686,6 +686,24 @@
                        last-write)))
         "an opaque host read keeps its preceding producer externally visible")))
 
+(deftest opaque-specialized-scalar-tail-does-not-become-a-successful-partial-program
+  ;; Captured canonical pre-semantic form of Float linear-nb -> Double mse-loss.
+  ;; The unsupported scalar tail must not vanish behind the admitted GEMM effect.
+  (let [source '(let* [size (.invk raster.numeric/_star__m_long_long-impl batch out-f)
+                      y (.invk raster.arrays/zeros-like_m_floats_long-impl x size)
+                      effect (.invk raster.linalg.blas/dgemm-nt!_m_floats_floats_floats_long_long_long_float_float-impl
+                                    x W y batch in-f out-f (float 1.0) (float 0.0))
+                      pred y]
+                 (.invk raster.dl.loss/mse-loss_m_floats_floats_long-impl
+                        pred tgt (clojure.core/* (clojure.core/long batch)
+                                                (clojure.core/long out-f))))
+        options {:dtype :float :segmented-plans? true
+                 :array-types {'W :float 'x :float 'tgt :float}
+                 :scalar-types {'batch :long 'in-f :long 'out-f :long}}
+        result (frontend/form->program-components (frontend/normalize-source source options) options)]
+    (is (nil? result)
+        "an unrepresented Double result and target read cannot be silently discarded")))
+
 (deftest direct-front-end-builds-the-typed-map-reduction-program
   (let [direct (frontend/form->program source {:dtype :float :array-types {'x :float}})
         equations (dialect/equations direct)]

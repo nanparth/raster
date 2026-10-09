@@ -53,6 +53,73 @@
             (dtype/dtype-for-scalar-tag
              (descriptor/cast-result-tag (first expression)))))))
 
+(defn completed-double-arithmetic?
+  "Prove a Float accumulator widens into arithmetic already declared Double.
+
+   This zero-tensor subset contains no local, conditional or effectful region. It
+   cannot move a Float intermediate operation into Double destination precision."
+  [region accumulator-dtype scalar-types]
+  (let [accumulator (first (:parameters region))
+        parameter-types (assoc scalar-types accumulator accumulator-dtype)
+        builder (scalar-expression/make-lowerer
+                 {:arrays #{} :array-types {} :scalar-types parameter-types
+                  :source-region (:expression region)
+                  :lower-index (fn [expression _]
+                                 (throw (ex-info "zero-tensor terminal proof cannot lower indices"
+                                                 {:reason :result-transform-proof-index
+                                                  :expression expression})))
+                  :decline! (fn [rule message data]
+                              (throw (ex-info message (assoc data :reason rule))))})
+        ;; The scheduled parameter boundary owns these dtypes. Use a proof-only
+        ;; view without occurrence type tags: an annotation cannot override a
+        ;; checked operand inside a nested arithmetic expression. Keep the original
+        ;; region for lowering and preserve explicit casts and all other metadata.
+        source-type (fn [expression environment]
+                      ((:source-type builder)
+                       (util/subst-syms
+                        parameter-types expression
+                        (fn [known operand]
+                          (if (contains? known operand)
+                            (vary-meta operand dissoc :raster.type/tag :tag)
+                            operand)))
+                       environment))
+        parameter-ids (set (:parameters region))]
+    (letfn [(admitted? [expression]
+              (cond
+                (symbol? expression)
+                (and (contains? parameter-ids expression)
+                     (contains? parameter-types expression)
+                     (contains? #{:float :double :long} (source-type expression {})))
+
+                (number? expression)
+                (contains? #{:float :double :long} (source-type expression {}))
+
+                (and (seq? expression) (descriptor/cast-op? (first expression)))
+                (and (= 2 (count expression))
+                     (= :double (dtype/dtype-for-scalar-tag
+                                 (descriptor/cast-result-tag (first expression))))
+                     (admitted? (second expression)))
+
+                (seq? expression)
+                (let [operator (intrinsics/canonical (descriptor/semantic-op expression))
+                      intrinsic (intrinsics/descriptor operator)
+                      arguments (vec (descriptor/call-args expression))
+                      ;; Check the operation from independently typed operands, rather than
+                      ;; letting its enclosing result annotation supply precision evidence.
+                      unannotated (vary-meta expression dissoc :raster.type/tag :tag)]
+                  (and intrinsic (not= :cmp (:kind intrinsic))
+                       (= (:arity intrinsic) (count arguments))
+                       (intrinsics/accepts-scalar-dtype? operator :double)
+                       (= :double (source-type unannotated {}))
+                       (every? admitted? arguments)))
+
+                :else false))]
+      (boolean
+       (and (= :float accumulator-dtype) (= :double (:result-dtype region))
+            (seq (:parameters region)) (empty? (:operands region))
+            (not (util/effectful? (:expression region)))
+            (admitted? (:expression region)))))))
+
 (defn make-region
   "Convert the target-neutral result-transform descriptor into KernelBody region data."
   [transform]

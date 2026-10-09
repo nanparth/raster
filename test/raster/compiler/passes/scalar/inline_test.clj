@@ -19,7 +19,7 @@
   dispatch: it is always a bug, and the inliner must say so AT THE CALL — naming the
   callee and both arities."
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.core :refer [deftm]]
+            [raster.core :refer [deftm reduce!]]
             [raster.par]
             [raster.numeric]
             [raster.arrays]
@@ -165,6 +165,39 @@
 (deftest leaf-bodies-are-inlinable
   (doseq [body ['x 'java.lang.Float/NEGATIVE_INFINITY 42 1.5 nil true]]
     (is (#'inline/inlinable-body? body))))
+
+(deftm normalized-array-sum [x :- (Array float) n :- Long] :- Double
+  (/ (reduce! [sum 0.0] [x] (+ sum x)) (double n)))
+
+(deftest parallel-scalar-wrapper-admission-preserves-opacity-and-purity
+  (doseq [body ['(clojure.core/alength x)
+                '(clojure.core// (unknown-call x) (double n))
+                '(clojure.core// (raster.par.extension/reduce acc 0.0 i n x) (double n))
+                '(clojure.core// (raster.par/map! x i n nil i) (double n))
+                '(clojure.core// (raster.par/reduce acc 0.0 i n (aset x i acc)) (double n))
+                '(unknown-call (raster.par/reduce acc 0.0 i n acc))]]
+    (is (not (#'inline/scalar-wrapped-parallel-result? body))))
+  (is (#'inline/scalar-wrapped-parallel-result?
+       '(clojure.core// (raster.par/reduce acc 0.0 i n (+ acc (aget x i)))
+                       (clojure.core/double n)))))
+
+(deftest scalar-wrapper-around-parallel-array-body-is-visible-at-gpu-entry
+  (let [callee 'raster.compiler.passes.scalar.inline-test/normalized-array-sum]
+    ;; A walk failure must surface here, before the resolver's conservative catch.
+    (let [walked (raster.core/ensure-walked-body! #'normalized-array-sum)]
+      (is (seq walked))
+      (is (some #(and (seq? %) (= 'raster.par/reduce (first %)))
+                (tree-seq coll? seq walked))))
+    (is (nil? (binding [inline/*inline-scalar-bodies?* false]
+                (#'inline/try-resolve-deftm callee ['floats 'long])))
+        "ordinary scalar inlining policy remains unchanged")
+    (let [resolved (binding [inline/*inline-scalar-bodies?* true]
+                     (#'inline/try-resolve-deftm callee ['floats 'long]))]
+      (is (some? resolved)
+          "a pure scalar wrapper must expose its retained parallel reduction")
+      (is (= 'double (:return-tag resolved)))
+      (is (some #(and (seq? %) (= 'raster.par/reduce (first %)))
+                (tree-seq coll? seq (:walked-body resolved)))))))
 
 (deftest lifted-tail-effect-retains-the-statement-binder-contract
   (let [result (:form (#'inline/inline-one-pass
