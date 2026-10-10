@@ -206,6 +206,8 @@
                  (cond-> {:array-types array-types :scalar-types scalar-types
                           :arrays (set inputs) :index-scope index-scope
                           :lower-index lower-index :predicate :map-active
+                          :affine-domain (when-not sequential-effects?
+                                           {:index index :bound '_n_bound})
                           :source-region [locals result effects]
                           :id-prefix "map" :decline! decline!}
                    strict-effects? (assoc :require-source-types? true
@@ -275,6 +277,7 @@
                                           (:result coordinate-value)
                                           (lower-index coordinate (set (keys environment))
                                                        environment))
+                  _ ((:require-index lowerer) coordinate-expression)
                   lowered ((:lower lowerer) expression (get array-types array) environment)]
               (concat (:operations coordinate-value)
                       (:operations lowered)
@@ -466,7 +469,13 @@
                                loop-environment
                                (into (assoc environment loop-index :long)
                                      (map vector parameters (map :dtype carries)))
-                               loop-state (lower-locals loop-locals loop-environment)
+                               loop-lower (lower-index lower (set (keys environment)) environment)
+                               loop-upper (lower-index extent (set (keys environment)) environment)
+                               loop-body
+                               ((:with-loop-index lowerer) loop-index loop-lower loop-upper
+                                (or upper-bound :exclusive)
+                                (fn [] (let [
+                                      loop-state (lower-locals loop-locals loop-environment)
                                inner (lower-effects loop-effects (:environment loop-state)
                                                     (:substitutions loop-state))
                                update-values
@@ -477,12 +486,15 @@
                                                   (util/subst-syms (:substitutions inner)))]
                                          (cast-carry carry expression (:environment inner))))
                                      carries)
+                                             ]
+                                         {:loop-state loop-state :inner inner :update-values update-values})))
+                               loop-state (:loop-state loop-body)
+                               inner (:inner loop-body)
+                               update-values (:update-values loop-body)
                                loop-operation
                                (body/->ForLoop
                                 (body/value loop-index :long)
-                                (lower-index lower (set (keys environment)) environment)
-                                (lower-index extent (set (keys environment)) environment)
-                                1
+                                loop-lower loop-upper 1
                                 (mapv (fn [carry parameter initial]
                                         (body/->LoopArg (body/value parameter (:dtype carry))
                                                         (:result initial)))
@@ -516,6 +528,7 @@
                                    (:result coordinate-value)
                                    (lower-index destination-index
                                                 (set (keys environment)) environment))
+                                 _ ((:require-index lowerer) coordinate-expression)
                                  lowered-value
                                  ((:lower lowerer) value (get array-types destination) environment)
                                  operator (when (= :reduce (:kind conflict))
@@ -642,11 +655,12 @@
                  (body/->IndexBinding local-index :local 0)
                  (body/->IndexCompute
                   launch-index
-                  (body/index-cast
-                   (body/expression :add
-                                    (body/expression :mul group-index workgroup-size)
-                                    local-index)
-                   :long :exact))]
+                  (let [expression (body/expression :add
+                                                    (body/expression :mul group-index workgroup-size)
+                                                    local-index)]
+                    (if (seq ((:required-preconditions lowerer)))
+                      (widen-index-expression expression {group-index :int local-index :int})
+                      (body/index-cast expression :long :exact))))]
        :masks (into [(body/->Mask
                       :map-active
                       [(if sequential-effects?
@@ -670,7 +684,8 @@
        :provenance {:dialect :kernel-body :source-dialect :segmap
                     :segop-id (:id segmap)}
        :attributes (cond-> {:kind :portable-segmap :extent bound :no-write-alias true
-                            :effect-iteration-order iteration-order}
+                            :effect-iteration-order iteration-order
+                            :required-preconditions ((:required-preconditions lowerer))}
                      (:address-projection segmap)
                      (assoc :address-projection (:address-projection segmap)))})
      :bound bound :inputs read-only-inputs :outputs outputs :scalars scalars}))
@@ -731,6 +746,7 @@
     (scheduled-body/make
      {:source segmap
       :body kernel-body
+      :preconditions (body/required-preconditions kernel-body)
       :arguments arguments
       :effects {:kind (cond
                         (= :ordered-effects (:write-conflict segmap)) :side-effect-map

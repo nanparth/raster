@@ -1211,3 +1211,174 @@
            clojure.lang.ExceptionInfo #"lifetime crosses a structured region boundary"
            (body/validate! (assoc kernel :operations
                                   (subvec (:operations kernel) 0 5))))))))
+
+(deftest pipelined-carries-cannot-discard-checked-quotient-ancestry
+  (let [original (fixtures/pipelined-staging-body 16 :preferred)
+        quotient (body/->ScalarCompute
+                  (body/value 'pipeline-quotient :long)
+                  (body/scalar-expression :quot :long [(body/literal 2 :long) (body/literal 1 :long)]))
+        factor (body/->ScalarCompute
+                (body/value 'pipeline-address-factor :long)
+                (body/scalar-expression :cast :long [(body/literal Long/MAX_VALUE :long)]
+                                       {:rounding :exact :overflow :exact}))
+        candidate (fn [initial yielded upper address?]
+                    (let [pipeline (-> (get-in original [:operations 4])
+                                       (assoc :upper upper
+                                              :iter-args [(body/->LoopArg (body/value 'pipeline-scalar-carry :long) initial)]
+                                              :results [(body/value 'pipeline-scalar-result :long)])
+                                       (update :operations
+                                               #(let [operations (assoc-in % [(dec (count %)) :values] [yielded])]
+                                                  (if address?
+                                                    (vec (concat (pop operations)
+                                                                 [(body/->ScalarStore
+                                                                   'y [(body/->IndexExpr :mul ['pipeline-scalar-carry 'pipeline-address-factor])]
+                                                                   (body/literal 0.0 :float) nil)
+                                                                  (peek operations)])) operations))))]
+                      (assoc original :operations
+                             (vec (concat (subvec (:operations original) 0 4)
+                                          [quotient factor pipeline]
+                                          (subvec (:operations original) 5))))))
+        ordinary (candidate (body/literal 0 :long) (body/literal 0 :long) 2 false)]
+    (is (= original (body/validate! original)))
+    (is (= ordinary (body/validate! ordinary))
+        "the real rotating async queue still accepts ordinary untagged scalar carries")
+    (doseq [kernel [(candidate 'pipeline-quotient (body/literal 0 :long) 0 false)
+                    (candidate (body/literal 0 :long) 'pipeline-quotient 2 false)]]
+      (is (= kernel (body/validate! kernel))
+          "harmless checked quotient value-only carries retain zero-trip and backedge semantics"))
+    (doseq [kernel [(candidate 'pipeline-quotient (body/literal 0 :long) 2 true)
+                    (candidate (body/literal 0 :long) 'pipeline-quotient 2 true)]]
+      (is (= :kernel-body-index-precondition
+             (try (body/validate! kernel) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+          "initial or later-backedge quotient ancestry cannot hide a genuinely overflowing address"))))
+
+(defn- guarded-storage-while-kernel [overflow proof]
+  (let [cast (fn [id source]
+               (body/->ScalarCompute (body/value id :long)
+                                     (body/scalar-expression :cast :long [source]
+                                                             {:rounding :exact :overflow :exact})))
+        load (fn [id offset]
+               (body/->ScalarLoad (body/value id :int) 'rp [offset] nil nil :cached))]
+    (body/make
+     {:id :independent-guarded-while
+      :parameters [(body/->KernelParameter 'rp :input :int [2] :global
+                                           (layout/row-major [2] :int) :input)]
+      :operations [(load 'start32 0) (cast 'start 'start32)
+                   (body/->WhileLoop
+                    [(body/->LoopArg (body/value 'k :long) 'start)
+                     (body/->LoopArg (body/value 'sum :double) (body/literal 0.0 :double))]
+                    [(load 'end32 1) (cast 'end 'end32)
+                     (body/->ScalarCompute (body/value 'done :predicate)
+                                          (body/scalar-expression :ge :predicate ['k 'end]))
+                     (body/->IfRegion 'done
+                                      [(body/->Yield [(body/literal false :predicate)])]
+                                      [(body/->Yield [(body/literal true :predicate)])]
+                                      [(body/value 'continue :predicate)])
+                     (body/->Yield ['continue])]
+                    [(body/->ScalarCompute
+                      (body/value 'next-k :long)
+                      (body/scalar-expression :+ :long ['k (body/literal 1 :long)]
+                                              (cond-> {:overflow overflow} proof (assoc :proof proof))))
+                     (body/->ScalarCompute (body/value 'next-sum :double)
+                                          (body/scalar-expression :+ :double ['sum (body/literal 1.0 :double)]))
+                     (body/->Yield ['next-k 'next-sum])]
+                    [(body/value 'result-k :long) (body/value 'result-sum :double)] {:association :ordered})]
+      :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+      :provenance {:dialect :test} :attributes {:kind :scalar}})))
+
+(deftest guarded-while-invariant-is-reconstructed-independently
+  (is (some? (guarded-storage-while-kernel :trap nil))
+      "ordinary checked typed IR is valid before portable proof qualification")
+  (is (some? (guarded-storage-while-kernel
+              :no-overflow {:kind :typed-scalar-range
+                            :lower (inc (bigint Integer/MIN_VALUE))
+                            :upper (bigint Integer/MAX_VALUE)}))))
+
+(deftest guarded-while-hostile-recurrences-lose-the-range-proof
+  (let [proof {:kind :typed-scalar-range :lower (inc (bigint Integer/MIN_VALUE))
+               :upper (bigint Integer/MAX_VALUE)}
+        ;; Start from the independently validated ordinary loop. Every mutation preserves
+        ;; its typed shape; failures must be arithmetic/proof failures, not IR setup errors.
+        ordinary (guarded-storage-while-kernel :trap nil)
+        claimed (assoc-in ordinary [:operations 2 :operations 0 :expression :options]
+                          {:overflow :no-overflow :proof proof})
+        reject (fn [kernel]
+                 (try (body/validate! kernel) nil
+                      (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+    (is (some? (body/validate! claimed)))
+    (doseq [hostile
+            [(assoc-in claimed [:operations 2 :condition-operations 2 :expression :op] :lt)
+             (assoc-in claimed [:operations 2 :operations 0 :expression :arguments 1]
+                       (body/literal 2 :long))
+             (assoc-in claimed [:operations 2 :operations 0 :expression :op] :-)
+             (assoc-in claimed [:operations 2 :operations 2 :values 0] 'k)
+             (assoc-in claimed [:operations 2 :operations 0 :expression :options :proof :upper] 10)
+             ;; This bounded rule does not admit unknown Long endpoints. This is not a
+             ;; mathematical claim that dominating k<e cannot prove Long k+1 by another rule.
+             ;; A valid Long endpoint parameter has no Int32-storage provenance.
+             (-> claimed
+                 (update :parameters conj (body/->KernelParameter 'unbounded-end :scalar :long [] nil nil :parameter))
+                 (assoc-in [:operations 2 :condition-operations 2 :expression :arguments 1] 'unbounded-end))]]
+      (is (= :kernel-body-intrinsic-overflow (reject hostile))))) )
+
+(deftest guarded-while-direct-condition-and-zero-trip-results
+  (let [ordinary (guarded-storage-while-kernel :trap nil)
+        proof {:kind :typed-scalar-range :lower (inc (bigint Integer/MIN_VALUE))
+               :upper (bigint Integer/MAX_VALUE)}
+        claimed (assoc-in ordinary [:operations 2 :operations 0 :expression :options]
+                          {:overflow :no-overflow :proof proof})
+        condition (get-in claimed [:operations 2 :condition-operations])
+        direct (assoc-in claimed [:operations 2 :condition-operations]
+                         (conj (assoc (subvec condition 0 3) 2
+                                      (assoc-in (nth condition 2) [:expression :op] :lt))
+                               (body/->Yield ['done])))]
+    (is (some? (body/validate! direct)))
+    ;; Exit/zero-trip range refinement is intentionally absent: the increment proof must
+    ;; not become an unrelated post-loop arithmetic certificate.
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not derivable from operand ranges"
+                         (body/validate!
+                          (update claimed :operations conj
+                                  (body/->ScalarCompute
+                                   (body/value 'after :long)
+                                   (body/scalar-expression :+ :long ['result-k (body/literal 1 :long)]
+                                                           {:overflow :no-overflow}))))))
+    (doseq [start [Integer/MIN_VALUE -7 0 Integer/MAX_VALUE]
+            end [Integer/MIN_VALUE -2 0 Integer/MAX_VALUE]
+            :when (< start end)]
+      (let [next-k (inc (bigint start))]
+        (is (<= (inc (bigint Integer/MIN_VALUE)) next-k (bigint Integer/MAX_VALUE)))))))
+
+(deftest guarded-while-compared-carry-and-complete-backedge-are-required
+  (let [base (guarded-storage-while-kernel :trap nil)
+        loop (nth (:operations base) 2)
+        other-carry (-> base
+                        (assoc-in [:operations 2 :iter-args]
+                                  (conj (:iter-args loop)
+                                        (body/->LoopArg (body/value 'other-k :long) 'start)))
+                        (assoc-in [:operations 2 :results]
+                                  (conj (:results loop) (body/value 'other-result :long)))
+                        (assoc-in [:operations 2 :operations 2 :values]
+                                  ['next-k 'next-sum 'other-k])
+                        (assoc-in [:operations 2 :condition-operations 2 :expression :arguments 0]
+                                  'other-k))
+        alternate (-> base
+                      (assoc-in [:operations 2 :operations]
+                                (into (subvec (:operations loop) 0 2)
+                                      [(body/->ScalarCompute (body/value 'choose-next :predicate)
+                                                             (body/scalar-expression :lt :predicate ['k (body/literal 0 :long)]))
+                                       (body/->IfRegion 'choose-next
+                                                       [(body/->Yield ['next-k])]
+                                                       [(body/->Yield ['k])]
+                                                       [(body/value 'chosen-k :long)])
+                                       (body/->Yield ['chosen-k 'next-sum])])))]
+    (doseq [ordinary [other-carry alternate]]
+      (is (some? (body/validate! ordinary)) "hostile recurrence itself remains valid checked IR")
+      (is (= :kernel-body-intrinsic-overflow
+             (try (body/validate!
+                   (assoc-in ordinary [:operations 2 :operations 0 :expression :options]
+                             {:overflow :no-overflow
+                              :proof {:kind :typed-scalar-range :lower (inc (bigint Integer/MIN_VALUE))
+                                      :upper (bigint Integer/MAX_VALUE)}}))
+                  nil
+                  (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))

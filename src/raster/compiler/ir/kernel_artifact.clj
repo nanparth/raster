@@ -10,7 +10,9 @@
   (:require [clojure.string :as str]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-launch :as klaunch]
-            [raster.compiler.ir.kernel-precondition :as precondition]))
+            [raster.compiler.ir.kernel-precondition :as precondition]
+            [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.core.intel-block-io :as block-io]))
 
 (defrecord KernelArtifact
            [kernel-name   ;; emitted entry-point string
@@ -100,6 +102,55 @@
       (when-not (map? value)
         (throw (ex-info (str "kernel artifact " k " must be a map")
                         {:kernel-name kernel-name k value}))))
+    (let [scheduled-body? (fn [value]
+                            ;; Match the existing cross-loader record recognition without a
+                            ;; reverse namespace require: scheduled-kernel-body depends on us.
+                            (= "raster.compiler.ir.scheduled_kernel_body.ScheduledKernelBody"
+                               (some-> value class .getName)))
+          attribute-schedule (:scheduled-kernel-body attributes)
+          source-operation (:scheduled-operation provenance)
+          provenance-schedule (when (or (scheduled-body? source-operation)
+                                        (body/kernel-body? (:body source-operation)))
+                                source-operation)
+          schedules (vec (keep identity [attribute-schedule provenance-schedule]))
+          retained-bodies (vec (keep identity [(:kernel-body attributes)
+                                               (:body attribute-schedule)
+                                               (:body provenance-schedule)]))]
+      (when (or (seq retained-bodies)
+                (contains? attributes :kernel-body)
+                (contains? attributes :scheduled-kernel-body)
+                (= :scheduled-kernel-body (:lowering provenance)))
+        (let [checked-bodies (mapv body/validate! retained-bodies)
+              checked (first checked-bodies)
+              required (body/required-preconditions checked)
+              fail-binding! (fn []
+                              (throw (ex-info "artifact has contradictory or incomplete retained body/ABI/constraint authority"
+                                              {:reason :kernel-artifact-required-preconditions
+                                               :required required :actual preconditions})))]
+          ;; Reconcile every retained authority before choosing conditional validation.
+          ;; An unconditional preferred attribute must not hide a conditional certificate.
+          (when-not (and (seq checked-bodies)
+                         (or (not (contains? attributes :scheduled-kernel-body))
+                             (scheduled-body? attribute-schedule))
+                         (apply = checked-bodies)
+                         (or (empty? schedules) (apply = schedules))
+                         (every? :body schedules))
+            (fail-binding!))
+          (when (seq required)
+            (let [target-facts (:target-facts attributes)
+                  target-suffix (when (and (= :opencl-intel (:target-dialect target-facts))
+                                           (= :dpas (:instruction-family target-facts)))
+                                  (:preconditions (block-io/body-requirements checked)))]
+              (when-not (and (= 3 (count checked-bodies))
+                             (= 2 (count schedules))
+                             (every? scheduled-body? schedules)
+                             (= target-facts (:target-facts provenance))
+                             (every? #(= required (:preconditions %)) schedules)
+                             (= (into required target-suffix) preconditions)
+                             (= (mapv (juxt :id :kind :dtype) (:parameters checked))
+                                (mapv (juxt :name :kind :kernel-dtype) abi))
+                             (every? #(= arguments (:arguments %)) schedules))
+                (fail-binding!)))))))
     (compilation artifact)
     artifact))
 

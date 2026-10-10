@@ -55,13 +55,21 @@
    operator, result dtype, already-converted argument vector and explicit operation options.
    `:fresh-binding` reserves an SSA identity for an owner's structured-control binder.
    These typed entries leave admission and proofs to the owner and final KernelBody validation."
-  [{:keys [array-types scalar-types scalar-ranges arrays index-scope lower-index lower-load-index predicate id-prefix decline!
+  [{:keys [array-types scalar-types scalar-ranges affine-domain arrays index-scope lower-index lower-load-index predicate id-prefix decline!
            conversion-policy load-other source-region require-source-types?]
     :or {id-prefix "scalar" scalar-ranges {}}}]
   (let [canon-type #(if (= :predicate %) :predicate (dtype/canon %))
         normalized-form (fn [form type source]
                           (with-meta form (assoc (meta source) :raster.type/tag
                                                  (dtype/scalar-tag-for-dtype type))))
+        required (atom [])
+        conditional-values
+        (atom (cond-> (into {} (map (fn [[id type]]
+                                     [id {:type (canon-type type) :abi-scalar-identity id
+                                          :range (scalar-range/for-dtype (canon-type type))}]))
+                           scalar-types)
+                affine-domain (assoc (:index affine-domain)
+                                     {:type :long :active-upper (:bound affine-domain)})))
         counter (atom 0)
         ;; One product Fold may feed several component projections in the same scalar region.
         ;; Cache its multi-result SSA refinement so projections never duplicate the loop or its
@@ -294,11 +302,27 @@
     (when-not (and (fn? lower-index) (fn? decline!))
       (throw (ex-info "scalar KernelBody lowering requires index and decline callbacks"
                       {:reason :raster/bug :lower-index lower-index :decline decline!})))
-    (letfn [(load-ssa [array coordinates]
+    (letfn [(require-index! [coordinate]
+              (when-let [info (body/conditional-index-info coordinate @conditional-values)]
+                (swap! required #(vec (distinct (into % (:required-preconditions info)))))))
+
+            (with-loop-index [index lower-bound upper-bound mode f]
+              (let [saved-values @conditional-values saved-ranges @value-ranges
+                    info (body/entered-for-loop-info
+                          lower-bound (body/conditional-index-info upper-bound saved-values) 1 mode)]
+                (when info
+                  (swap! conditional-values assoc index info)
+                  (remember-range! index (:range info)))
+                (try (f)
+                     (finally (reset! conditional-values saved-values)
+                              (reset! value-ranges saved-ranges)))))
+
+            (load-ssa [array coordinates]
               (let [type (some-> (get array-types array) dtype/canon)]
                 (when-not (and (contains? arrays array) type)
                   (decline! :indexed-load "scalar loads require a declared typed stable tensor"
                             {:array array :array-types array-types}))
+                (doseq [coordinate coordinates] (require-index! coordinate))
                 (reserve! [array coordinates predicate])
                 (let [id (fresh "load") range (scalar-range/for-dtype type)]
                   (remember-range! id range)
@@ -329,6 +353,13 @@
                     result (fresh "value")
                     range (or range (scalar-range/for-dtype result-type))]
                 (remember-range! result range)
+                (let [expression (body/scalar-expression operator result-type arguments options)
+                      transfer (body/conditional-integer-transfer expression @conditional-values)]
+                  (swap! conditional-values assoc result
+                         (cond-> {:type result-type :range range}
+                           (= :predicate result-type) (assoc :comparison-expression expression)
+                           (and transfer (every? (set @required) (:required-preconditions transfer)))
+                           (assoc :conditional-integer (:fact transfer)))))
                 {:operations [(body/->ScalarCompute
                                (body/value result result-type)
                                (body/scalar-expression operator result-type arguments options))]
@@ -680,8 +711,21 @@
                                else-expression then-expression)
                              expected env)
                       (let [condition (lower condition :predicate env)
-                            then-value (lower then-expression expected env)
-                            else-value (lower else-expression expected env)
+                            saved-values @conditional-values
+                            saved-ranges @value-ranges
+                            comparison (:comparison-expression (get saved-values (:result condition)))
+                            lower-branch (fn [expression truth?]
+                                           (let [refined (body/refine-comparison-values comparison saved-values truth?)]
+                                             (reset! conditional-values refined)
+                                             (reset! value-ranges (merge saved-ranges
+                                                                        (into {} (keep (fn [[id info]]
+                                                                                        (when (:range info) [id (:range info)]))) refined)))
+                                             (try (lower expression expected env)
+                                                  (finally
+                                                    (reset! conditional-values saved-values)
+                                                    (reset! value-ranges saved-ranges)))))
+                            then-value (lower-branch then-expression true)
+                            else-value (lower-branch else-expression false)
                             result-type (:type then-value)
                             _ (when-not (= result-type (:type else-value) expected)
                                 (decline! :branch-dtype
@@ -752,7 +796,11 @@
                         _ (remember-range! loop-index
                                            (scalar-range/hull [(index-bound-range lower-bound env)
                                                                (index-bound-range upper-bound env)]))
-                        local-state
+                        loop-body
+                        (with-loop-index loop-index lower-bound upper-bound
+                                         (:upper-bound attributes :exclusive)
+                          (fn [] (let [
+                                     local-state
                         (reduce
                          (fn [{:keys [operations substitutions environment]} local]
                            (let [local-type (canon-type (:dtype local))
@@ -787,6 +835,10 @@
                                       "canonical scalar fold carry dtype must remain invariant"
                                       {:expression expression :initial (:type initial)
                                        :update (:type update) :dtype fold-type}))
+                                     ]
+                                   {:local-state local-state :update update})))
+                        local-state (:local-state loop-body)
+                        update (:update loop-body)
                         loop-operation
                         (body/->ForLoop
                          (body/value loop-index :long)
@@ -941,6 +993,28 @@
                                          (body/->Yield (:results updates)))
                                    (mapv (fn [result type] (body/value result type)) results dtypes)
                                    {:association :ordered :source-order true})
+                                  initial-facts
+                                  (mapv (fn [initial]
+                                          {:range (:range initial)
+                                           :int32-storage-widening?
+                                           (body/exact-int32-storage-widening?
+                                            (:result initial) (:operations initial))}) initials)
+                                  invariants (body/guarded-while-increments operation initial-facts)
+                                  update-proofs (into {} (map (fn [[_ invariant]]
+                                                               [(:update-id invariant) (:update invariant)]))
+                                                      invariants)
+                                  ;; Qualify the completed actual SSA recurrence before it is
+                                  ;; submitted to independent KernelBody validation. Never
+                                  ;; re-lower source expressions or rewrite wrapping semantics.
+                                  operation
+                                  (clojure.core/update operation :operations
+                                          (fn [operations]
+                                            (mapv (fn [op]
+                                                    (if-let [range (get update-proofs (get-in op [:result :id]))]
+                                                      (assoc-in op [:expression :options]
+                                                                {:overflow :no-overflow
+                                                                 :proof (assoc range :kind :typed-scalar-range)})
+                                                      op)) operations)))
                                   lowered {:operations (conj (vec (mapcat :operations initials))
                                                              operation)
                                            :results results :types dtypes}]
@@ -989,17 +1063,20 @@
                             loop-type (:type initial)
                             update (util/subst-syms {index-sym loop-index acc-sym carry}
                                                     update-expr)
-                            lowered (lower update loop-type
-                                           (assoc env loop-index :long carry loop-type))
+                            upper (lower-index bound-expr (set (keys env)))
+                            lower-bound (body/index-cast index-init :long :exact)
+                            lowered (with-loop-index loop-index lower-bound upper
+                                      (if inclusive? :inclusive :exclusive)
+                                      #(lower update loop-type
+                                              (assoc env loop-index :long carry loop-type)))
                             _ (when-not (= loop-type (:type lowered))
                                 (decline! :ordered-loop-dtype
                                           "ordered scalar loop carry dtype must remain invariant"
                                           {:expression expression :initial loop-type
                                            :update (:type lowered)}))
-                            upper (lower-index bound-expr (set (keys env)))
                             loop (body/->ForLoop
                                   (body/value loop-index :long)
-                                  (body/index-cast index-init :long :exact)
+                                  lower-bound
                                   upper 1
                                   [(body/->LoopArg (body/value carry loop-type)
                                                    (:result initial))]
@@ -1178,8 +1255,32 @@
                               (and (contains? #{:byte :int :long} operand-type)
                                    (contains? #{:+ :- :*} operator))
                               operand-ranges (mapv :range lowered)
+                              conditional-factor
+                              (when (and (= :* operator) (= :long operand-type) affine-domain
+                                         (nil? (intrinsics/source-overflow-policy semantic-operation)))
+                                (some (fn [[index factor]]
+                                        (when (and (= index (:index affine-domain))
+                                                   (= :long (get scalar-types factor))) factor))
+                                      [(mapv :result lowered) (vec (reverse (mapv :result lowered)))]))
+                              _ (when conditional-factor
+                                  (swap! required (fn [conditions]
+                                                    (vec (distinct (into conditions
+                                                       (body/affine-product-preconditions
+                                                        (:bound affine-domain) conditional-factor)))))))
+                              conditional-transfer
+                              (when (and affine-domain
+                                         (nil? (intrinsics/source-overflow-policy semantic-operation)))
+                                (body/conditional-integer-transfer
+                                 (body/scalar-expression operator result-type (mapv :result lowered) {})
+                                 @conditional-values))
+                              _ (when conditional-transfer
+                                  (swap! required #(vec (distinct (into % (:required-preconditions conditional-transfer))))))
                               proven-range (when integral-arithmetic?
-                                             (scalar-range/arithmetic operator operand-ranges))
+                                             (if conditional-transfer
+                                               (:range conditional-transfer)
+                                             (if conditional-factor
+                                               {:lower 0 :upper Long/MAX_VALUE}
+                                               (scalar-range/arithmetic operator operand-ranges))))
                               overflow (when integral-arithmetic?
                                          (or (intrinsics/source-overflow-policy semantic-operation)
                                              (when (scalar-range/contained-in-dtype? proven-range operand-type)
@@ -1194,9 +1295,11 @@
                                             "scalar intrinsic operands require one dtype"
                                             {:expression expression :operand-type operand-type
                                              :actual (mapv :type lowered)}))
-                              result-range (if (= :quot operator)
-                                             (scalar-range/quotient operand-ranges)
-                                             proven-range)
+                              result-range (or (:range conditional-transfer)
+                                               (case operator
+                                                 :quot (scalar-range/quotient operand-ranges)
+                                                 :rem (scalar-range/remainder operand-ranges)
+                                                 proven-range))
                               computed (compute-ssa operator result-type (mapv :result lowered)
                                                     options (when (scalar-range/contained-in-dtype?
                                                                     result-range result-type)
@@ -1214,7 +1317,8 @@
                             {:expression expression :type (type expression)})))]
       ;; Reserve at public region boundaries, not at every recursive child: identifiers are
       ;; scoped facts, and rescanning each subtree would make deeply nested lowering quadratic.
-      {:fresh-binding fresh
+      {:required-preconditions #(deref required)
+       :fresh-binding fresh
        ;; Read-only source evidence, independent of any consumer result dtype.
        :source-type authoritative-source-type
        :lower (fn [expression expected env]
@@ -1227,6 +1331,9 @@
        ;; These typed entries perform no source admission, index proof, promotion or overflow
        ;; inference. Their owner supplies proved coordinates and already-converted operands.
        :load load-ssa
+       ;; Store and atomic destinations use the same private coordinate facts as loads.
+       :require-index require-index!
+       :with-loop-index with-loop-index
        :compute (fn [operator result-type arguments options]
                   (compute-ssa operator result-type arguments options nil))
        :lower-region

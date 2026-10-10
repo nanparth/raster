@@ -185,6 +185,11 @@
         ;; These private projections consume only the exact body checked in this invocation.
         ;; Public helper entry points still validate independently; no authority escapes here.
         expected-uses (uses-from-checked-body kernel-body arguments)]
+    (when (and (seq (body/required-preconditions kernel-body))
+               (not= (body/required-preconditions kernel-body) preconditions))
+      (fail! :scheduled-kernel-body-required-preconditions
+             "conditional body obligations differ from scheduled constraints"
+             {:required (body/required-preconditions kernel-body) :actual preconditions}))
     (when (nil? source)
       (fail! :scheduled-kernel-body-source
              "scheduled kernel body requires its exact source operation" {}))

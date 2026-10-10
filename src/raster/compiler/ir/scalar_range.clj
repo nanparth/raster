@@ -150,6 +150,21 @@
         {:lower (quot (:lower numerator) divisor-value)
          :upper (quot (:upper numerator) divisor-value)}))))
 
+(defn remainder
+  "Conservative signed remainder interval for an exact positive constant divisor.
+   Zero, negative and varying divisors retain their existing exceptional semantics."
+  [operands]
+  (when (and (= 2 (count operands)) (every? some? operands))
+    (let [[numerator divisor] operands
+          d (:lower divisor)
+          lo (:lower numerator)
+          hi (:upper numerator)]
+      (when (and (integer? d) (= d (:upper divisor)) (pos? d)
+                 (integer? lo) (integer? hi))
+        (let [magnitude (dec (bigint d))]
+          {:lower (max (- magnitude) (min 0 lo))
+           :upper (min magnitude (max 0 hi))})))))
+
 (defn typed-index-range
   "Conditional interval proof for a bounded typed index tree.
    Leaf domains must hold at the access. Every intermediate must fit its declared integer

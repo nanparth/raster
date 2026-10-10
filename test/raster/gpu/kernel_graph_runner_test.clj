@@ -1,11 +1,15 @@
 (ns raster.gpu.kernel-graph-runner-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.gpu.segop-opencl :as emit]
+            [raster.core :refer [deftm]]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.gpu.compiled :as compiled]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.soac :as soac]
+            [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.gpu.core :as gpu]
             [raster.gpu.resource-cleanup :as cleanup]
@@ -34,7 +38,229 @@
         operations (lower/lower-scan node nil :dtype :float)]
     (emit/generate-scan-kernel-graph
      (lower/scan-kernel-graph
-      node operations {:array-types {'values :float 'out :float}}))))
+     node operations {:array-types {'values :float 'out :float}}))))
+
+(deftest conditional-affine-public-rebind-checks-new-scalars-and-retains-immutable-replay
+  (let [operation (segop/->SegMap
+                   904 (segop/make-seg-space 'row 'n) (segop/->SegLevel :thread :virtual)
+                   '(double (clojure.core/* (long row) (long factor)))
+                   nil #{} #{'output} #{'factor}
+                   (segop/->KernelGrid 1 256 0) :double 'output nil)
+        emitted (emit/generate-scheduled-segmap-kernel
+                 operation :scalar-types {'n :long 'factor :long}
+                 :array-types {'output :double} :target-dialect :opencl-portable)
+        output {:dtype :double :n-elements 2 :byte-size 16}
+        allocation (bview/allocation {:id :out :byte-size 16 :memory-space :shared
+                                     :device :ze:0 :coherence :host-coherent :ownership :owned})
+        sess (atom {:device-id :ze:0 :session-id :conditional-rebind
+                    :buffers {:out output} :allocations {:out allocation}
+                    :kernel-graphs {} :events {} :closed? false})
+        contacts (atom [])
+        calls (atom [])
+        arguments (fn [factor]
+                    (mapv (fn [slot]
+                            (case (:name slot)
+                              output :out
+                              factor {:type :long :value factor}
+                              _n_bound {:type :long :value 2})) (:abi emitted)))
+        resolver (fn [_ name]
+                   (case name
+                     "register-kernel!" (fn [& _] (swap! contacts conj :register))
+                     "bind-kernel-call" (fn [call & _]
+                                          (swap! contacts conj :bind)
+                                          (swap! calls conj call)
+                                          {:kernel-call call})
+                     "record-graph!" (fn [prepared _]
+                                       (swap! contacts conj :record) {:prepared prepared})
+                     "submit-graph!" (fn [graph] (swap! contacts conj :submit) {:graph graph})
+                     "await-event!" (fn [event] (swap! contacts conj :await) event)
+                     "release-event!" (fn [event] (swap! contacts conj :release-event) event)
+                     (throw (ex-info "unexpected mocked runtime function" {:name name}))))
+        soft (fn [_ name]
+               (case name
+                 "destroy-graph!" (fn [_] (swap! contacts conj :destroy-graph))
+                 "destroy-prepared!" (fn [_] (swap! contacts conj :destroy-prepared))
+                 nil))]
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'rt-resolve) resolver
+       (ns-resolve 'raster.gpu.core 'rt-resolve-soft) soft}
+      (fn []
+        (let [first-handle (gpu/bind-kernel-call! sess :affine emitted (arguments 4294967296))
+              first-entry (get-in @sess [:kernel-graphs :affine])]
+          (is (identical? output (get (gpu/run-kernel-graph! sess first-handle) 'output)))
+          (is (identical? output (get (gpu/run-kernel-graph! sess first-handle) 'output)))
+          (is (= 1 (count @calls)) "immutable replay retains the checked scalar tuple")
+          (reset! contacts [])
+          (is (thrown? ArithmeticException
+                       (gpu/bind-kernel-call! sess :affine emitted (arguments Long/MAX_VALUE))))
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (gpu/bind-kernel-call! sess :affine emitted (arguments -1))))
+          (is (empty? @contacts) "bad changed scalars do not contact or retire the prior generation")
+          (is (identical? first-entry (get-in @sess [:kernel-graphs :affine])))
+          (is (identical? output (get (gpu/run-kernel-graph! sess first-handle) 'output)))
+          (let [second-handle (gpu/bind-kernel-call! sess :affine emitted (arguments 3))]
+            (is (= 2 (count @calls)))
+            (is (= {:type :long :value 3}
+                   (second (:arguments (last @calls)))))
+            (is (thrown? clojure.lang.ExceptionInfo (gpu/run-kernel-graph! sess first-handle)))
+            (is (identical? output (get (gpu/run-kernel-graph! sess second-handle) 'output)))
+            (gpu/release-kernel-graph! sess second-handle)
+            (is (empty? (:kernel-graphs @sess)))))))))
+
+(deftm conditional-affine-public-map!
+  [out :- (Array double) n :- Long factor :- Long] :- (Array double)
+  (dotimes [row n]
+    (aset out row (double (clojure.core/* (long row) factor))))
+  out)
+
+(deftest conditional-affine-compiled-specializations-bind-checked-scalars
+  ;; Scalars are captured by Prepared. A scalar change prepares and binds a fresh
+  ;; specialization; invoke's existing array-only refresh contract is untouched.
+  (let [contacts (atom []) calls (atom [])
+        session (atom {:device-id :ocl:0 :session-id :compiled-affine
+                       :buffers {} :allocations {} :buffer-owners {}
+                       :prepared {} :kernel-graphs {} :graphs {} :events {} :closed? false})
+        prepare (fn [factor]
+                  (compiled/lower #'conditional-affine-public-map!
+                                  [(double-array 2) (long 2) (long factor)]
+                                  {:compiler :equation-first :target :ocl:0 :dtype :double
+                                   :roles {'out :state}}))
+        resolver (fn [_ name]
+                   (case name
+                     "register-kernel!" (fn [& _] (swap! contacts conj :register))
+                     "bind-kernel-call" (fn [call & _] (swap! calls conj call) {:kernel-call call})
+                     "record-graph!" (fn [prepared _] {:prepared prepared})
+                     "make-buffer" (fn [n dt opts]
+                                     (swap! contacts conj :temporary-allocation)
+                                     (lifecycle/native-buffer
+                                      #(hash-map :dtype dt :n-elements n :byte-size (* n (dtype/bytes-of dt)))
+                                      (fn [_]) opts))
+                     "free-buffer!" (fn [_])
+                     (throw (ex-info "unexpected mocked runtime function" {:name name}))))
+        soft (fn [_ name]
+               (case name "destroy-graph!" (fn [_]) "destroy-prepared!" (fn [_]) nil))]
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'rt-resolve) resolver
+       (ns-resolve 'raster.gpu.core 'rt-resolve-soft) soft
+       #'gpu/alloc!
+       (fn [sess specs]
+         (swap! contacts conj :allocate)
+         (doseq [[key [dt n _ opts]] specs]
+           (let [bytes (* n (dtype/bytes-of dt))
+                 buffer (lifecycle/native-buffer #(hash-map :dtype dt :n-elements n :byte-size bytes)
+                                                  (fn [_]) {})
+                 allocation (bview/allocation
+                             (merge {:id (:allocation-id opts) :device :ocl:0
+                                     :byte-size bytes :ownership :owned}
+                                    (select-keys opts [:memory-space :coherence :alignment])))]
+             (swap! sess #(-> % (assoc-in [:buffers key] buffer)
+                                  (assoc-in [:buffer-owners key] (::cleanup/owner buffer))
+                                  (assoc-in [:allocations key] allocation))))))
+       #'gpu/upload-range! (fn [& _])}
+      (fn []
+        (let [negative (try (compiled/instantiate! (prepare -1) {:session session})
+                            (catch Exception error error))
+              overflow (try (compiled/instantiate! (prepare Long/MAX_VALUE) {:session session})
+                            (catch Exception error error))]
+          (is (= :kernel-precondition-failed (:reason (ex-data negative)))
+              "negative factors fail the actual captured scalar precondition")
+          (is (instance? ArithmeticException overflow)
+              "the unchanged checked Product evaluator rejects overflowing bounds")
+          (is (= "long overflow" (.getMessage overflow)))
+          (is (empty? @contacts) "invalid specialization declines before allocation or driver contact"))
+        (doseq [factor [4294967296 3]]
+          (let [before (count @calls) prepared (prepare factor)
+                bound (compiled/instantiate! prepared {:session session})]
+            (try
+              (is (< before (count @calls)) "actual LinkPlan instantiation binds its generated graph")
+              (is (some (fn [call]
+                          (some #(= {:type :long :value factor} %) (:arguments call)))
+                        (subvec @calls before))
+                  "the newly captured factor reaches the checked ordered call ABI")
+              (finally (compiled/close! bound)))))
+        (is (empty? (:kernel-graphs @session)))
+        (is (empty? (:buffers @session)))))))
+
+(deftm conditional-quotient-public-map!
+  [fine :- (Array double) out :- (Array double) n :- Long divisor :- Long width :- Long] :- (Array double)
+  (dotimes [flat n]
+    (let [q (quot (long flat) divisor)
+          r (- (long flat) (* q divisor))
+          k (+ (* (long 2) q width) (* (long 2) r))]
+      (aset out flat (* 0.25 (+ (aget fine k) (aget fine (+ k 1))
+                               (aget fine (+ k width)) (aget fine (+ k width 1)))))))
+  out)
+
+(deftest conditional-quotient-compiled-specializations-bind-checked-scalars
+  ;; Scalars are captured by Prepared. A scalar change prepares and binds a fresh
+  ;; specialization; invoke's existing array-only refresh contract is untouched.
+  (let [contacts (atom []) calls (atom [])
+        session (atom {:device-id :ocl:0 :session-id :compiled-quotient
+                       :buffers {} :allocations {} :buffer-owners {}
+                       :prepared {} :kernel-graphs {} :graphs {} :events {} :closed? false})
+        prepare (fn [n divisor width]
+                  (compiled/lower #'conditional-quotient-public-map!
+                                  [(double-array 16) (double-array 2) (long n) (long divisor) (long width)]
+                                  {:compiler :equation-first :target :ocl:0 :dtype :double
+                                   :roles {'out :state}}))
+        resolver (fn [_ name]
+                   (case name
+                     "register-kernel!" (fn [& _] (swap! contacts conj :register))
+                     "bind-kernel-call" (fn [call & _] (swap! calls conj call) {:kernel-call call})
+                     "record-graph!" (fn [prepared _] {:prepared prepared})
+                     "make-buffer" (fn [n dt opts]
+                                     (swap! contacts conj :temporary-allocation)
+                                     (lifecycle/native-buffer
+                                      #(hash-map :dtype dt :n-elements n :byte-size (* n (dtype/bytes-of dt)))
+                                      (fn [_]) opts))
+                     "free-buffer!" (fn [_])
+                     (throw (ex-info "unexpected mocked runtime function" {:name name}))))
+        soft (fn [_ name]
+               (case name "destroy-graph!" (fn [_]) "destroy-prepared!" (fn [_]) nil))]
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'rt-resolve) resolver
+       (ns-resolve 'raster.gpu.core 'rt-resolve-soft) soft
+       #'gpu/alloc!
+       (fn [sess specs]
+         (swap! contacts conj :allocate)
+         (doseq [[key [dt n _ opts]] specs]
+           (let [bytes (* n (dtype/bytes-of dt))
+                 buffer (lifecycle/native-buffer #(hash-map :dtype dt :n-elements n :byte-size bytes)
+                                                  (fn [_]) {})
+                 allocation (bview/allocation
+                             (merge {:id (:allocation-id opts) :device :ocl:0
+                                     :byte-size bytes :ownership :owned}
+                                    (select-keys opts [:memory-space :coherence :alignment])))]
+             (swap! sess #(-> % (assoc-in [:buffers key] buffer)
+                                  (assoc-in [:buffer-owners key] (::cleanup/owner buffer))
+                                  (assoc-in [:allocations key] allocation))))))
+       #'gpu/upload-range! (fn [& _])}
+      (fn []
+        (let [negative (try (compiled/instantiate! (prepare 2 -1 2) {:session session})
+                            (catch Exception error error))
+              overflow (try (compiled/instantiate! (prepare 1 Long/MAX_VALUE Long/MAX_VALUE) {:session session})
+                            (catch Exception error error))]
+          (is (= :kernel-precondition-failed (:reason (ex-data negative)))
+              "active negative divisor fails the actual quotient-domain precondition")
+          (is (instance? ArithmeticException overflow)
+              "the unchanged checked Product evaluator rejects overflowing bounds")
+          (is (= "long overflow" (.getMessage overflow)))
+          (is (empty? @contacts) "invalid specialization declines before allocation or driver contact"))
+        (doseq [[n divisor width] [[2 2 2] [2 3 4]]]
+          (let [before (count @calls) prepared (prepare n divisor width)
+                bound (compiled/instantiate! prepared {:session session})]
+            (try
+              (is (< before (count @calls)) "actual LinkPlan instantiation binds its generated graph")
+              (is (some (fn [call]
+                          (let [bindings (zipmap (map :name (get-in call [:artifact :abi]))
+                                                 (:arguments call))]
+                            (and (= {:type :long :value divisor} (get bindings 'divisor))
+                                 (= {:type :long :value width} (get bindings 'width)))))
+                        (subvec @calls before))
+                  "both newly captured quotient parameters reach their checked named ABI slots")
+              (finally (compiled/close! bound)))))
+        (is (empty? (:kernel-graphs @session)))
+        (is (empty? (:buffers @session)))))))
 
 (deftest integrated-opencl-allocation-still-uploads-through-cl-mem
   (let [source (float-array [1.0 2.0])

@@ -1951,6 +1951,7 @@
            external-ids (external-graph-buffer-ids graph)]
        (when closed?
          (throw (ex-info "cannot bind a kernel graph in a closed GPU session" {:key graph-key})))
+       (kgcall/preflight! graph scalar-values)
        (assert-source-unrecorded! sess :graph graph-key)
        (when-not (= external-ids (set (keys buffer-keys)))
          (throw (ex-info "kernel graph external bindings differ from graph inputs/outputs"
@@ -2061,6 +2062,7 @@
        (when (nil? call-key)
          (throw (ex-info "bound kernel call requires a non-nil key" {})))
        (kabi/validate-arguments! abi arguments)
+       (kcall/validate-preconditions! artifact arguments)
        (let [pointer-bindings
              (into {}
                    (keep-indexed (fn [index [slot value]]
@@ -2497,6 +2499,7 @@
     (case (kexec/kind executable)
       :kernel-artifact
       (do
+        (kcall/validate-preconditions! executable runtime-arguments)
         (register! (:kernel-name executable) executable arena-id)
         (->BoundExecutableStep
          [(bind! (kcall/make executable runtime-arguments

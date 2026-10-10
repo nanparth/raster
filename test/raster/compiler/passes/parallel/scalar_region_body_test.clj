@@ -1027,7 +1027,11 @@
     (is (some? loop))
     (is (some? addition))
     (is (= :no-overflow (get-in addition [:expression :options :overflow])))
-    (is (= {:lower -6442450943 :upper 6442450942 :kind :typed-scalar-range}
+    ;; A canonical exclusive loop enters only for a nonnegative index below degree.
+    ;; Independently: min(start)+0 and max(start)+(max(end)-min(start)-1).
+    (is (= {:lower Integer/MIN_VALUE
+            :upper (+' Integer/MAX_VALUE (-' Integer/MAX_VALUE Integer/MIN_VALUE) -1)
+            :kind :typed-scalar-range}
            (get-in addition [:expression :options :proof])))
     (is (some? (body/validate! (fold-region-kernel region))))
     (is (string? (emit/emit-scalar-kernel "finite_volume_ranges" (fold-region-kernel region)
@@ -1046,9 +1050,15 @@
           addition (induction-addition region)]
       (is (= :no-overflow (get-in addition [:expression :options :overflow])))
       (is (some? (body/validate! (fold-region-kernel region))))))
+  (let [region (finite-volume-fold-region {:storage-type :long :upper-bound 1})]
+    (is (= :no-overflow (get-in (induction-addition region) [:expression :options :overflow])))
+    (is (some? (body/validate! (fold-region-kernel region))))
+    (is (= {:lower Long/MIN_VALUE :upper Long/MAX_VALUE :kind :typed-scalar-range}
+           (get-in (induction-addition region) [:expression :options :proof]))
+        "the sole entered index is zero, so adding an arbitrary Long start is representable"))
   (doseq [options [{:upper-bound Long/MAX_VALUE}
                    {:lower-bound Long/MIN_VALUE :upper-bound -1}
-                   {:storage-type :long :upper-bound 1}]]
+                   {:storage-type :long :upper-bound 2}]]
     (let [region (finite-volume-fold-region options)]
       (is (= :trap (get-in (induction-addition region) [:expression :options :overflow])))
       (is (some? (body/validate! (fold-region-kernel region))))))
@@ -1073,3 +1083,37 @@
     (is (= :kernel-body-intrinsic-overflow
            (try (body/validate! forged) nil
                 (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+
+(defn- guarded-storage-while-lowered []
+  (let [decline! (fn [rule message data] (throw (ex-info message (assoc data :rule rule))))
+        lower (:lower (scalar/make-lowerer
+                       {:array-types {'rp :int} :arrays #{'rp} :scalar-types {}
+                        :lower-index (fn [expression scope] (index/lower expression scope decline!))
+                        :conversion-policy conversion/policy :decline! decline!}))
+        expression '(while-component
+                     (while-fold {:accumulators [k sum] :identities [(long (aget rp 0)) 0.0]
+                                  :dtypes [:long :double] :association :ordered}
+                                 (lambda [k sum] (region [] [(if (>= k (long (aget rp 1))) false true)]))
+                                 (lambda [k sum] (region [] [(+ k 1) (+ sum 1.0)])))
+                     1)]
+    (lower expression :double {})))
+
+(deftest guarded-storage-while-increment-has-a-checked-portable-proof
+  (let [lowered (guarded-storage-while-lowered)
+        loop (last (:operations lowered))
+        update (first (:operations loop))
+        kernel (body/make
+                {:id :guarded-storage-while
+                 :parameters [(body/->KernelParameter 'rp :input :int [2] :global
+                                                      (layout/row-major [2] :int) :input)]
+                 :operations (:operations lowered)
+                 :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+                 :provenance {:dialect :test} :attributes {:kind :scalar}})]
+    (is (= [:long :double] (mapv #(get-in % [:binding :type]) (:iter-args loop))))
+    (is (= :exact (get-in (second (:operations lowered)) [:expression :options :overflow])))
+    (is (= :no-overflow (get-in update [:expression :options :overflow])))
+    (is (= {:kind :typed-scalar-range :lower (inc (bigint Integer/MIN_VALUE))
+            :upper (bigint Integer/MAX_VALUE)}
+           (get-in update [:expression :options :proof])))
+    (is (string? (emit/emit-scalar-kernel "guarded_storage_while" kernel
+                                         {:target-dialect :opencl-portable})))) )

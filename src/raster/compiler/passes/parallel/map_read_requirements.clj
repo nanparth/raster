@@ -501,10 +501,11 @@
                                :else nil))
                            arguments (mapv argument-range (:arguments expression))
                            derived
-                           (or (when (and (= :typed-scalar-range (:kind proof))
-                                          (ranges/contained-in-dtype? proof type))
-                                 (select-keys proof [:lower :upper]))
-                               (when (every? some? arguments)
+                           ;; A valid overflow certificate may be wider than this
+                           ;; static map's independently checked operand domains.
+                           ;; Derive the access interval first; retain the certificate
+                           ;; only when the actual operand interval is unknown.
+                           (or (when (every? some? arguments)
                                  (case (:op expression)
                                    (:+ :- :*)
                                    (let [range (ranges/arithmetic (:op expression) arguments)]
@@ -529,7 +530,10 @@
                                      (when (and (= :exact (get-in expression [:options :overflow]))
                                                 (ranges/contained-in-dtype? range type))
                                        range))
-                                   nil)))]
+                                   nil))
+                               (when (and (= :typed-scalar-range (:kind proof))
+                                          (ranges/contained-in-dtype? proof type))
+                                 (select-keys proof [:lower :upper])))]
                        (if (and (symbol? id) derived)
                          (assoc known id {:type type :range derived})
                          known))

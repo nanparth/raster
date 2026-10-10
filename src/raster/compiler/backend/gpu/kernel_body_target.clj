@@ -135,6 +135,11 @@
               :parameter-names names
               :parameter-alignments {}
               :target-facts (scalar-target-facts kernel-body dialect target-features)})))
+         _ (when (and (seq (body/required-preconditions kernel-body))
+                      (not= (body/required-preconditions kernel-body)
+                            (:required-preconditions emitted)))
+             (throw (ex-info "target module dropped conditional body obligations"
+                             {:reason :kernel-body-target-required-preconditions})))
          names (validate-target-names! kernel-name kernel-body (:parameter-names emitted))
          projected-abi (project-abi scheduled names (:parameter-alignments emitted))]
      (scheduled-body/validate-artifact-projection!

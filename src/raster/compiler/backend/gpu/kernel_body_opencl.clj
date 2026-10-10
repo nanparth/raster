@@ -1794,13 +1794,18 @@
      (binding [*scalar-dialect*
                (merge (c-dialect/resolve! target-dialect)
                       (select-keys target-features [:compute-capability :architecture]))]
-       (emit-scalar-kernel* kernel-name kernel-body options)))))
+       (assoc (emit-scalar-kernel* kernel-name kernel-body options)
+              :required-preconditions (body/required-preconditions kernel-body))))))
 
 (defn emit-scalar-kernel
   "Source-only projection. Runtime artifacts must consume emit-scalar-module requirements too."
   ([kernel-name kernel-body] (emit-scalar-kernel kernel-name kernel-body {}))
   ([kernel-name kernel-body options]
    (let [module (emit-scalar-module kernel-name kernel-body options)]
+     (when (seq (:required-preconditions module))
+       (throw (ex-info "source-only emission discards conditional execution obligations"
+                       {:reason :discarded-precondition-contract
+                        :required-preconditions (:required-preconditions module)})))
      (when (seq (:compilation module))
        (throw (ex-info "explicit compilation requirements need emit-scalar-module"
                        {:reason :discarded-compilation-contract

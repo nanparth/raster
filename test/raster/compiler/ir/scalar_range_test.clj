@@ -105,3 +105,32 @@
     (is (nil? (ranges/typed-index-range (body/index-cast 'j :int :exact)
                                         {'j :long} {'j {:lower 0 :upper 3}})))
     (is (nil? (prove (reduce (fn [x _] (body/expression :add x 0)) 'i (range 130)))))))
+
+
+(deftest signed-remainder-by-a-positive-constant-retains-endpoint-bounds
+  (let [remainder (ns-resolve 'raster.compiler.ir.scalar-range 'remainder)]
+    (is (some? remainder) "the existing ordinary interval algebra must model signed remainder")
+    (when remainder
+      (doseq [n [Long/MIN_VALUE -17 -1 0 1 17 Long/MAX_VALUE]]
+        (is (= {:lower 0 :upper 0}
+               (remainder [{:lower n :upper n} {:lower 1 :upper 1}]))))
+      (is (= {:lower -2 :upper 2}
+             (remainder [(ranges/for-dtype :long) {:lower 3 :upper 3}])))
+      (doseq [d [0 -1 Long/MIN_VALUE]]
+        (is (nil? (remainder [(ranges/for-dtype :long) {:lower d :upper d}])))))))
+
+
+(deftest signed-positive-constant-remainder-bounds-cover-the-actual-signed-values
+  (doseq [d [1 2 3 17 Long/MAX_VALUE]
+          [lo hi] [[Long/MIN_VALUE Long/MAX_VALUE] [Long/MIN_VALUE -1]
+                   [-17 17] [0 Long/MAX_VALUE] [-1 -1] [1 1]]]
+    (let [interval (ranges/remainder [{:lower lo :upper hi} {:lower d :upper d}])]
+      (is (ranges/contained-in-dtype? interval :long))
+      (doseq [n (distinct [lo hi (max lo (min hi -1)) (max lo (min hi 0))
+                          (max lo (min hi 1))])]
+        (is (<= (:lower interval) (rem n d) (:upper interval))))))
+  (doseq [lo (range -5 6) hi (range lo 6) d (range 1 8)]
+    (let [interval (ranges/remainder [{:lower lo :upper hi} {:lower d :upper d}])]
+      (is (every? #(<= (:lower interval) (rem % d) (:upper interval)) (range lo (inc hi))))))
+  (is (nil? (ranges/remainder [{:lower -1 :upper 1} {:lower 1 :upper 2}])))
+  (is (nil? (ranges/remainder [nil {:lower 1 :upper 1}]))))

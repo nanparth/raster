@@ -7,7 +7,8 @@
    let*-rewrap dropped the metadata, so the devirtualized shape fell through
    to a broken gpufn_aget helper call (qlinear-k) while the typed shape
    emitted x[i] (decoder-gpu)."
-  (:require [clojure.string :as str]
+  (:require [clojure.walk :as walk]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.kernel-abi :as kabi]
@@ -15,7 +16,9 @@
             [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
+            [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
@@ -27,7 +30,194 @@
             [raster.compiler.passes.parallel.segstencil-body :as segstencil-body]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
-            [raster.compiler.backend.gpu.segop-opencl :as sg]))
+            [raster.compiler.backend.gpu.segop-opencl :as sg]
+            [raster.compiler.backend.gpu.kernel-body-opencl :as scalar-emitter]
+            [raster.gpu.core :as gpu]))
+
+(defn- affine-operation []
+  (segop/->SegMap
+   903 (segop/make-seg-space 'row 'n) (segop/->SegLevel :thread :virtual)
+   '(double (clojure.core/* (long row) (long factor)))
+   nil #{} #{'output} #{'factor}
+   (segop/->KernelGrid 1 256 0) :double 'output nil))
+
+(deftest canonical-affine-map-preserves-conditional-product-obligations
+  ;; Same checked flat-index/mask/Long parameter topology as the captured
+  ;; row*nrows, hq*head-dim and row*width bodies; no buffer-capacity inference.
+  (let [operation (affine-operation)
+        options {:scalar-types {'n :long 'factor :long} :array-types {'output :double}}
+        required [{:expression '_n_bound :op :>= :value 0}
+                  {:expression 'factor :op :>= :value 0}
+                  {:expression (klaunch/product '_n_bound 'factor)
+                   :op :<= :value Long/MAX_VALUE}]
+        result (try
+                 {:artifact (sg/generate-scheduled-segmap-kernel
+                              operation :scalar-types (:scalar-types options)
+                              :array-types (:array-types options)
+                              :target-dialect :opencl-portable)}
+                 (catch clojure.lang.ExceptionInfo error {:error (ex-data error)}))]
+    (is (nil? (:error result)) "a checked conditional affine schedule must emit portably")
+    (when-let [artifact (:artifact result)]
+      (is (= required (get-in artifact [:attributes :kernel-body :attributes :required-preconditions])))
+      (is (= required (:preconditions artifact)))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (kart/validate! (assoc artifact :preconditions [])))
+          "retained body authority cannot survive dropped obligations"))))
+
+(deftest conditional-affine-index-proof-follows-the-defining-chain
+  (let [scheduled (segmap-body/schedule
+                   (affine-operation)
+                   {:scalar-types {'n :long 'factor :long} :array-types {'output :double}})
+        checked (:body scheduled)
+        [group lane row] (:indices checked)
+        unsafe (kernel-body/->IndexCompute
+                'overflowing-origin
+                (kernel-body/index-cast
+                 (kernel-body/expression :add
+                                         (kernel-body/expression :mul (:id group) 256)
+                                         (:id lane)) :long :exact))
+        alias (assoc row :expression (kernel-body/index-cast 'overflowing-origin :long :exact))
+        forged (assoc checked :indices [group lane unsafe alias])
+        safe-origin (assoc row :id 'safe-origin)
+        safe-alias (assoc row :expression (kernel-body/index-cast 'safe-origin :long :exact))
+        valid-alias (assoc checked :indices [group lane safe-origin safe-alias])]
+    (is (= checked (kernel-body/validate! checked)))
+    (is (= valid-alias (kernel-body/validate! valid-alias))
+        "an alias preserves an independently proved widened origin")
+    (is (thrown? clojure.lang.ExceptionInfo (kernel-body/validate! forged))
+        "an exact alias cannot erase the earlier Int arithmetic overflow boundary")))
+
+(defn- affine-artifact [target]
+  (sg/generate-scheduled-segmap-kernel
+   (affine-operation) :scalar-types {'n :long 'factor :long}
+   :array-types {'output :double} :target-dialect target))
+
+(defn- affine-arguments [artifact n factor pointer]
+  (mapv (fn [slot]
+          (case (:name slot)
+            output pointer
+            factor {:type :long :value factor}
+            _n_bound {:type :long :value n})) (:abi artifact)))
+
+(defn- affine-graph [artifact]
+  (let [{:keys [abi arguments]} (kgraph/public-interface (:abi artifact) (:arguments artifact))]
+    (kgraph/make
+     {:outputs [(kgraph/buffer 'output :double 'n :device :output)]
+      :scalars [(kgraph/->GraphScalar 'factor :long) (kgraph/->GraphScalar 'n :long)]
+      :abi abi :arguments arguments
+      :nodes [(kgraph/->ScheduledKernel :affine artifact [(kgraph/->ValueUse 'output :write)]
+                                       #{'n 'factor} [])]})))
+
+(deftest conditional-affine-contract-is-closed-through-emission-and-artifacts
+  (doseq [target [:opencl-portable :opencl-intel :cuda :hip]]
+    (let [artifact (affine-artifact target)
+          checked (get-in artifact [:attributes :kernel-body])
+          scheduled (get-in artifact [:attributes :scheduled-kernel-body])
+          conditions (:preconditions artifact)]
+      (is (re-find #"\(long(?: long)?\).*map_group.*\*.*\(long(?: long)?\).*256" (:source artifact))
+          "target source widens before hardware index multiplication")
+      (is (= conditions (:required-preconditions
+                         (scalar-emitter/emit-scalar-module
+                          "affine_module" checked {:target-dialect target}))))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"discards conditional"
+                           (scalar-emitter/emit-scalar-kernel
+                            "affine_raw" checked {:target-dialect target})))
+      (doseq [bad [[] (vec (reverse conditions))
+                   (assoc-in conditions [1 :expression] '_n_bound)]]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (scheduled-body/validate! (assoc scheduled :preconditions bad))))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (kart/validate! (assoc artifact :preconditions bad)))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (kart/validate! (update artifact :arguments #(vec (reverse %))))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (kernel-body/validate! (update checked :attributes dissoc :required-preconditions))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (kernel-body/validate! (assoc checked :operations
+                                                (:operations (first (:operations checked)))))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (kernel-body/validate! (assoc-in checked [:masks 0 :predicates 0 :op] :gte)))))))
+
+(declare emitted-scan-graph)
+
+(deftest conditional-artifacts-reconcile-every-retained-body-authority
+  (let [artifact (affine-artifact :opencl-portable)
+        conditional (get-in artifact [:attributes :kernel-body])
+        unconditional (assoc conditional :operations [] :attributes {})
+        ordinary (sg/generate-scheduled-segmap-kernel
+                  (assoc (affine-operation) :lambda '(double factor))
+                  :scalar-types {'n :long 'factor :long}
+                  :array-types {'output :double} :target-dialect :opencl-portable)]
+    (is (= unconditional (kernel-body/validate! unconditional))
+        "the contradictory preferred body is independently valid, not malformed setup")
+    (is (= artifact (kart/validate! artifact)))
+    (is (empty? (:preconditions ordinary)))
+    (is (= ordinary (kart/validate! ordinary)))
+    (let [scan (get-in (emitted-scan-graph
+                       '(raster.par/scan out acc 0.0 i 64 double (+ acc (aget values i))))
+                      [:nodes 0 :operation])]
+      (is (= "raster.compiler.ir.segop.SegScan"
+             (some-> scan :provenance :scheduled-operation class .getName)))
+      (is (= scan (kart/validate! scan))
+          "ordinary scan keeps its semantic source certificate, not a fabricated body schedule"))
+    (doseq [path [[:attributes :kernel-body]
+                  [:attributes :scheduled-kernel-body :body]
+                  [:provenance :scheduled-operation :body]]]
+      (let [copied (-> artifact (assoc :preconditions []) (assoc-in path unconditional))]
+        (is (thrown? clojure.lang.ExceptionInfo (kart/validate! copied))
+            (str "weaker body must not hide other retained authority: " path))))
+    (doseq [path [[:attributes :kernel-body]
+                  [:attributes :scheduled-kernel-body]
+                  [:provenance :scheduled-operation]]]
+      (is (thrown? clojure.lang.ExceptionInfo (kart/validate! (assoc-in artifact path nil)))
+          (str "conditional transport requires its complete retained authority: " path)))
+    (doseq [path [[:attributes :scheduled-kernel-body]
+                  [:provenance :scheduled-operation]]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (kart/validate! (update-in artifact path assoc :preconditions [])))
+          (str "contradictory schedule conditions cannot choose the weaker certificate: " path))
+      (doseq [wrong [(into {} (get-in artifact path)) (affine-operation) {}]]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (kart/validate! (assoc-in artifact path wrong)))
+            (str "conditional schedule requires its exact record authority: " path))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (kart/validate!
+                  (-> artifact
+                      (assoc-in [:attributes :kernel-body] nil)
+                      (assoc-in [:attributes :scheduled-kernel-body] nil)
+                      (assoc-in [:provenance :scheduled-operation] nil))))
+        "retained scheduled-body markers cannot survive complete body/certificate removal")))
+
+(deftest conditional-affine-checks-actual-scalars-before-direct-or-graph-contact
+  (let [artifact (affine-artifact :opencl-portable)
+        graph (affine-graph artifact)
+        contacts (atom [])
+        sess (atom {:device-id :ocl:0 :session-id :affine-test :closed? false
+                    :buffers {} :allocations {} :kernel-graphs {} :events {}})]
+    (doseq [[n factor] [[2 4294967296] [1 Long/MAX_VALUE] [0 Long/MAX_VALUE] [7 0]]]
+      (is (kcall/validate-preconditions! artifact (affine-arguments artifact n factor nil)))
+      (is (= graph (graph-call/preflight! graph
+                                        {'n {:type :long :value n}
+                                         'factor {:type :long :value factor}}))))
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'rt-resolve)
+       (fn [_ name] (swap! contacts conj name)
+         (throw (ex-info "unexpected native contact" {:reason :unexpected-native-contact})))}
+      (fn []
+        (doseq [[n factor error] [[-1 1 clojure.lang.ExceptionInfo]
+                                  [1 -1 clojure.lang.ExceptionInfo]
+                                  [2 Long/MAX_VALUE ArithmeticException]]]
+          (let [arguments (affine-arguments artifact n factor :missing-pointer)
+                scalars {'n {:type :long :value n} 'factor {:type :long :value factor}}]
+            (is (instance? error (try (gpu/bind-kernel-call! sess :same-key artifact arguments)
+                                      nil (catch Throwable e e))))
+            (is (instance? error (try (gpu/bind-kernel-graph! sess :same-key graph
+                                                            {'output :missing-pointer} scalars)
+                                      nil (catch Throwable e e))))
+            (is (instance? error (try (graph-call/temporary-specs graph scalars)
+                                      nil (catch Throwable e e))))))
+        (is (empty? @contacts) "allocation, view materialization and registration are never contacted")
+        (is (empty? (:kernel-graphs @sess)) "failed rebind does not publish or retire a recording")))))
 
 (deftest portable-map-empty-extent-has-a-masked-valid-launch
   (let [operation (segop/->SegMap
@@ -1040,3 +1230,829 @@
     (is (= :segmap-kernel-body-declined (:reason failure)))
     (is (= :simulated (:missing-rule failure)))
     (is (= :none (:fallback failure)))))
+
+(defn- quotient-neighbour-operation []
+  ;; Complete retained restriction arithmetic: quotient, subtraction-based
+  ;; remainder, doubled coordinates, width product and all four neighbour loads.
+  ;; Width is its actual Long ABI capture; this fixture infers no relation to d.
+  (segop/->SegMap
+   905 (segop/make-seg-space 'flat 'n) (segop/->SegLevel :thread :virtual)
+   '(let [q (quot (long flat) divisor)
+          r (- (long flat) (* q divisor))
+          row2 (* (long 2) q)
+          col2 (* (long 2) r)
+          k (+ (* row2 width) col2)]
+      (* 0.25 (+ (clojure.core/aget fine k)
+                 (clojure.core/aget fine (+ k 1))
+                 (clojure.core/aget fine (+ k width))
+                 (clojure.core/aget fine (+ k width 1)))))
+   {:locals [{:id 'q :dtype :long :init '(quot (long flat) divisor)}
+             {:id 'r :dtype :long :init '(- (long flat) (* q divisor))}
+             {:id 'row2 :dtype :long :init '(* (long 2) q)}
+             {:id 'col2 :dtype :long :init '(* (long 2) r)}
+             {:id 'k :dtype :long :init '(+ (* row2 width) col2)}]
+    :result '(* 0.25 (+ (clojure.core/aget fine k)
+                       (clojure.core/aget fine (+ k 1))
+                       (clojure.core/aget fine (+ k width))
+                       (clojure.core/aget fine (+ k width 1))))}
+   #{'fine} #{'output} #{'divisor 'width}
+   (segop/->KernelGrid 1 256 0) :double 'output nil))
+
+(deftest guarded-quotient-and-complete-neighbour-chain-emit-portably
+  (let [operation (quotient-neighbour-operation)
+        options {:scalar-types {'n :long 'divisor :long 'width :long}
+                 :array-types {'fine :double 'output :double}}
+        scheduled (segmap-body/schedule operation options)
+        checked (:body scheduled)
+        result (try
+                 {:artifact (sg/generate-scheduled-segmap-kernel
+                             operation :scalar-types (:scalar-types options)
+                             :array-types (:array-types options)
+                             :target-dialect :opencl-portable)}
+                 (catch clojure.lang.ExceptionInfo error {:error (ex-data error)}))]
+    (is (= checked (kernel-body/validate! checked))
+        "prerequisite: complete quotient and neighbour chain is checked KernelBody IR")
+    (is (nil? (:error result))
+        (str "the full guarded source must emit with retained conditional obligations: " (:error result)))
+    (when-let [artifact (:artifact result)]
+      (is (seq (:preconditions artifact)))
+      (is (= artifact (kart/validate! artifact))))))
+
+(deftest quotient-neighbour-load-offsets-have-zero-safe-host-obligations
+  (let [artifact (sg/generate-scheduled-segmap-kernel
+                  (quotient-neighbour-operation)
+                  :scalar-types {'n :long 'divisor :long 'width :long}
+                  :array-types {'fine :double 'output :double}
+                  :target-dialect :opencl-portable)
+        arguments (fn [n divisor width]
+                           (mapv (fn [slot]
+                                   (case (:name slot)
+                                     fine ::fine output ::output
+                                     divisor {:type :long :value divisor}
+                                     width {:type :long :value width}
+                                     _n_bound {:type :long :value n})) (:abi artifact)))]
+    (doseq [divisor [Long/MIN_VALUE 0 Long/MAX_VALUE]]
+      (is (kcall/validate-preconditions! artifact (arguments 0 divisor Long/MAX_VALUE))
+          "empty work makes every unused neighbour term zero before checked evaluation"))
+    (is (thrown? ArithmeticException
+                 (kcall/validate-preconditions! artifact (arguments 1 Long/MAX_VALUE Long/MAX_VALUE)))
+        "actual emitted load k+width+1 must reject active overflow even when q=r=k=0")))
+
+(defn- quotient-neighbour-artifact [target]
+  (sg/generate-scheduled-segmap-kernel
+   (quotient-neighbour-operation)
+   :scalar-types {'n :long 'divisor :long 'width :long}
+   :array-types {'fine :double 'output :double} :target-dialect target))
+
+(deftest quotient-address-obligations-are-independent-and-transported
+  (doseq [target [:opencl-portable :opencl-intel :cuda :hip]]
+    (let [artifact (quotient-neighbour-artifact target)
+          checked (get-in artifact [:attributes :kernel-body])
+          scheduled (get-in artifact [:attributes :scheduled-kernel-body])
+          conditions (:preconditions artifact)]
+      (is (= conditions (:required-preconditions
+                         (scalar-emitter/emit-scalar-module
+                          "quotient_module" checked {:target-dialect target}))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (scalar-emitter/emit-scalar-kernel
+                    "quotient_raw" checked {:target-dialect target})))
+      (doseq [index (range (count conditions))]
+        (let [missing (into (subvec conditions 0 index) (subvec conditions (inc index)))]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (kernel-body/validate!
+                        (assoc-in checked [:attributes :required-preconditions] missing)))
+              (str "independent body reconstruction requires intermediate/address condition " index))
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (scheduled-body/validate! (assoc scheduled :preconditions missing))))
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (kart/validate! (assoc artifact :preconditions missing))))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (kernel-body/validate!
+                    (assoc-in checked [:masks 0 :predicates 0 :op] :lte)))
+          "quotient facts require the actual dominating upper-domain mask")
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (kernel-body/validate!
+                    (assoc checked :operations (:operations (first (:operations checked)))))))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (kart/validate! (assoc artifact :arguments (vec (reverse (:arguments artifact))))))))))
+
+(deftest quotient-remainder-requires-the-same-checked-operands
+  (let [original (quotient-neighbour-operation)]
+    (doseq [replacement ['(- (long flat) (* q other-divisor))
+                         '(- other-numerator (* q divisor))]]
+      (let [operation (-> original
+                          (update :scalars into #{'other-divisor 'other-numerator})
+                          (assoc-in [:scalar-region :locals 1 :init] replacement))
+            result (try
+                     (sg/generate-scheduled-segmap-kernel
+                      operation
+                      :scalar-types {'n :long 'divisor :long 'width :long
+                                     'other-divisor :long 'other-numerator :long}
+                      :array-types {'fine :double 'output :double}
+                      :target-dialect :opencl-portable)
+                     nil
+                     (catch clojure.lang.ExceptionInfo error (ex-data error)))]
+        (is (= :kernel-body-index-precondition (:reason result))
+            (str "unrelated Long operands cannot claim quotient correlation: " replacement))))))
+
+(deftest actual-keyword-operand-cannot-overwrite-conditional-index-prefix
+  (let [operation (assoc (quotient-neighbour-operation)
+                         :scalar-region
+                         {:locals [{:id 'q :dtype :long :init '(quot (long flat) divisor)}
+                                   {:id 'one :dtype :long :init '(+ q (long 1))}]
+                          :result '(clojure.core/aget fine (+ q width one))})
+        scheduled (segmap-body/schedule
+                   operation {:scalar-types {'n :long 'divisor :long 'width :long}
+                              :array-types {'fine :double 'output :double}})
+        checked (:body scheduled)
+        computes (filter #(instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                         (tree-seq coll? seq checked))
+        addition (first (filter #(= :+ (get-in % [:expression :op])) computes))
+        id (get-in addition [:result :id])
+        keyword-id :raster.compiler.ir.kernel-body/index-prefix
+        renamed (walk/postwalk
+                 (fn [value]
+                   (cond
+                     (= id value) keyword-id
+                     (and (instance? raster.compiler.ir.kernel_body.IndexCast value)
+                          (= keyword-id (:argument value))
+                          (= :long (:dtype value)) (= :exact (:overflow value)))
+                     (:argument value)
+                     :else value)) checked)
+        original kernel-body/conditional-index-info
+        captured (atom nil)]
+    (is (= checked (kernel-body/validate! checked)) "original checked producer is valid")
+    (is (some? id) "actual typed q+1 producer exists")
+    (with-redefs [kernel-body/conditional-index-info
+                  (fn [expression values]
+                    (when (and (instance? raster.compiler.ir.kernel_body.IndexExpr expression)
+                               (= 3 (count (:arguments expression)))
+                               (get values keyword-id))
+                      (reset! captured [expression values]))
+                    (original expression values))]
+      (try (kernel-body/validate! renamed)
+           (catch clojure.lang.ExceptionInfo error
+             (is (= :kernel-body-index-precondition (:reason (ex-data error)))))))
+    (is (some? @captured) "actual verifier facts at the load include the legal keyword SSA")
+    (let [[coordinate values] @captured
+          info (original coordinate values)
+          conditions (:required-preconditions info)
+          candidate (assoc-in renamed [:attributes :required-preconditions] conditions)
+          bindings (fn [n divisor width]
+                     (fn [id] (case id _n_bound n divisor divisor width width)))]
+      (is (some? info))
+      (is (= candidate (kernel-body/validate! candidate)))
+      (doseq [width [0 1 17]]
+        (is (precondition/check! conditions (bindings 1 1 width))))
+      (is (precondition/check! conditions (bindings 0 Long/MIN_VALUE Long/MAX_VALUE)))
+      (is (thrown? ArithmeticException (Math/addExact Long/MAX_VALUE (long 1))))
+      (is (thrown? ArithmeticException
+                   (precondition/check! conditions (bindings 1 1 Long/MAX_VALUE)))
+          "a legal real keyword identity cannot overwrite the actual overflowing prefix bound"))))
+
+(deftest actual-direct-remainder-neighbour-chain-emits-with-closed-contracts
+  (let [operation (assoc-in (quotient-neighbour-operation)
+                            [:scalar-region :locals 1 :init] '(rem (long flat) divisor))
+        options {:scalar-types {'n :long 'divisor :long 'width :long}
+                 :array-types {'fine :double 'output :double}}
+        scheduled (segmap-body/schedule operation options)
+        result (try
+                 (sg/generate-scheduled-segmap-kernel
+                  operation :scalar-types (:scalar-types options)
+                  :array-types (:array-types options) :target-dialect :opencl-portable)
+                 nil
+                 (catch clojure.lang.ExceptionInfo error (ex-data error)))]
+    (is (= (:body scheduled) (kernel-body/validate! (:body scheduled)))
+        "the actual direct rem topology is checked before the doubled remainder")
+    (is (nil? result) (str "complete direct-rem neighbour emission: " result))))
+
+(deftest guarded-positive-long-decrement-emits-without-global-restriction
+  (let [operation (segop/->SegMap
+                   906 (segop/make-seg-space 'row 'n) (segop/->SegLevel :thread :virtual)
+                   '(if (> left (long 0)) (double (- left (long 1))) 0.0)
+                   nil #{} #{'output} #{'left} (segop/->KernelGrid 1 256 0)
+                   :double 'output nil)
+        options {:scalar-types {'n :long 'left :long} :array-types {'output :double}}
+        scheduled (segmap-body/schedule operation options)
+        result (try
+                 (sg/generate-scheduled-segmap-kernel
+                  operation :scalar-types (:scalar-types options)
+                  :array-types (:array-types options) :target-dialect :opencl-portable)
+                 nil
+                 (catch clojure.lang.ExceptionInfo error (ex-data error)))]
+    (is (= (:body scheduled) (kernel-body/validate! (:body scheduled)))
+        "the valid actual left>0 branch dominates left-1")
+    (is (nil? result) (str "branch-local Long decrement emission: " result))))
+
+(deftest guarded-uniform-long-product-emits-with-actual-abi-contract
+  (let [operation (segop/->SegMap
+                   907 (segop/make-seg-space 'hq 'n) (segop/->SegLevel :thread :virtual)
+                   '(double (* n-kv head-dim)) nil #{} #{'output} #{'n-kv 'head-dim}
+                   (segop/->KernelGrid 1 256 0) :double 'output nil)
+        options {:scalar-types {'n :long 'n-kv :long 'head-dim :long}
+                 :array-types {'output :double}}
+        scheduled (segmap-body/schedule operation options)
+        result (try
+                 (sg/generate-scheduled-segmap-kernel
+                  operation :scalar-types (:scalar-types options)
+                  :array-types (:array-types options) :target-dialect :opencl-portable)
+                 nil
+                 (catch clojure.lang.ExceptionInfo error (ex-data error)))]
+    (is (= (:body scheduled) (kernel-body/validate! (:body scheduled)))
+        "the original attention product uses two actual Long ABI identities")
+    (is (nil? result) (str "active-domain uniform ABI product emission: " result))))
+
+(defn- remaining-product-map [form captures]
+  (segop/->SegMap 908 (segop/make-seg-space 'row 'n)
+                  (segop/->SegLevel :thread :virtual) form nil #{} #{'output}
+                  captures (segop/->KernelGrid 1 256 0) :double 'output nil))
+
+(defn- remaining-product-artifact [operation scalar-types]
+  (sg/generate-scheduled-segmap-kernel operation :scalar-types scalar-types
+                                       :array-types {'output :double 'fine :double}
+                                       :target-dialect :opencl-portable))
+
+(defn- remaining-product-trap [operation scalar-types]
+  (let [scheduled (segmap-body/schedule operation {:scalar-types scalar-types
+                                                  :array-types {'output :double 'fine :double}})]
+    (is (= (:body scheduled) (kernel-body/validate! (:body scheduled)))
+        "negative controls reach checked typed IR before emission")
+    (try (remaining-product-artifact operation scalar-types) nil
+         (catch clojure.lang.ExceptionInfo error (select-keys (ex-data error) [:reason :operation])))))
+
+(deftest positive-comparison-ranges-are-strictly-branch-local
+  (let [types {'n :long 'left :long}
+        artifact (remaining-product-artifact
+                  (remaining-product-map '(if (> left (long 0))
+                                            (double (- left (long 1))) 0.0) #{'left}) types)
+        required (:preconditions artifact)]
+    (doseq [left [Long/MIN_VALUE -1 0 1 Long/MAX_VALUE]]
+      (is (precondition/check! required (fn [id] (case id _n_bound 1 left left)))
+          "negative left remains legal in the unchanged else arm"))
+    (is (not-any? #(= 'left (:expression %)) required)
+        "the comparison supplies lexical range facts, not a host left restriction")
+    (doseq [form ['(if (> left (long 0)) 0.0 (double (- left (long 1))))
+                  '(if (< left (long 0)) (double (- left (long 1))) 0.0)
+                  '(let [x (- left (long 1))] (if (> left (long 0)) (double x) 0.0))
+                  '(+ (if (> left (long 0)) (double (- left (long 1))) 0.0)
+                      (double (- left (long 1))))
+                  '(if (> other (long 0)) (double (- left (long 1))) 0.0)]]
+      (is (= {:reason :kernel-body-c-trap-unsupported :operation :-}
+             (remaining-product-trap
+              (cond-> (remaining-product-map form #{'left 'other})
+                (= 'let (first form))
+                (assoc :scalar-region {:locals [{:id 'x :dtype :long :init (second (second form))}]
+                                       :result (nth form 2)}))
+              (assoc types 'other :long)))))))
+
+(deftest uniform-product-contracts-use-the-actual-active-domain
+  (let [artifact (remaining-product-artifact
+                  (remaining-product-map '(double (* n-kv head-dim)) #{'n-kv 'head-dim})
+                  {'n :long 'n-kv :long 'head-dim :long})
+        required (:preconditions artifact)
+        bindings (fn [n a b] (fn [id] (case id _n_bound n n-kv a head-dim b)))]
+    (doseq [a [Long/MIN_VALUE -1 Long/MAX_VALUE]
+            b [Long/MIN_VALUE -1 Long/MAX_VALUE]]
+      (is (precondition/check! required (bindings 0 a b))))
+    (is (precondition/check! required (bindings 1 Long/MAX_VALUE 1)))
+    (is (precondition/check! required (bindings 1 2147483648 2)))
+    (doseq [[a b] [[Long/MAX_VALUE 2] [Long/MIN_VALUE -1] [-1 1]]]
+      (is (thrown? Exception (precondition/check! required (bindings 1 a b)))
+          "this closed cohort rejects negative factors and actual overflow"))
+    (is (= {:reason :kernel-body-c-trap-unsupported :operation :-}
+           (remaining-product-trap
+            (remaining-product-map '(double (- total (* n-kv head-dim)))
+                                   #{'total 'n-kv 'head-dim})
+            {'n :long 'total :long 'n-kv :long 'head-dim :long}))
+        "product representability cannot certify a separate possibly underflowing subtraction")))
+
+(deftest direct-remainder-retains-divisor-and-address-obligations
+  (let [operation (assoc-in (quotient-neighbour-operation)
+                            [:scalar-region :locals 1 :init] '(rem (long flat) divisor))
+        types {'n :long 'divisor :long 'width :long}
+        artifact (remaining-product-artifact operation types)
+        required (:preconditions artifact)
+        bindings (fn [n d w] (fn [id] (case id _n_bound n divisor d width w)))]
+    (doseq [d [Long/MIN_VALUE 0 Long/MAX_VALUE]]
+      (is (precondition/check! required (bindings 0 d Long/MAX_VALUE))))
+    (doseq [d [0 -1]]
+      (is (thrown? Exception (precondition/check! required (bindings 1 d 0)))))
+    (is (precondition/check! required (bindings 1 Long/MAX_VALUE 0)))
+    (is (thrown? ArithmeticException
+                 (precondition/check! required (bindings 1 Long/MAX_VALUE Long/MAX_VALUE))))
+    (doseq [init ['(rem other divisor)]]
+      (is (= :kernel-body-index-precondition
+             (try (remaining-product-artifact
+                   (-> operation (assoc-in [:scalar-region :locals 1 :init] init)
+                       (update :scalars conj 'other)) (assoc types 'other :long)) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+          "an unrelated numerator cannot inherit the guarded index's range"))
+    (let [separate (remaining-product-artifact
+                    (-> operation (assoc-in [:scalar-region :locals 1 :init] '(rem (long flat) other))
+                        (update :scalars conj 'other)) (assoc types 'other :long))]
+      (is (= separate (kart/validate! separate)))
+      (is (precondition/check! (:preconditions separate)
+                              (fn [id] (case id _n_bound 1 divisor 1 other 1 width 0))))
+      (is (thrown? Exception
+                   (precondition/check! (:preconditions separate)
+                                        (fn [id] (case id _n_bound 1 divisor 1 other 0 width 0))))
+          "general checked addition retains the distinct remainder divisor obligation"))))
+
+
+(deftest remaining-product-proofs-are-reconstructed-at-the-actual-guard
+  (doseq [[operation types]
+          [[(remaining-product-map '(double (* n-kv head-dim)) #{'n-kv 'head-dim})
+            {'n :long 'n-kv :long 'head-dim :long}]
+           [(assoc-in (quotient-neighbour-operation)
+                      [:scalar-region :locals 1 :init] '(rem (long flat) divisor))
+            {'n :long 'divisor :long 'width :long}]]]
+    (let [checked (:body (segmap-body/schedule operation {:scalar-types types
+                                                        :array-types {'output :double 'fine :double}}))
+          unguarded (update checked :operations
+                            (fn [operations]
+                              (vec (mapcat (fn [operation]
+                                             (if (instance? raster.compiler.ir.kernel_body.Guard operation)
+                                               (:operations operation) [operation])) operations))))
+          required (kernel-body/required-preconditions checked)]
+      (is (= checked (kernel-body/validate! checked)))
+      (is (seq required))
+      (is (= :kernel-body-intrinsic-overflow
+             (try (kernel-body/validate! unguarded) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+          "schema-valid operations outside the guard cannot borrow lexical range authority")
+      (doseq [condition required]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (kernel-body/validate!
+                      (assoc-in checked [:attributes :required-preconditions]
+                                (vec (remove #{condition} required)))))
+            "the standalone validator reconstructs each intermediate obligation")))))
+
+(deftest explicit-store-recomposes-the-checked-quotient-and-direct-remainder
+  (let [operation (assoc (remaining-product-map
+                          '(clojure.core/aset output (+ (* q divisor) r) 0.0) #{'divisor})
+                         :out-sym nil
+                         :scalar-region {:locals [{:id 'q :dtype :long :init '(quot (long row) divisor)}
+                                                  {:id 'r :dtype :long :init '(rem (long row) divisor)}]
+                                         :result '(clojure.core/aset output (+ (* q divisor) r) 0.0)})
+        original kernel-body/validate!
+        candidate (atom nil)
+        result (with-redefs [kernel-body/validate!
+                            (fn [& args]
+                              (when (some #(instance? raster.compiler.ir.kernel_body.ScalarStore %)
+                                          (tree-seq coll? seq (first args)))
+                                (reset! candidate (first args)))
+                              (apply original args))]
+                 (try {:artifact (remaining-product-artifact operation {'n :long 'divisor :long})}
+                      (catch clojure.lang.ExceptionInfo error {:error (ex-data error)})))
+        stores (filter #(instance? raster.compiler.ir.kernel_body.ScalarStore %)
+                       (tree-seq coll? seq @candidate))
+        computes (filter #(instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                         (tree-seq coll? seq @candidate))]
+    (is (= 1 (count stores)) "the normal route retains the actual explicit destination Store")
+    (is (= #{:quot :rem} (set (keep #(when (contains? #{:quot :rem} (get-in % [:expression :op]))
+                                      (get-in % [:expression :op])) computes)))
+        "both actual typed source definitions precede the Store")
+    (is (nil? (:error result)) (str "the correlated Store must validate and emit: " (:error result)))))
+
+(deftest explicit-store-addresses-collect-nonrecomposition-obligations
+  (let [operation (-> (quotient-neighbour-operation)
+                      (assoc :out-sym nil)
+                      (assoc-in [:scalar-region :locals 1 :init] '(rem (long flat) divisor))
+                      (assoc-in [:scalar-region :result]
+                                '(clojure.core/aset output (+ k width 1) 0.0)))
+        artifact (remaining-product-artifact operation {'n :long 'divisor :long 'width :long})
+        bindings (fn [n d w] (fn [id] (case id _n_bound n divisor d width w)))]
+    (is (= artifact (kart/validate! artifact)))
+    (is (precondition/check! (:preconditions artifact) (bindings 0 Long/MIN_VALUE Long/MAX_VALUE)))
+    (is (precondition/check! (:preconditions artifact) (bindings 1 Long/MAX_VALUE 0)))
+    (is (thrown? ArithmeticException
+                 (precondition/check! (:preconditions artifact)
+                                      (bindings 1 Long/MAX_VALUE Long/MAX_VALUE)))
+        "the actual destination +width+1 obligation rejects active overflow")))
+
+(defn- remainder-distance-fold-operation []
+  (assoc (remaining-product-map nil #{'divisor})
+         :scalar-region
+         {:locals [{:id 'r :dtype :long :init '(rem (long row) divisor)}]
+          :result '(fold {:accumulator acc :index i :identity 0.0 :lower 0
+                          :extent divisor :dtype :double :association :ordered}
+                         (lambda [acc i] (region [] [(+ acc (double (- r i)))])))}))
+
+(defn- uniform-stride-effect-loop-operation []
+  (assoc (remaining-product-map nil #{'cache-len 'n-kv 'head-dim}) :out-sym nil
+         :scalar-region
+         {:locals [{:id 'stride :dtype :long :init '(* n-kv head-dim)}]
+          :effects [{:loop {:index 't :lower 0 :extent 'cache-len :upper-bound :exclusive
+                            :carries []
+                            :locals [{:id 'offset :dtype :long :init '(* t stride)}]
+                            :effects [{:destination 'output :destination-index 'offset
+                                       :value 0.0 :predicate 1 :conflict {:kind :unique}}]}}]}))
+
+(deftest canonical-long-fold-distance-retains-entered-body-bounds
+  (let [operation (remainder-distance-fold-operation)
+        types {'n :long 'divisor :long}
+        scheduled (segmap-body/schedule operation {:scalar-types types :array-types {'output :double}})
+        loops (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                      (tree-seq coll? seq (:body scheduled)))
+        result (try (remaining-product-artifact operation types) nil
+                    (catch clojure.lang.ExceptionInfo error (ex-data error)))]
+    (is (= (:body scheduled) (kernel-body/validate! (:body scheduled))))
+    (is (= [[:long 1 :ordered]]
+           (mapv #(vector (get-in % [:index :type]) (:step %) (get-in % [:attributes :association])) loops))
+        "the actual ordered Fold is a canonical Long exclusive step-one ForLoop")
+    (is (nil? result) (str "the signed remainder-minus-entered-index distance must emit: " result))))
+
+(deftest canonical-long-effect-loop-multiplies-the-checked-uniform-stride
+  (let [operation (uniform-stride-effect-loop-operation)
+        types {'n :long 'cache-len :long 'n-kv :long 'head-dim :long}
+        scheduled (segmap-body/schedule operation {:scalar-types types :array-types {'output :double}})
+        loops (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                      (tree-seq coll? seq (:body scheduled)))
+        result (try (remaining-product-artifact operation types) nil
+                    (catch clojure.lang.ExceptionInfo error (ex-data error)))]
+    (is (= (:body scheduled) (kernel-body/validate! (:body scheduled))))
+    (is (= [[:long 1 :ordered]]
+           (mapv #(vector (get-in % [:index :type]) (:step %) (get-in % [:attributes :association])) loops))
+        "the actual effect local multiplies a real canonical entered loop index")
+    (is (nil? result) (str "loop-index times checked ABI stride must emit: " result))))
+
+(defn- complete-attention-address-operation []
+  ;; Retained Long source metadata is the checked IR vocabulary, not a new storage conversion.
+  (let [long-expression (fn [form] (walk/postwalk #(if (seq? %) (with-meta % {:raster.type/tag 'long}) %) form))]
+    (assoc (remaining-product-map nil #{'cache-len 'n-kv 'head-dim 'group})
+           :space (segop/make-seg-space 'hq 'n) :out-sym nil :dtype :float
+           :scalar-region
+           {:locals [{:id 'stride :dtype :long :init (long-expression '(* n-kv head-dim))}
+                     {:id 'head-offset :dtype :long :init (long-expression '(* (quot (long hq) group) head-dim))}]
+            :effects [{:loop {:index 't :lower 0 :extent 'cache-len :upper-bound :exclusive
+                              :carries []
+                              :locals [{:id 'base :dtype :long :init (long-expression '(+ (* t stride) head-offset))}]
+                              :effects [{:loop {:index 'j :lower 0 :extent 'head-dim :upper-bound :exclusive
+                                                :carries []
+                                                :locals [{:id 'address :dtype :long :init (long-expression '(+ base j))}]
+                                                :effects [{:destination 'output :destination-index 'address
+                                                           :value '(float 0.0) :predicate 1
+                                                           :conflict {:kind :unique}}]}}]}}]})))
+
+(deftest complete-attention-address-chain-retains-both-loop-domains
+  (let [operation (complete-attention-address-operation)
+        types {'n :long 'cache-len :long 'n-kv :long 'head-dim :long 'group :long}
+        scheduled (segmap-body/schedule operation {:scalar-types types :array-types {'output :float}})
+        loops (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                      (tree-seq coll? seq (:body scheduled)))
+        stores (filter #(instance? raster.compiler.ir.kernel_body.ScalarStore %)
+                       (tree-seq coll? seq (:body scheduled)))
+        result (try (sg/generate-scheduled-segmap-kernel operation :scalar-types types
+                                                        :array-types {'output :float}
+                                                        :target-dialect :opencl-portable)
+                    nil (catch clojure.lang.ExceptionInfo error (ex-data error)))]
+    (is (= (:body scheduled) (kernel-body/validate! (:body scheduled))))
+    (is (= 2 (count loops)) "outer cache and inner head-dimension loops both remain")
+    (is (= [:long :long] (mapv #(get-in % [:index :type]) loops)))
+    (is (= 1 (count stores)) "the complete address reaches its actual Float destination Store")
+    (is (nil? result) (str "the complete checked attention address chain must emit: " result))))
+
+(defn- recomposition-store-operation [remainder-form captures]
+  (assoc (remaining-product-map nil captures) :out-sym nil
+         :scalar-region
+         {:locals [{:id 'q :dtype :long :init '(quot (long row) divisor)}
+                   {:id 'r :dtype :long :init remainder-form}]
+          :result '(clojure.core/aset output (+ (* q divisor) r) 0.0)}))
+
+(deftest explicit-store-recomposition-keeps-actual-divisor-and-numerator-identities
+  (let [types {'n :long 'divisor :long 'other :long}
+        bindings (fn [n d other] (fn [id] (case id _n_bound n divisor d other other)))
+        same (remaining-product-artifact
+              (recomposition-store-operation '(rem (long row) divisor) #{'divisor}) types)]
+    (is (= same (kart/validate! same)))
+    (is (precondition/check! (:preconditions same) (bindings Long/MAX_VALUE 1 1)))
+    (doseq [remainder ['(rem (long row) other) '(rem other divisor)]]
+      (is (= :kernel-body-index-precondition
+             (try (remaining-product-artifact
+                   (recomposition-store-operation remainder #{'divisor 'other}) types) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+          "distinct actual divisor/numerator identities cannot fall through unresolved address arithmetic"))))
+
+(deftest explicit-store-and-atomic-addresses-retain-independent-obligations
+  (doseq [store ['(clojure.core/aset output (+ k width 1) 0.0)
+                 '(raster.par/atomic-add! output (+ k width 1) 0.0)]]
+    (let [operation (-> (quotient-neighbour-operation)
+                        (assoc :out-sym nil)
+                        (assoc-in [:scalar-region :locals 1 :init] '(rem (long flat) divisor))
+                        (assoc-in [:scalar-region :result] store))
+          types {'n :long 'divisor :long 'width :long}
+          operation (cond-> operation
+                      (= 'raster.par/atomic-add! (first store))
+                      (assoc :write-conflicts {'output {:kind :reduce :operator :+}}
+                             :write-conflict :reduce))
+          scheduled (segmap-body/schedule operation {:scalar-types types
+                                                    :array-types {'output :double 'fine :double}})
+          checked (:body scheduled)
+          required (kernel-body/required-preconditions checked)
+          bindings (fn [n d w] (fn [id] (case id _n_bound n divisor d width w)))
+          destination (filter #(or (instance? raster.compiler.ir.kernel_body.ScalarStore %)
+                                   (instance? raster.compiler.ir.kernel_body.AtomicRMW %))
+                              (tree-seq coll? seq checked))]
+      (is (= checked (kernel-body/validate! checked)))
+      (is (= 1 (count destination)))
+      (is (precondition/check! required (bindings 0 Long/MIN_VALUE Long/MAX_VALUE)))
+      (is (thrown? ArithmeticException
+                   (precondition/check! required (bindings 1 Long/MAX_VALUE Long/MAX_VALUE))))
+      (doseq [condition required]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (kernel-body/validate!
+                      (assoc-in checked [:attributes :required-preconditions]
+                                (vec (remove #{condition} required)))))
+            "the standalone validator reconstructs each destination obligation")))))
+
+(deftest explicit-recomposition-store-requires-its-dominating-active-domain
+  (let [operation (recomposition-store-operation '(rem (long row) divisor) #{'divisor})
+        checked (:body (segmap-body/schedule operation {:scalar-types {'n :long 'divisor :long}
+                                                       :array-types {'output :double}}))
+        unguarded (update checked :operations
+                          (fn [operations]
+                            (vec (mapcat (fn [operation]
+                                           (if (instance? raster.compiler.ir.kernel_body.Guard operation)
+                                             (:operations operation) [operation])) operations))))
+        result (try (kernel-body/validate! unguarded) nil
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))]
+    (is (= checked (kernel-body/validate! checked)))
+    (is (contains? #{:kernel-body-intrinsic-overflow :kernel-body-index-precondition} result)
+        (str "schema-valid Store arithmetic outside the active guard cannot borrow its quotient domain: " result))))
+
+(deftest canonical-loop-facts-require-the-actual-exclusive-zero-step-one-form
+  (let [operation (uniform-stride-effect-loop-operation)
+        types {'n :long 'cache-len :long 'n-kv :long 'head-dim :long}
+        checked (:body (segmap-body/schedule operation {:scalar-types types
+                                                       :array-types {'output :double}}))
+        loop-operation (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                                      (tree-seq coll? seq checked)))
+        upper (:upper loop-operation)
+        upper-info {:type :long :range {:lower Long/MIN_VALUE :upper Long/MAX_VALUE}
+                    :abi-scalar-identity 'cache-len}]
+    (is (= checked (kernel-body/validate! checked)))
+    (is (= 'cache-len (if (instance? raster.compiler.ir.kernel_body.IndexCast upper)
+                        (:argument upper) upper)))
+    (is (= 1 (:step loop-operation)))
+    (is (not= :inclusive (get-in loop-operation [:attributes :upper-bound])))
+    (is (some? (kernel-body/entered-for-loop-info (:lower loop-operation) upper-info 1 :exclusive)))
+    (doseq [[lower step mode] [[1 1 :exclusive] [0 2 :exclusive] [0 1 :inclusive]]]
+      (is (nil? (kernel-body/entered-for-loop-info lower upper-info step mode))
+          "noncanonical loops cannot acquire the entered-zero-origin proof"))))
+
+(deftest empty-inner-loops-preserve-evaluated-prefix-contracts
+  (let [artifact (remaining-product-artifact
+                  (uniform-stride-effect-loop-operation)
+                  {'n :long 'cache-len :long 'n-kv :long 'head-dim :long})
+        required (:preconditions artifact)
+        bindings (fn [n cache a b]
+                   (fn [id] (case id _n_bound n cache-len cache n-kv a head-dim b)))]
+    (doseq [cache [Long/MIN_VALUE 0 Long/MAX_VALUE]]
+      (is (precondition/check! required (bindings 0 cache Long/MIN_VALUE Long/MAX_VALUE))))
+    (doseq [cache [Long/MIN_VALUE 0 1 2]]
+      (is (precondition/check! required (bindings 1 cache Long/MAX_VALUE 1))))
+    (doseq [cache [Long/MIN_VALUE 0]]
+      (is (thrown? ArithmeticException
+                   (precondition/check! required (bindings 1 cache Long/MAX_VALUE 2)))
+          "the stride executes before the empty inner loop"))
+    (is (thrown? ArithmeticException
+                 (precondition/check! required (bindings 1 3 Long/MAX_VALUE 1))))))
+
+(deftest complete-attention-sums-check-combined-bounds-and-evaluation-order
+  (let [artifact (sg/generate-scheduled-segmap-kernel
+                  (complete-attention-address-operation)
+                  :scalar-types {'n :long 'cache-len :long 'n-kv :long 'head-dim :long 'group :long}
+                  :array-types {'output :float} :target-dialect :opencl-portable)
+        required (:preconditions artifact)
+        bindings (fn [n cache kv dim group]
+                   (fn [id] (case id _n_bound n cache-len cache n-kv kv head-dim dim group group)))]
+    (is (= artifact (kart/validate! artifact)))
+    (is (precondition/check! required (bindings 0 Long/MAX_VALUE Long/MIN_VALUE Long/MAX_VALUE Long/MIN_VALUE)))
+    (is (precondition/check! required (bindings 2 1 1 1 1)))
+    (is (thrown? ArithmeticException
+                 (precondition/check! required (bindings 2 2 1 Long/MAX_VALUE 1)))
+        "each head/loop product fits while their actual sum overflows")
+    (is (thrown? ArithmeticException
+                 (precondition/check! required (bindings 1 0 Long/MAX_VALUE 2 1)))
+        "an unentered cache loop cannot erase the already evaluated stride product")))
+
+(deftest canonical-loop-authority-is-reconstructed-from-the-actual-for-loop
+  (let [operation (uniform-stride-effect-loop-operation)
+        types {'n :long 'cache-len :long 'n-kv :long 'head-dim :long}
+        checked (:body (segmap-body/schedule operation {:scalar-types types
+                                                       :array-types {'output :double}}))
+        checked (update checked :parameters conj
+                        (assoc (first (filter #(= 'cache-len (:id %)) (:parameters checked))) :id 'other))
+        mutations [(fn [loop-operation]
+                     (assoc loop-operation :lower (kernel-body/->IndexCast 'other :long :exact)))
+                   (fn [loop-operation] (assoc loop-operation :step 2))
+                   (fn [loop-operation] (assoc-in loop-operation [:attributes :upper-bound] :inclusive))]]
+    (is (= checked (kernel-body/validate! checked)))
+    (doseq [mutate mutations]
+      (let [candidate (walk/postwalk
+                       #(if (instance? raster.compiler.ir.kernel_body.ForLoop %) (mutate %) %)
+                       checked)
+            result (try (kernel-body/validate! candidate) nil
+                        (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))]
+        (is (= :kernel-body-intrinsic-overflow result)
+            (str "a schema-valid noncanonical loop cannot retain the old multiplication proof: " result))))))
+
+(deftest quotient-address-ancestry-survives-checked-aliases-and-backedges
+  (let [operation (recomposition-store-operation '(rem (long row) divisor) #{'divisor})
+        checked (:body (segmap-body/schedule operation {:scalar-types {'n :long 'divisor :long}
+                                                       :array-types {'output :double}}))
+        q (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                               (= :quot (get-in % [:expression :op]))) (tree-seq coll? seq checked)))
+        q-id (get-in q [:result :id])
+        with-alias (walk/postwalk
+                    (fn [node]
+                      (if (instance? raster.compiler.ir.kernel_body.Guard node)
+                        (update node :operations
+                                #(vec (mapcat (fn [op]
+                                                (if (= op q)
+                                                  [op (kernel-body/->ScalarCompute
+                                                       (kernel-body/value 'checked-q-alias :long)
+                                                       (kernel-body/scalar-expression :cast :long [q-id]
+                                                                                      {:rounding :exact :overflow :exact}))
+                                                   (kernel-body/->IndexCompute 'checked-q-index
+                                                                               (kernel-body/->IndexCast 'checked-q-alias :long :exact))]
+                                                  [(if (instance? raster.compiler.ir.kernel_body.ScalarStore op)
+                                                     (update op :coordinates
+                                                             (partial walk/postwalk-replace {q-id 'checked-q-index})) op)])) %))) node)) checked)
+        unguarded (update with-alias :operations
+                          #(vec (mapcat (fn [op]
+                                          (if (instance? raster.compiler.ir.kernel_body.Guard op)
+                                            (:operations op) [op])) %)))
+        loop-body (fn [upper carry-result coordinate]
+                    (kernel-body/->ForLoop
+                     (kernel-body/value 'ancestry-loop-index :long)
+                     (kernel-body/->IndexCast 0 :long :exact)
+                     (kernel-body/->IndexCast upper :long :exact) 1
+                     [(kernel-body/->LoopArg (kernel-body/value 'first-carry :long)
+                                             (kernel-body/literal 0 :long))
+                      (kernel-body/->LoopArg (kernel-body/value 'second-carry :long)
+                                             (kernel-body/literal 0 :long))]
+                     [(kernel-body/->ScalarStore 'output [coordinate]
+                                                (kernel-body/literal 0.0 :double) :map-active)
+                      (kernel-body/->Yield [carry-result 'first-carry])]
+                     [(kernel-body/value 'first-loop-result :long)
+                      (kernel-body/value 'second-loop-result :long)]
+                     {:association :ordered :source-order true}))
+        replace-store (fn [replacement]
+                        (walk/postwalk #(if (instance? raster.compiler.ir.kernel_body.ScalarStore %) replacement %)
+                                       checked))
+        ordinary (replace-store (loop-body 3 'first-carry 'second-carry))
+        later (replace-store (loop-body 3 q-id
+                                       (kernel-body/->IndexExpr :mul ['second-carry
+                                                                    (kernel-body/->IndexCast 'divisor :long :exact)])))]
+    (is (= checked (kernel-body/validate! checked)))
+    (is (= with-alias (kernel-body/validate! with-alias))
+        "exact ScalarExpr and IndexCompute aliases preserve the checked quotient relation")
+    (is (= :kernel-body-index-precondition
+           (try (kernel-body/validate! unguarded) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (is (= ordinary (kernel-body/validate! ordinary))
+        "ordinary no-quotient carries retain the existing checked address route")
+    (is (= :kernel-body-index-precondition
+           (try (kernel-body/validate! later) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        "a second carry becomes quotient-derived only on a later backedge and cannot escape closure")
+    (let [zero-trip (replace-store (loop-body 0 q-id 'second-carry))]
+      (is (= zero-trip (kernel-body/validate! zero-trip))
+          "zero-trip carry results still retain their initial type/storage contracts"))))
+
+
+(deftest signed-donor-coordinate-with-unit-remainder-has-an-ordinary-proof
+  (let [operation (assoc (remaining-product-map nil #{'i})
+                         :inputs #{'donors 'fine}
+                         :scalar-region
+                         {:locals [{:id 'donor :dtype :int :init '(aget donors row)}
+                                   {:id 'r :dtype :long :init '(rem i (long 1))}]
+                          :result '(aget fine (+ (* (long donor) (long 1)) r))})
+        result (try
+                 {:artifact (sg/generate-scheduled-segmap-kernel
+                             operation :scalar-types {'n :long 'i :long}
+                             :array-types {'donors :int 'fine :double 'output :double}
+                             :target-dialect :opencl-portable)}
+                 (catch clojure.lang.ExceptionInfo error {:error (ex-data error)}))]
+    (is (nil? (:error result))
+        (str "signed Int32 donor plus rem(signed Long,1) must retain the ordinary address proof: " (:error result)))))
+
+(defn- nested-causal-attention-address-operation []
+  (let [long-expression (fn [form] (walk/postwalk #(if (seq? %) (with-meta % {:raster.type/tag 'long}) %) form))]
+    (assoc (remaining-product-map nil #{'ss 'seq-len 'slab 'head-dim})
+           :space (segop/make-seg-space 't 'n) :inputs #{'query 'key}
+           :scalar-region
+           {:locals [{:id 'q1 :dtype :long :init (long-expression '(quot (long t) ss))}
+                     {:id 'r1 :dtype :long :init (long-expression '(rem (long t) ss))}
+                     {:id 'q2 :dtype :long :init (long-expression '(quot r1 seq-len))}
+                     {:id 'r2 :dtype :long :init (long-expression '(rem r1 seq-len))}
+                     {:id 'batch :dtype :long :init (long-expression '(* q1 slab))}
+                     {:id 'qbase :dtype :long :init (long-expression '(+ batch (* q2 head-dim)))}
+                     {:id 'kbase :dtype :long :init (long-expression '(+ batch (* r2 head-dim)))}]
+            :result '(if (<= r2 q2)
+                       (fold {:accumulator acc :index j :identity 0.0 :lower 0
+                              :extent head-dim :dtype :double :association :ordered}
+                             (lambda [acc j]
+                               (region [] [(+ acc (* (aget query (+ qbase j))
+                                                    (aget key (+ kbase j))))])))
+                       0.0)})))
+
+(deftest nested-causal-attention-address-retains-the-actual-nested-numerator
+  (let [operation (nested-causal-attention-address-operation)
+        result (try
+                 {:artifact (sg/generate-scheduled-segmap-kernel
+                             operation :scalar-types {'n :long 'ss :long 'seq-len :long 'slab :long 'head-dim :long}
+                             :array-types {'query :double 'key :double 'output :double}
+                             :target-dialect :opencl-portable)}
+                 (catch clojure.lang.ExceptionInfo error {:error (ex-data error)}))]
+    (is (nil? (:error result))
+        (str "the complete nested causal q/r, products, ordered loop and load coordinates must emit: " (:error result)))))
+
+
+(deftest nested-causal-address-contract-retains-evaluated-prefix-and-empty-activation
+  (let [operation (nested-causal-attention-address-operation)
+        types {'n :long 'ss :long 'seq-len :long 'slab :long 'head-dim :long}
+        options {:scalar-types types :array-types {'query :double 'key :double 'output :double}}
+        scheduled (segmap-body/schedule operation options)
+        artifact (sg/generate-scheduled-segmap-kernel operation
+                   :scalar-types types :array-types (:array-types options) :target-dialect :opencl-portable)
+        loads (filter #(instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                      (tree-seq coll? seq (:body scheduled)))
+        computes (filter #(instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                         (tree-seq coll? seq (:body scheduled)))
+        bindings (fn [n ss seq-len slab hd]
+                   (fn [id] (case id _n_bound n ss ss seq-len seq-len slab slab head-dim hd)))]
+    (is (= (:body scheduled) (kernel-body/validate! (:body scheduled))))
+    (is (= #{'query 'key} (set (map :buffer loads))))
+    (is (= 4 (count (filter #(contains? #{:quot :rem} (get-in % [:expression :op])) computes))))
+    (is (precondition/check! (:preconditions artifact)
+                            (bindings 0 Long/MIN_VALUE Long/MIN_VALUE Long/MAX_VALUE Long/MAX_VALUE)))
+    (is (precondition/check! (:preconditions artifact) (bindings 4 4 2 8 2)))
+    (doseq [tuple [[1 1 0 0 0] [1 1 -1 0 0] [4 4 2 8 Long/MAX_VALUE]]]
+      (is (thrown? Exception
+                   (precondition/check! (:preconditions artifact) (apply bindings tuple)))
+          "the actual nested divisor and all evaluated products remain checked even before an empty inner loop"))))
+
+
+(deftest nested-causal-raw-ordered-loop-collects-the-final-load-obligation
+  (let [operation (assoc-in (nested-causal-attention-address-operation)
+                            [:scalar-region :result]
+                            '(if (<= r2 q2)
+                               (loop [j 0 acc 0.0]
+                                 (if (< j head-dim)
+                                   (recur (inc j) (+ acc (* (aget query (+ qbase j))
+                                                           (aget key (+ kbase j)))))
+                                   acc))
+                               0.0))
+        types {'n :long 'ss :long 'seq-len :long 'slab :long 'head-dim :long}
+        scheduled (segmap-body/schedule operation {:scalar-types types
+                                                  :array-types {'query :double 'key :double 'output :double}})
+        loads (filter #(instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                      (tree-seq coll? seq (:body scheduled)))
+        artifact (sg/generate-scheduled-segmap-kernel operation :scalar-types types
+                   :array-types {'query :double 'key :double 'output :double}
+                   :target-dialect :opencl-portable)]
+    (is (= #{'query 'key} (set (map :buffer loads))))
+    (is (= (:body scheduled) (kernel-body/validate! (:body scheduled))))
+    (is (seq (:preconditions artifact)))
+    (is (thrown? Exception
+                 (precondition/check! (:preconditions artifact)
+                   (fn [id] (case id _n_bound 4 ss 4 seq-len 2 slab 8 head-dim Long/MAX_VALUE)))))))
+
+
+(deftest nested-recomposition-keeps-inner-numerator-and-divisor-identities
+  (let [base (-> (nested-causal-attention-address-operation)
+                 (assoc :inputs #{'fine})
+                 (update-in [:scalar-region :locals] #(vec (take 4 %)))
+                 (assoc-in [:scalar-region :result] '(aget fine (+ (* q2 seq-len) r2))))
+        types {'n :long 'ss :long 'seq-len :long 'slab :long 'head-dim :long 'other :long}
+        positive (remaining-product-artifact base types)]
+    (is (= positive (kart/validate! positive)))
+    (doseq [r2 ['(rem r1 other) '(rem q1 seq-len)]]
+      (let [different (-> base
+                          (update :scalars conj 'other)
+                          (assoc-in [:scalar-region :locals 3 :init] r2))]
+        (is (= :kernel-body-index-precondition
+               (try (remaining-product-artifact different types) nil
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+            "an unrelated actual nested numerator/divisor cannot inherit the exact recomposition relation")))))
+
+
+(deftest broad-valid-overflow-proof-does-not-erase-the-static-read-domain
+  (let [graph (capacity-fixture/inferred-graph '(let* [k (+ i j)] (aget a k)))
+        operation (get-in graph [:nodes 0 :operation])
+        options {:dtype :float :array-types {'a :float 'C :float}}
+        lowered (segmap-body/lower operation options)
+        proofs (keep #(get-in % [:expression :options :proof])
+                     (filter #(instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                             (tree-seq coll? seq (:kernel-body lowered))))]
+    (is (some #(and (= :typed-scalar-range (:kind %)) (< (:lower %) 0)) proofs)
+        "the actual validated certificate conservatively includes negative values")
+    (is (= {'a 6} (map-reads/static-read-requirements operation options)))
+    (is (= {'a 6} (into {} (map (juxt :id :elements)) (:inputs graph))))
+    (let [indirect (get-in (capacity-fixture/inferred-graph '(aget a (int (aget b j))))
+                          [:nodes 0 :operation])]
+      (is (nil? (map-reads/static-read-requirements
+                 indirect {:dtype :float :array-types {'a :float 'b :float 'C :float}}))
+          "unknown loaded contents cannot supply an input capacity"))))
