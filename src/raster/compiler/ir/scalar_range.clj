@@ -97,6 +97,23 @@
                  (contained-in-dtype? through-exit index-type))
         entry))))
 
+(defn guarded-exclusive-loop-lattice-entry-range
+  "Body-entry interval for the guarded-advance ForLoop contract. A singleton start and
+   static positive stride preserve their lattice; the emitter breaks before an exiting
+   increment could overflow. This proof does not describe an unchecked for-loop increment."
+  [lower upper step index-type]
+  (when (and lower upper (integer? step) (pos? step)
+             (literal step index-type)
+             (= (:lower lower) (:upper lower))
+             (contained-in-dtype? lower index-type)
+             (contained-in-dtype? upper index-type)
+             (< (:lower lower) (:upper upper)))
+    (let [start (bigint (:lower lower))
+          last-limit (dec (bigint (:upper upper)))
+          last-entry (+' start (*' (quot (-' last-limit start) step) step))
+          result {:lower start :upper last-entry}]
+      (when (contained-in-dtype? result index-type) result))))
+
 (defn accumulation-prefixes
   "Enclose every prefix of up to `count` additions of values in `term`, starting at `initial`.
    Unknown or nonintegral counts decline; proof arithmetic remains unbounded."

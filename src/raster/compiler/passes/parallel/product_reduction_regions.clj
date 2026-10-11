@@ -46,10 +46,10 @@
               facts))
           (or supplied {}) (take-nth 2 (:bindings region))))
 
-(defn lower
-  "Lower element once and provide a shared combine lowerer with deterministic fresh SSA IDs.
-   The caller supplies its decline mechanism and retained array/scalar/local dtype facts."
-  [segred {:keys [array-types scalar-types element-binding-types combine-binding-types
+(defn- lower-regions
+  "Two internal views of the same typed region: production scalar instructions and
+   original structural reads for independent storage admission."
+  [structural-reads? segred {:keys [array-types scalar-types element-binding-types combine-binding-types
                   axis-substitutions id-prefix]
            :or {axis-substitutions {} id-prefix "product"}} decline!]
   (let [operator (reduction/validate! (:reduction segred))
@@ -77,9 +77,15 @@
                       (index/lower-typed expression (set/union (set (keys index-types)) locals)
                                          index-types :long decline!))
         lowerer (scalar/make-lowerer
-                 {:arrays (set (:inputs segred)) :array-types array-types :scalar-types index-types
-                  :scalar-ranges (cond-> {} column-range (assoc column column-range))
-                  :lower-index lower-index :id-prefix id-prefix :decline! decline!})
+                 (cond-> {:arrays (set (:inputs segred)) :array-types array-types :scalar-types index-types
+                          :scalar-ranges (cond-> {} column-range (assoc column column-range))
+                          :lower-index lower-index
+                          :id-prefix id-prefix :decline! decline!}
+                   ;; Storage admission sees the original typed AxisMap tree. Production
+                   ;; retains actual source checks through the default coordinate adapter.
+                   structural-reads?
+                   (assoc :lower-load-index (fn [_array expression locals]
+                                              (lower-index expression locals)))))
         element-region (-> (reduction/element-region operator)
                            (update :bindings #(util/subst-syms axis-substitutions %))
                            (update :results #(util/subst-syms axis-substitutions %)))
@@ -98,6 +104,12 @@
      :combine combine :lower-index lower-index :index-types index-types
      :axes (conj (mapv (juxt :name :bound) segments) [column width])}))
 
+(defn lower
+  "Lower the exact typed element into production instructions. Storage admission
+   independently derives original structural reads from the same private inputs."
+  [segred options decline!]
+  (lower-regions false segred options decline!))
+
 (defn dense-read-requirements
   "Derive exact flat capacities from verified operand indexing maps, or decline.
 
@@ -108,7 +120,7 @@
    not an independent execution certificate; the segment guard and lane loop establish the active
    domains when the body is scheduled."
   [segred options decline!]
-  (let [{:keys [element combine index-types axes]} (lower segred options decline!)
+  (let [{:keys [element combine index-types axes]} (lower-regions true segred options decline!)
         _ (when (> (count axes) 6)
             (decline! :indexing-map-rank
                       "product indexing-map search is bounded to six semantic axes"

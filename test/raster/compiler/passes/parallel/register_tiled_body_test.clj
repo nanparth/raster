@@ -103,10 +103,12 @@
     (is (= physical-shape (:shape (nth (:parameters kernel) parameter-index))))
     (is (= (if (= variant :nt) 'B 'A) (:buffer load)))
     (is (= (if (= variant :nt)
-             [(body/expression :add 'register-block-col strided)
-              (body/expression :add 'register-k-block contiguous)]
-             [(body/expression :add 'register-k-block strided)
-              (body/expression :add 'register-block-row contiguous)])
+             [(body/expression :add 'register-block-col (body/index-cast strided :long :exact))
+              (body/expression :add (body/index-cast 'register-k-block :long :exact)
+                                   (body/index-cast contiguous :long :exact))]
+             [(body/expression :add (body/index-cast 'register-k-block :long :exact)
+                                   (body/index-cast strided :long :exact))
+              (body/expression :add 'register-block-row (body/index-cast contiguous :long :exact))])
            (:coordinates load)))
     (is (= [contiguous strided] (:coordinates store)))
     (is (= allocation-shape (:shape (nth (:allocations kernel) parameter-index))))
@@ -360,3 +362,64 @@
               conditions)
         "legacy guarded dispatch must retain the impossible condition and fall back")
     (is (not (register-tiled/static-capacity-overflow? [65535 32768 'depth])))))
+
+(deftest generated-register-global-prefixes-widen-before-their-first-multiply
+  (let [checked (:kernel-body (register-tiled/lower (contraction) {:tile register-tiled/default-tile}))
+        definitions (into {} (map (juxt :id :expression))
+                          (filter #(instance? raster.compiler.ir.kernel_body.IndexCompute %) (:indices checked)))
+        evaluate (fn evaluate [node values]
+                   (cond (symbol? node) (get values node)
+                         (integer? node) (bigint node)
+                         (instance? raster.compiler.ir.kernel_body.IndexCast node) (evaluate (:argument node) values)
+                         (instance? raster.compiler.ir.kernel_body.IndexExpr node)
+                         (apply ({:add +' :mul *'} (:op node)) (map #(evaluate % values) (:arguments node)))))
+        geometry (launch/geometry {:workgroup-size [16 16] :group-count [33554433 33554433]})]
+    (doseq [[id group] [['register-block-row 'register-group-row]
+                       ['register-block-col 'register-group-col]]]
+      (let [expression (get definitions id)]
+        (is (= :mul (:op expression)))
+        (is (= 2 (count (:arguments expression))))
+        (is (every? #(and (instance? raster.compiler.ir.kernel_body.IndexCast %)
+                         (= :long (:dtype %)) (= :exact (:overflow %))) (:arguments expression)))
+        (is (= 2147483648N (evaluate expression {group 33554432})))))
+    (is (= checked (body/validate! checked)))
+    (is (= geometry (body/validate-launch-index-ranges! checked geometry)))
+    (is (= :kernel-launch-index-range
+           (try (body/validate-launch-index-ranges! checked
+                  (launch/geometry {:workgroup-size [16 16] :group-count [2147483649 1]})) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (is (every? #(= :int (:type (:index %)))
+                (filter #(and (instance? raster.compiler.ir.kernel_body.ForLoop %)
+                              (not= 'register-k-block (:id (:index %))))
+                        (tree-seq coll? seq checked)))
+        "physical staging and microtile induction widths retain their existing Int contract")))
+
+(deftest long-k-lattice-proof-does-not-certify-overflowing-non-power-of-two-padding
+  (let [error (try
+                (register-tiled/lower
+                 (contraction-with-dimensions 1 1 'depth)
+                 {:tile (assoc small-tile :block-k 3)
+                  :scalar-types {'depth :long}})
+                nil
+                (catch clojure.lang.ExceptionInfo error error))]
+    (is (some? error))
+    (is (= :kernel-body-index-precondition (:reason (ex-data error))))
+    (is (= :add (:op (:expression (ex-data error)))))
+    (is (some #{'register-k-block}
+              (:arguments (:expression (ex-data error)))))))
+
+(deftest symbolic-long-k-global-coordinates-retain-all-physical-permutations
+  (doseq [[variant expression]
+          [[:nn '(* (aget A (+ (* i depth) k)) (aget B (+ (* k 1) j)))]
+           [:tn '(* (aget A (+ (* k 1) i)) (aget B (+ (* k 1) j)))]
+           [:nt '(* (aget A (+ (* i depth) k)) (aget B (+ (* j depth) k)))]]]
+    (let [proof (facts/from-components
+                 {:out 'C :free-axes [['i 1] ['j 1]] :contract-axes [['k 'depth]]
+                  :body expression :opts {:init (float 0.0)} :dtype :float})
+          kernel (:kernel-body (register-tiled/lower proof
+                                 {:tile register-tiled/default-tile
+                                  :scalar-types {'depth :long}}))]
+      (is (= variant (get-in kernel [:schedule :variant])))
+      (is (body/kernel-body? (body/validate! kernel)))
+      (is (str/includes? (body-emit/emit-scalar-kernel (str "long_k_" (name variant)) kernel)
+                         "for (long rstr_register_k_block")))))

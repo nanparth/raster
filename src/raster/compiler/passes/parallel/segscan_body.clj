@@ -30,6 +30,15 @@
   (body/->WorkgroupBarrier
    :workgroup #{:workgroup} :acquire-release (body/full-participation)))
 
+(defn- global-index [value]
+  (body/index-cast value :long :exact))
+
+(defn- global-block-base [workgroup-size]
+  (body/expression :mul (global-index 'scan-group) (global-index workgroup-size)))
+
+(defn- global-scan-index [workgroup-size]
+  (body/expression :add (global-block-base workgroup-size) (global-index 'scan-lane)))
+
 (defn- identity-value
   [value result-type]
   (let [value (if (and (seq? value) (= 2 (count value)) (number? (second value)))
@@ -180,10 +189,11 @@
                   :lower-index lower-index :predicate nil
                   :id-prefix "scan-element" :decline! decline!})
         lowered ((:lower lowerer) expression result-type
-                                    (assoc scalar-types 'scan-index :int))]
+                                    (assoc scalar-types 'scan-index :long))]
     [(body/->ScalarCompute
       (body/value 'scan-element-active :predicate)
-      (body/scalar-expression :lt :predicate ['scan-index '_n_bound]))
+      (body/scalar-expression :lt :predicate
+        ['scan-index (body/cast-expression '_n_bound :long :exact :exact)]))
      (body/->IfRegion
       'scan-element-active
       (conj (vec (:operations lowered)) (body/->Yield [(:result lowered)]))
@@ -200,12 +210,12 @@
         output (first (filter output-ids (map :buffer (:uses context))))
         totals (first (filter temporary-ids (map :buffer (:uses context))))
         result-index (if (= :exclusive scan-mode)
-                       (body/expression :add 'scan-index 1)
+                       (body/expression :add 'scan-index (global-index 1))
                        'scan-index)
         offsets (take-while #(< % workgroup-size) (iterate #(* 2 %) 1))
         masks (vec
                (concat
-                [(body/->Mask :scan-active [(body/predicate :lt 'scan-index '_n_bound)])
+                [(body/->Mask :scan-active [(body/predicate :lt 'scan-index (global-index '_n_bound))])
                  (body/->Mask :scan-lane-zero [(body/predicate :eq 'scan-lane 0)])
                  (body/->Mask :scan-first-lane
                               [(body/predicate :eq 'scan-group 0)
@@ -219,16 +229,14 @@
                    (body/->IndexBinding 'scan-lane :local 0)
                    (body/->IndexCompute
                     'scan-index
-                    (body/expression :add
-                                     (body/expression :mul 'scan-group workgroup-size)
-                                     'scan-lane))]
+                    (global-scan-index workgroup-size))]
                   (when totals
                     [(body/->IndexCompute
-                      'scan-block-base (body/expression :mul 'scan-group workgroup-size))
+                      'scan-block-base (global-block-base workgroup-size))
                      (body/->IndexCompute
                       'scan-valid-count
-                      (body/expression :min workgroup-size
-                                       (body/expression :sub '_n_bound
+                      (body/expression :min (global-index workgroup-size)
+                                       (body/expression :sub (global-index '_n_bound)
                                                         'scan-block-base)))])))
         initial (element-operations operation context)
         stages (scan-stages scratch result-type scan-algebra identity workgroup-size)
@@ -240,7 +248,7 @@
                (when totals
                  [(body/->ScalarLoad
                    (body/value 'scan-block-total result-type) scratch
-                   [(body/expression :sub 'scan-valid-count 1)]
+                   [(body/expression :sub 'scan-valid-count (global-index 1))]
                    :scan-lane-zero identity :cached)
                   (body/->ScalarStore totals ['scan-group] 'scan-block-total :scan-lane-zero)])
                (when (= :exclusive scan-mode)
@@ -385,7 +393,7 @@
         operator (intrinsics/canonical (:combine scan-algebra))
         identity (identity-value (:identity scan-algebra) result-type)
         result-index (if (= :exclusive scan-mode)
-                       (body/expression :add 'scan-index 1)
+                       (body/expression :add 'scan-index (global-index 1))
                        'scan-index)]
     (when-not (and totals output)
       (decline! :carry-buffers
@@ -398,20 +406,18 @@
                 (body/->IndexBinding 'scan-lane :local 0)
                 (body/->IndexCompute
                  'scan-index
-                 (body/expression :add
-                                  (body/expression :mul 'scan-group workgroup-size)
-                                  'scan-lane))
+                 (global-scan-index workgroup-size))
                 (body/->IndexCompute
-                 'scan-block (body/expression :floor-div 'scan-index scan-workgroup))]
-      :masks [(body/->Mask :scan-active [(body/predicate :lt 'scan-index '_n_bound)])
+                 'scan-block (body/expression :floor-div 'scan-index (global-index scan-workgroup)))]
+      :masks [(body/->Mask :scan-active [(body/predicate :lt 'scan-index (global-index '_n_bound))])
               (body/->Mask :scan-has-carry
-                           [(body/predicate :lt 'scan-index '_n_bound)
-                            (body/predicate :lte 1 'scan-block)])]
+                           [(body/predicate :lt 'scan-index (global-index '_n_bound))
+                            (body/predicate :lte (global-index 1) 'scan-block)])]
       :operations [(body/->ScalarLoad (body/value 'scan-current result-type) output
                                       [result-index] :scan-active identity :cached)
                    (body/->ScalarLoad
                     (body/value 'scan-carry result-type) totals
-                    [(body/expression :sub 'scan-block 1)]
+                    [(body/expression :sub 'scan-block (global-index 1))]
                     :scan-has-carry identity :cached)
                    (body/->ScalarCompute
                     (body/value 'scan-with-carry result-type)

@@ -12,6 +12,7 @@
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.compiler.core.intel-block-io :as block-io]))
 
 (defrecord KernelArtifact
@@ -132,8 +133,12 @@
           (when-not (and (seq checked-bodies)
                          (or (not (contains? attributes :scheduled-kernel-body))
                              (scheduled-body? attribute-schedule))
-                         (apply = checked-bodies)
-                         (or (empty? schedules) (apply = schedules))
+                         (every? #(or (identical? (first checked-bodies) %)
+                                      (semantic-fingerprint/equivalent? (first checked-bodies) %))
+                                 (rest checked-bodies))
+                         (every? #(or (identical? (first schedules) %)
+                                      (semantic-fingerprint/equivalent? (first schedules) %))
+                                 (rest schedules))
                          (every? :body schedules))
             (fail-binding!))
           (when (seq required)

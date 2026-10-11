@@ -426,7 +426,7 @@
                      :result-dtype result-dtype})))))
   expression)
 
-(defn lower-element-operations
+(defn- lower-element-operations*
   "Lower a scalar reduction element into typed SSA. coordinate-lower may translate a verified
    source-level flat array index into KernelBody index arithmetic; without it, this retains the
    pointwise full-reduction contract. Mixed scalar arithmetic requires the walker/TypedClojure
@@ -436,15 +436,19 @@
    their own retained facts. Admission remains here; accepted loads, conversions and arithmetic
    over typed child values use the same SSA builder as maps and ordered fold-maps."
   [expression {:keys [index coordinate dtype arrays array-types scalars scalar-types coordinate-lower
-                      lower-load-index
-                      load-predicate load-other declared-result-dtype]}]
+                      lower-load-index element-binding-types
+                      load-predicate load-other declared-result-dtype index-region]}
+   same-id-contraction-projection?]
   (let [dtype (dtype/canon dtype)
         expression (inline-scalar-bindings expression)
         _ (validate-reduction-value-language! expression (some? declared-result-dtype))
         array-types (into {} (map (fn [id] [id (dtype/canon (get array-types id dtype))]))
                           arrays)
-        scalar-types (into {} (map (fn [id] [id (dtype/canon (get scalar-types id dtype))]))
-                           scalars)
+        scalar-types (merge
+                      (into {} (map (fn [id] [id (dtype/canon (get scalar-types id dtype))])) scalars)
+                      ;; These are the region owner's actual generated SSA/loop binders,
+                      ;; distinct from ABI scalars. Final KernelBody validation checks their types.
+                      (into {} (map (fn [[id type]] [id (dtype/canon type)])) element-binding-types))
         lower-coordinate
         (fn [source-coordinate _]
           (let [source-coordinate (strip-index-cast source-coordinate)
@@ -478,10 +482,12 @@
                   ;; Only this adapter's already-approved coordinates reach KernelBody.
                   :lower-index lower-coordinate
                   :lower-load-index
-                  (fn [array source-coordinate scope]
-                    (or (when lower-load-index
-                          (lower-load-index array source-coordinate scope))
-                        (lower-coordinate source-coordinate scope)))
+                  (when-not same-id-contraction-projection?
+                    ;; Generic reduction owners keep their storage and source-ID rewrites.
+                    (fn [array source-coordinate scope]
+                      (or (when lower-load-index
+                            (lower-load-index array source-coordinate scope))
+                          (lower-coordinate source-coordinate scope))))
                   :predicate load-predicate
                   :load-other (fn [storage-dtype]
                                 (if load-other
@@ -493,13 +499,32 @@
                                 (source-value-dtype expression)
                                 (some-> declared-result-dtype dtype/canon)
                                 dtype)
-        lowered ((:lower lowerer) expression source-result-dtype scalar-types)]
+        lower-source #((:lower lowerer) expression source-result-dtype scalar-types)
+        lowered (if index-region
+                  ((:with-index-region lowerer) index-region lower-source)
+                  (lower-source))]
     (when-not (= dtype (:type lowered))
       (decline! :element-result-dtype
                 "KernelBody reduction element must match its certified accumulator dtype"
                 {:expression expression :element-dtype (:type lowered)
                  :accumulator-dtype dtype}))
-    {:operations (:operations lowered) :result (:result lowered)}))
+    {:operations (:operations lowered) :result (:result lowered)
+     :required-preconditions ((:required-preconditions lowerer))}))
+(defn lower-element-operations
+  "Lower with the reduction owner's original coordinate/storage adapter."
+  [expression options]
+  (lower-element-operations* expression options false))
+
+(defn lower-contraction-element-operations
+  "Internal contraction entry: its coordinate owner preserves the actual source IDs.
+   This selects source materialization, never supplies an arithmetic proof."
+  [expression options]
+  (when (or (:lower-load-index options)
+            (not= (:index options) (:coordinate options)))
+    (throw (ex-info "same-ID contraction lowering cannot replace a storage/rebinding owner"
+                    {:reason :raster/bug})))
+  (lower-element-operations* expression options true))
+
 (defn lower
   "Lower an eligible scalar SegRed to one verified portable workgroup-tree KernelBody.
 
@@ -677,7 +702,9 @@
                     ;; equal Integer/MAX_VALUE; inactive final-group lanes must not overflow while
                     ;; merely forming the coordinate that the loop predicate excludes.
                     (body/->IndexCompute
-                     'wide-bound (body/index-cast '_n_bound :long :exact))
+                     'wide-bound (body/expression :max
+                                 (body/index-cast '_n_bound :long :exact)
+                                 (body/index-cast 0 :long :exact)))
                     (body/->IndexCompute
                      'wide-group-index (body/index-cast 'group-index :long :exact))
                     (body/->IndexCompute

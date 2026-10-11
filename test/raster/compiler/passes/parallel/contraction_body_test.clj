@@ -71,6 +71,13 @@
                   (catch clojure.lang.ExceptionInfo exception
                     (:reason (ex-data exception)))))))
     (when dynamic?
+      (let [weakened (-> portable (assoc :preconditions [])
+                         (assoc-in [:body :attributes :required-preconditions] []))]
+        (is (= :kernel-body-index-precondition
+               (try (complete-write weakened)
+                    :accepted
+                    (catch clojure.lang.ExceptionInfo exception (:reason (ex-data exception)))))
+            "joint contract deletion rejects during independent address validation"))
       (is (nil? (complete-write (assoc register :preconditions []))))
       (let [narrow-body (:kernel-body
                          (register-tiled/lower verified
@@ -121,11 +128,11 @@
         parameters (into {} (map (juxt :id identity)) (:parameters kernel))]
     (is (= :kernel-body (artifact/emission-route (:artifact routed))))
     (is (= :segmap (:strategy routed)))
-    (is (= '[4] (:shape (parameters 'a))))
-    (is (= '[3] (:shape (parameters 'b))))
+    (is (= [(body/index-cast 4 :long :exact)] (:shape (parameters 'a))))
+    (is (= [(body/index-cast 3 :long :exact)] (:shape (parameters 'b))))
     (is (= :independent-segments (get-in kernel [:schedule :strategy])))
     (is (not-any? #(instance? raster.compiler.ir.kernel_body.ForLoop %)
-                  (:operations kernel)))
+                  (tree-seq coll? seq (:operations kernel))))
     (doseq [dialect [:opencl-intel :cuda :hip]]
       (is (string? (:source (emit/generate-contraction-kernel-body
                             kernel :target-dialect dialect)))))))
@@ -182,7 +189,8 @@
                :scalar-types {'m :long 'k :int 'scale :float}})
         kernel (:body plan)
         parameters (into {} (map (juxt :id :dtype)) (:parameters kernel))
-        loop (first (:operations kernel))]
+        work (get-in kernel [:operations 1 :then-operations])
+        loop (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %) work))]
     (is (:ok plan))
     (is (= kernel (body/validate! kernel)))
     (is (= :float (get parameters 'x)))
@@ -245,7 +253,8 @@
 (deftest portable-contraction-is-a-complete-scheduled-kernel-body
   (let [plan (portable-plan)
         kernel (:body plan)
-        loop (first (:operations kernel))]
+        work (get-in kernel [:operations 1 :then-operations])
+        loop (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %) work))]
     (is (:ok plan))
     (is (body/kernel-body? kernel))
     (is (= :sequential-segments (get-in kernel [:schedule :strategy])))
@@ -256,12 +265,13 @@
     (is (= '[A x y k m _nseg] (mapv :id (:parameters kernel))))
     (is (= [:input :input :output :scalar :scalar :scalar]
            (mapv :kind (:parameters kernel))))
-    (is (= 'i (:id (last (:indices kernel))))
-        "the free output coordinate is decomposed from the flat segment index")
+    (is (instance? raster.compiler.ir.kernel_body.IfRegion (get-in kernel [:operations 1])))
+    (is (= 'i (:id (first work)))
+        "the free output coordinate is reconstructed inside the actual active branch")
     (is (= 'l (get-in loop [:index :id])))
     (is (= 'k (:upper loop)))
     (is (= 1 (:step loop)))
-    (is (= :active-segment (:predicate (last (:operations kernel)))))))
+    (is (= :active-segment (:predicate (last (butlast work)))))))
 
 (deftest one-portable-body-emits-through-every-c-family-dialect
   (let [kernel (:body (portable-plan))]
@@ -281,8 +291,8 @@
 (deftest portable-result-transform-is-typed-scalar-ssa-on-every-c-family-target
   (let [plan (portable-result-transform-plan)
         kernel (:body plan)
-        operations (:operations kernel)
-        epilogue-operations (subvec operations 1 (dec (count operations)))
+        operations (vec (butlast (get-in kernel [:operations 1 :then-operations])))
+        epilogue-operations (subvec operations 3 (dec (count operations)))
         classes (mapv #(some-> % class .getSimpleName) epilogue-operations)]
     (is (:ok plan))
     (is (= '[A B C bias scale _nseg] (mapv :id (:parameters kernel))))
@@ -328,8 +338,8 @@
                                                          (raster.math/exp
                                                           (raster.numeric/* -1.0 x))))))
           kernel (:body plan)
-          operations (:operations kernel)
-          epilogue-operations (subvec operations 1 (dec (count operations)))
+          operations (vec (butlast (get-in kernel [:operations 1 :then-operations])))
+          epilogue-operations (subvec operations 3 (dec (count operations)))
           operators (keep #(get-in % [:expression :op]) epilogue-operations)]
       (is (:ok plan))
       ;; widen acc, load bias, x = acc + bias, -1*x, exp, 1+exp, x/(1+exp), narrow to half
@@ -342,8 +352,8 @@
           (is (= '[bias] (:epilogue-operands emitted)))))))
   (testing "a let binder shadows the accumulator lexically"
     (let [plan (let-epilogue-plan '(let [acc (raster.numeric/* acc 2.0)] acc))
-          operations (:operations (:body plan))
-          epilogue-operations (subvec operations 1 (dec (count operations)))]
+          operations (vec (butlast (get-in plan [:body :operations 1 :then-operations])))
+          epilogue-operations (subvec operations 3 (dec (count operations)))]
       (is (:ok plan))
       ;; widen acc, multiply, narrow to half
       (is (= 3 (count epilogue-operations))))))
@@ -475,3 +485,230 @@
     (is (= [[:dpas :epilogue-reads-destination]]
            (mapv (juxt :leaf :reason) (:declines routed))))
     (is (= :inout (:kind (first (filter #(= 'C (:name %)) (:abi routed))))))))
+
+(deftest sequential-axis-divisions-execute-only-in-the-real-active-branch
+  (let [form '(raster.par/contract C [[i m] [j n]] [[l k]]
+                (* (aget A (+ (* i k) l)) (aget B (+ (* l n) j))))
+        verified (facts/contraction-facts form :dtype :double)
+        source (lower/contract-form->segred form :dtype :double :facts verified)
+        plan (schedule/plan-portable-body verified source nil
+                                         {:scalar-types {'m :long 'n :long 'k :long}})
+        kernel (:body plan)
+        work (get-in kernel [:operations 1 :then-operations])
+        requirements (body/required-preconditions kernel)
+        check #(raster.compiler.ir.kernel-precondition/check! requirements %)
+        loop (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %) work))]
+    (is (:ok plan))
+    (is (= '[segment-group segment-lane segment-index] (mapv :id (:indices kernel))))
+    (is (instance? raster.compiler.ir.kernel_body.IfRegion (get-in kernel [:operations 1])))
+    (is (= '[i j] (mapv :id (take 2 work))))
+    (is (instance? raster.compiler.ir.kernel_body.ScalarStore (last (butlast work))))
+    (is (zero? (get-in loop [:iter-args 0 :initial :value])))
+    (is (= :double (get-in loop [:iter-args 0 :initial :type])))
+    (is (true? (check {'_nseg 6 'm 2 'n 3 'k 0})))
+    (is (true? (check {'_nseg 0 'm 0 'n Long/MIN_VALUE 'k 0})))
+    (doseq [axis '[m n] value [0 -1 Long/MIN_VALUE]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (check (assoc {'_nseg 6 'm 2 'n 3 'k 0} axis value)))))
+    (doseq [condition requirements]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (body/validate! (assoc-in kernel [:attributes :required-preconditions]
+                                             (vec (remove #{condition} requirements)))))))
+    (let [branch (get-in kernel [:operations 1])
+          false-escape (assoc-in kernel [:operations 1]
+                                 (assoc branch :then-operations (:else-operations branch)
+                                               :else-operations (:then-operations branch)))]
+      (is (thrown? clojure.lang.ExceptionInfo (body/validate! false-escape))))
+    (let [emitted (emit/generate-contraction-kernel-artifact kernel :target-dialect :opencl-intel)]
+      (is (= requirements (:preconditions emitted))))))
+
+(deftest conditional-descriptors-retain-actual-scalar-bindings-and-metadata
+  (let [routed (route/route-contraction matvec :dtype :double :desc {}
+                                       :scalar-types {'m :long 'k :int})
+        descriptor (dissoc routed :artifact :arguments)
+        k-position (first (keep-indexed (fn [i arg] (when (= 'k (:value arg)) i))
+                                         (:scalar-args descriptor)))]
+    (doseq [value [7 '(+ k 1)]]
+      (let [changed (assoc-in descriptor [:scalar-args k-position :value] value)
+            checked (route/validate-descriptor changed)
+            compiled (:artifact checked)
+            bindings (get-in compiled [:attributes :scheduled-kernel-body :scalar-bindings])]
+        (is (= value (:value (first (filter #(= 'k (:parameter %)) bindings)))))
+        (is (= (:arguments checked) (:arguments compiled)))
+        (doseq [field [:strategy :out-elems :dtype :out-dtype :dims :declines]]
+          (is (= (get checked field) (get-in compiled [:attributes field]))))))
+    (let [m-position (first (keep-indexed (fn [i arg] (when (= 'm (:value arg)) i))
+                                         (:scalar-args descriptor)))
+          bound-position (dec (count (:scalar-args descriptor)))
+          incoherent (assoc-in descriptor [:scalar-args m-position :value] 7)
+          coherent (-> incoherent
+                       (assoc-in [:scalar-args bound-position :value] 7)
+                       (assoc :out-elems 7 :grid [1]))]
+      (is (thrown? clojure.lang.ExceptionInfo (route/validate-descriptor incoherent)))
+      (is (= 7 (get-in (route/validate-descriptor coherent) [:artifact :attributes :out-elems]))))
+    (doseq [changed [(assoc descriptor :grid [1])
+                     (assoc descriptor :wg [128])
+                     (assoc descriptor :out-elems 'k)
+                     (update descriptor :source str "\n/* changed module */")]]
+      (is (thrown? clojure.lang.ExceptionInfo (route/validate-descriptor changed))))))
+
+(deftest static-generated-segment-geometry-widens-before-every-prefix
+  (let [form '(raster.par/contract C [[i 4] [j 3]] []
+                (* (aget A i) (aget B j)))
+        verified (facts/contraction-facts form :dtype :double)
+        operation (lower/contract-form->segmap form :dtype :double)
+        plan (schedule/plan-portable-body verified operation nil {})
+        kernel (:body plan)
+        expression (:expression (last (:indices kernel)))
+        casts (filter #(instance? raster.compiler.ir.kernel_body.IndexCast %)
+                      (tree-seq coll? seq expression))]
+    (is (:ok plan))
+    (is (= :add (:op expression)))
+    (is (= 3 (count casts)))
+    (is (every? #(= :long (:dtype %)) casts))
+    (let [group (inc (quot Integer/MAX_VALUE 256))
+          reference (+ (* (bigint group) 256) 255)]
+      (is (> reference Integer/MAX_VALUE))
+      (is (< reference Long/MAX_VALUE)))
+    (is (body/kernel-body? (body/validate! kernel)))))
+
+(deftest result-transform-address-requirements-follow-the-real-active-branch
+  (let [routed (route/route-contraction (destination-reading-form :float) :dtype :float
+                                        :desc {} :candidate-families #{:portable})
+        kernel (:kernel-body routed)
+        requirements (body/required-preconditions kernel)
+        branch (get-in kernel [:operations 1])
+        definitions (vec (take-while #(instance? raster.compiler.ir.kernel_body.IndexCompute %)
+                                     (:then-operations branch)))
+        region {:parameters (:parameters kernel) :indices (:indices kernel) :launch (:launch kernel)
+                :condition-definition (first (:operations kernel)) :if-region branch
+                :index-definitions definitions :required-preconditions requirements}]
+    (is (= :portable-segred (:strategy routed)))
+    (is (some #(= :<= (:op %)) requirements))
+    (is (body/kernel-body? (body/validate! kernel)))
+    (is (map? (:values (body/scheduled-index-region-info region))))
+    (doseq [changed [(assoc region :if-region (assoc branch :then-operations []))
+                     (assoc region :if-region (assoc branch :then-operations (:else-operations branch)
+                                                           :else-operations (:then-operations branch)))]]
+      (is (= :kernel-body-index-region
+             (try (body/scheduled-index-region-info changed) :accepted
+                  (catch clojure.lang.ExceptionInfo exception (:reason (ex-data exception)))))))
+    (let [redundant {:expression
+                     (launch/product
+                      (launch/minimum (launch/sum (launch/maximum 4 1) -1)
+                                      (launch/maximum 0 (launch/sum '_nseg -1)))
+                      (launch/product (launch/minimum '_nseg 1) 16))
+                     :op :<= :value Long/MAX_VALUE}]
+      (is (some #{redundant} requirements))
+      ;; For integer N>=0, 0<=min(N,1)<=1 and 0<=min(3,max(0,N-1))<=3,
+      ;; so this exact earlier source-prefix cap is <=48 without the condition.
+      (doseq [n [0 1 2 32 Long/MAX_VALUE]]
+        (is (<= (launch/resolve-expression {'_nseg n} (:expression redundant)) 48)))
+      (doseq [condition requirements]
+        (let [changed (assoc-in kernel [:attributes :required-preconditions]
+                                (vec (remove #{condition} requirements)))]
+          (cond
+            (= {:expression '_nseg :op :>= :value 0} condition)
+            ;; Closed positive constant divisions independently bound i<=3,j<=7,l<=15.
+            ;; Every address prefix fits Long even without this outer activation condition.
+            (is (body/kernel-body? (body/validate! changed)))
+            (= redundant condition)
+            (is (= :kernel-body-index-precondition
+                   (try (body/validate! changed) :accepted
+                        (catch clojure.lang.ExceptionInfo exception (:reason (ex-data exception))))))
+            :else (is (thrown? clojure.lang.ExceptionInfo (body/validate! changed)))))))
+    (is (artifact/kernel-artifact? (:artifact (route/validate-descriptor routed))))
+    (doseq [changed [(assoc-in kernel [:operations 1]
+                              (assoc branch :then-operations (:else-operations branch)
+                                            :else-operations (:then-operations branch)))
+                     (assoc-in kernel [:operations 0 :expression :arguments 1]
+                               (body/literal Long/MAX_VALUE :long))]]
+      (is (body/kernel-body? (body/validate! changed))
+          "independent arithmetic bounds do not prove the original source branch")
+      (is (= {:reason :contract-descriptor-module-projection :field :source}
+             (try (route/validate-descriptor (assoc routed :kernel-body changed)) :accepted
+                  (catch clojure.lang.ExceptionInfo exception
+                    (select-keys (ex-data exception) [:reason :field]))))))))
+
+(deftest scoped-remainder-ranges-retain-the-actual-divisor-width
+  (doseq [[m-type expected] [[:int (dec Integer/MAX_VALUE)] [:long (dec Long/MAX_VALUE)]]]
+    (let [verified (facts/contraction-facts matvec :dtype :double)
+          operation (lower/contract-form->segred matvec :dtype :double :facts verified)
+          plan (schedule/plan-portable-body verified operation nil
+                                           {:scalar-types {'m m-type 'k :int}})
+          kernel (:body plan)
+          branch (get-in kernel [:operations 1])
+          definitions (vec (take-while #(instance? raster.compiler.ir.kernel_body.IndexCompute %)
+                                       (:then-operations branch)))
+          loop (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                              (:then-operations branch)))
+          region {:parameters (:parameters kernel) :indices (:indices kernel) :launch (:launch kernel)
+                  :condition-definition (first (:operations kernel)) :if-region branch
+                  :index-definitions definitions :required-preconditions (body/required-preconditions kernel)
+                  :inner-loop loop}
+          reconstructed (body/scheduled-index-region-info region)]
+      (is (:ok plan))
+      (is (= {:lower 0 :upper expected} (get-in reconstructed [:values 'i :range])))
+      (is (= {:lower 0 :upper (dec Integer/MAX_VALUE)}
+             (get-in reconstructed [:values 'l :range])))
+      (is (nil? (get-in reconstructed [:values 'l :abi-scalar-identity])))
+      (is (= (when (= :long m-type) 'k)
+             (get-in reconstructed [:values 'l :entered-loop-index :upper])))
+      (let [inclusive (body/scheduled-index-region-info
+                       (assoc region :inner-loop (assoc-in loop [:attributes :upper-bound] :inclusive)))]
+        (is (= {:lower Integer/MIN_VALUE :upper Integer/MAX_VALUE}
+               (get-in inclusive [:values 'l :range])))
+        (is (nil? (get-in inclusive [:values 'l :abi-scalar-identity]))))
+      (let [conditions (body/required-preconditions kernel)]
+        (is (true? (raster.compiler.ir.kernel-precondition/check!
+                    conditions {'m 0 'k -1 '_nseg 0})))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (raster.compiler.ir.kernel-precondition/check!
+                      conditions {'m -1 'k 0 '_nseg 1}))))
+      (when (= :long m-type)
+        (let [load (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                                       (= 'A (:buffer %)))
+                                 (tree-seq coll? seq (:operations kernel))))
+              coordinate (first (:coordinates load))
+              conditions (body/required-preconditions kernel)
+              cap {:expression (launch/product '_nseg (launch/maximum 'k 0))
+                   :op :<= :value Long/MAX_VALUE}]
+          (is (instance? raster.compiler.ir.kernel_body.IndexExpr coordinate))
+          (is (= :add (:op coordinate)))
+          (is (some #{cap} conditions))
+          (is (string? (:source (emit/generate-contraction-kernel-body
+                                kernel :target-dialect :opencl-portable))))
+          (is (true? (raster.compiler.ir.kernel-precondition/check!
+                      conditions {'m 3 'k 2 '_nseg 3})))
+          (is (thrown? ArithmeticException
+                       (raster.compiler.ir.kernel-precondition/check!
+                        conditions {'m Long/MAX_VALUE 'k 2 '_nseg Long/MAX_VALUE})))
+          (doseq [condition conditions]
+            (is (thrown? clojure.lang.ExceptionInfo
+                         (body/validate!
+                          (assoc-in kernel [:attributes :required-preconditions]
+                                    (vec (remove #{condition} conditions)))))))))))
+)
+
+(deftest descriptor-launch-products-preserve-checked-prefix-order
+  (let [identity @(ns-resolve 'raster.compiler.passes.parallel.contract-route 'descriptor-launch-identity)
+        outcome (fn [expression values]
+                  (try {:value (launch/resolve-expression values expression)}
+                       (catch ArithmeticException error {:error (class error)})))
+        left (launch/product (launch/product 'heads 'rows) 'rows)
+        flat (launch/product 'heads 'rows 'rows)]
+    (is (= (identity left) (identity flat)))
+    (doseq [values [{'heads 2 'rows 3} {'heads 0 'rows Long/MAX_VALUE}
+                    {'heads -1 'rows 2} {'heads Long/MAX_VALUE 'rows 2}]]
+      (is (= (outcome left values) (outcome flat values))))
+    (doseq [[nested flattened]
+            [[(launch/product 0 (launch/product Long/MAX_VALUE 2))
+              (launch/product 0 Long/MAX_VALUE 2)]
+             [(launch/product Long/MAX_VALUE (launch/product 2 0))
+              (launch/product Long/MAX_VALUE 2 0)]
+             [(launch/product Long/MIN_VALUE -1 0) (launch/product 0)]]]
+      (is (not= (identity nested) (identity flattened)))
+      (is (not= (outcome nested {}) (outcome flattened {}))))
+    (is (= 42 (identity (launch/product 6 7))))
+    (is (not= 'rows (identity (body/index-cast 'rows :int :exact))))
+    (is (not= 'rows (identity (body/index-cast 'rows :long :wrap))))))

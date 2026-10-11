@@ -134,3 +134,36 @@
       (is (every? #(<= (:lower interval) (rem % d) (:upper interval)) (range lo (inc hi))))))
   (is (nil? (ranges/remainder [{:lower -1 :upper 1} {:lower 1 :upper 2}])))
   (is (nil? (ranges/remainder [nil {:lower 1 :upper 1}]))))
+
+(deftest guarded-loop-entry-lattice-retains-static-stride-at-machine-boundaries
+  (doseq [[type limit] [[:int Integer/MAX_VALUE] [:long Long/MAX_VALUE]]
+          step [1 3 7 16 31]
+          start [0 1 -7]]
+    (let [actual (ranges/guarded-exclusive-loop-lattice-entry-range
+                  {:lower start :upper start}
+                  (ranges/for-dtype type) step type)
+          last-entry (+' start (*' (quot (-' (bigint limit) 1 start) step) step))]
+      (is (= {:lower start :upper last-entry} actual))
+      (is (< (:upper actual) limit))
+      (is (zero? (mod (-' (:upper actual) start) step)))
+      (is (>= (+' (:upper actual) step) limit)) ))
+  (doseq [[lower upper step] [[{:lower 0 :upper 1} {:lower 0 :upper 9} 3]
+                              [{:lower 9 :upper 9} {:lower 0 :upper 9} 3]
+                              [{:lower 0 :upper 0} {:lower 0 :upper 9} 'step]
+                              [{:lower 0 :upper 0} {:lower 0 :upper 9} 0]]]
+    (is (nil? (ranges/guarded-exclusive-loop-lattice-entry-range lower upper step :long))))
+  (is (nil? (ranges/guarded-exclusive-loop-lattice-entry-range
+             {:lower 0 :upper 0} {:lower 0 :upper Long/MAX_VALUE}
+             (inc (bigint Long/MAX_VALUE)) :long))))
+
+(deftest ordinary-index-division-range-transfer-requires-actual-safe-operand-intervals
+  (let [info! (ns-resolve 'raster.compiler.ir.kernel-body 'expression-info!)
+        values {'n {:type :int :range {:lower 0 :upper 1023} :uniformity #{}}
+                'signed {:type :int :range (ranges/for-dtype :int) :uniformity #{}}
+                'unknown-divisor {:type :int :range (ranges/for-dtype :int) :uniformity #{}}}]
+    (doseq [[op expected] [[:mod {:lower 0 :upper 15}]
+                           [:floor-div {:lower 0 :upper 63}]]]
+      (is (= expected (:range (info! (body/expression op 'n 16) values))))
+      (doseq [[numerator divisor] [['n 0] ['n -1] ['n 'unknown-divisor] ['signed 16]]]
+        (is (= (ranges/for-dtype :int)
+               (:range (info! (body/expression op numerator divisor) values))))))))

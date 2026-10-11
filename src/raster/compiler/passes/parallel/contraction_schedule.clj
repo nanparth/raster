@@ -574,6 +574,7 @@
                      {:source operation :body kernel-body :arguments arguments
                       :scalar-bindings (scheduled-body/derive-scalar-bindings
                                         kernel-body arguments scalar-types)
+                      :preconditions (body/required-preconditions kernel-body)
                       :effects {:kind :pure-contraction
                                 :uses (scheduled-body/derive-uses kernel-body arguments)}
                       :legality {:kind :ordered-portable-contraction}

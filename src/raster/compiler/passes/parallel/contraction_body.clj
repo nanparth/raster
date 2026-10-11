@@ -170,14 +170,19 @@
         ;; Physical coordinates are wide. Preserve the scalar ABI's retained widths and insert
         ;; exact widening at index uses rather than pretending every dimension was an int.
         wide-indices? (boolean (some #(= :long (dtype/canon (scalar-dtype %))) scalars))
-        widen-builtin #(if wide-indices? (body/index-cast % :long :exact) %)
+        ;; Generated global geometry is Long regardless of the scalar ABI. Reduction source
+        ;; binders retain their existing dtype; their coordinate uses widen independently.
+        widen-builtin #(body/index-cast % :long :exact)
+        reduction-zero (if wide-indices? (body/index-cast 0 :long :exact) 0)
+        retained-reduced-bound (when reduced-dim
+                                 (lower-index (:bound reduced-dim) index-scope))
         widen-index (fn widen-index [expression]
                       (cond
-                        (not wide-indices?) expression
                         (integer? expression) (body/index-cast expression :long :exact)
                         (symbol? expression)
-                        (if (and (not (contains? axis-symbols expression))
-                                 (= :int (dtype/canon (scalar-dtype expression))))
+                        (if (or (and (= reduced-index expression) (not wide-indices?))
+                                (and (not (contains? axis-symbols expression))
+                                     (= :int (dtype/canon (scalar-dtype expression)))))
                           (body/index-cast expression :long :exact)
                           expression)
                         (instance? raster.compiler.ir.kernel_body.IndexExpr expression)
@@ -197,23 +202,58 @@
                       (widen-index (lower-index expression scope)))
         segment-count (lower-index segment-count-source index-scope)
         launch-segment-count (index-expression/to-launch-expression segment-count decline!)
-        reduced-bound (when reduced-dim (lower-index (:bound reduced-dim) index-scope))
+        reduced-bound (when reduced-dim
+                        (if wide-indices? (widen-index retained-reduced-bound)
+                            retained-reduced-bound))
+        reduction-header (when reduced-dim
+                           (body/->ForLoop
+                            (body/value reduced-index (if wide-indices? :long :int))
+                            reduction-zero reduced-bound 1 [] [] [] {}))
         segment-index 'segment-index
         group-index 'segment-group
         local-index 'segment-lane
         active-mask :active-segment
+        segment-indices [(body/->IndexBinding group-index :group 0)
+                         (body/->IndexBinding local-index :local 0)
+                         (body/->IndexCompute
+                          segment-index
+                          (body/expression :add
+                                           (body/expression :mul
+                                                            (widen-builtin group-index)
+                                                            (widen-builtin workgroup-size))
+                                           (widen-builtin local-index)))]
+        segment-condition (body/->ScalarCompute
+                           (body/value :segment-active :predicate)
+                           (body/scalar-expression :lt :predicate
+                            [(body/cast-expression segment-index :long :exact :exact)
+                             (body/cast-expression '_nseg :long :exact :exact)]))
+        segment-launch (launch/spec
+                        {:workgroup-size [workgroup-size]
+                         :group-count [(launch/ceil-div launch-segment-count workgroup-size)]})
         decomposition
         (mapv
          (fn [position {:keys [name bound]}]
            (let [following (subvec (vec segment-dims) (inc position))
-                 divisor (product-expression
-                          (mapv #(lower-index (:bound %) index-scope) following))
-                 quotient (if (= 1 divisor)
-                            segment-index
-                            (body/expression :floor-div segment-index divisor))]
+                 quotient (reduce (fn [value dimension]
+                                    (let [divisor (lower-index (:bound dimension) index-scope)]
+                                      (if (= 1 (:bound dimension)) value
+                                          (body/expression :floor-div value divisor))))
+                                  segment-index following)]
              (body/->IndexCompute
-              name (body/expression :mod quotient (lower-index bound index-scope)))))
+              name (if (some #(= 0 (:bound %)) segment-dims)
+                     (widen-builtin 0)
+                     (body/expression :mod quotient (lower-index bound index-scope))))))
          (range) segment-dims)
+        segment-branch (body/->IfRegion :segment-active decomposition [] [])
+        axis-domain-preconditions
+        (vec (distinct
+              (mapcat (fn [{:keys [bound]}]
+                        (body/quotient-domain-preconditions
+                         '_nseg
+                         (if (or (symbol? bound) (integer? bound)) bound
+                             (index-expression/to-launch-expression
+                              (lower-index bound index-scope) decline!))))
+                      segment-dims)))
         {:keys [operator identity element]} (if map-only?
                                              {:identity 0.0 :element (:body contract-facts)}
                                              (segred-body/scalar-plan segred))
@@ -227,23 +267,8 @@
         ;; `lower-element-operations`.
         element-coordinate-lower #(lower-index % index-scope)
         epilogue-coordinate-lower #(lower-index (axis-map/index-expr %) index-scope)
-        {:keys [operations result]}
-        (segred-body/lower-element-operations
-         element {:index reduced-index :coordinate reduced-index :dtype dtype
-                  ;; The verified contraction region declares the product result dtype even when
-                  ;; a synthetic surface fixture carries no walker metadata on its outer call.
-                  ;; This fact applies only to the region result; nested scalar calls remain typed
-                  ;; by their own retained source facts.
-                  :declared-result-dtype dtype
-                  :arrays (set arrays) :scalars (set scalars)
-                  :array-types (into {} (map (fn [id] [id (array-dtype id)])) arrays)
-                  :scalar-types (into {} (map (fn [id] [id (scalar-dtype id)])) scalars)
-                  :coordinate-lower element-coordinate-lower
-                  :load-predicate active-mask
-                  :load-other (body/literal identity dtype)})
         accumulator 'segment-accumulator
         next-accumulator 'next-segment-accumulator
-        reduction-result (if map-only? result 'segment-result)
         physical-extent
         (fn [array]
           (lower-index (axis-map/n-elements (get operand-maps array)) index-scope))
@@ -277,7 +302,31 @@
               transform-scalar-parameters
               [(body/->KernelParameter '_nseg :scalar segment-count-dtype
                                        [] nil nil :bound)]))]
-    (let [parameter-map (into {} (map (juxt :id clojure.core/identity)) parameters)
+    (let [index-region {:parameters parameters :indices segment-indices :launch segment-launch
+                        :condition-definition segment-condition :if-region segment-branch
+                        :index-definitions decomposition
+                        :required-preconditions axis-domain-preconditions}
+        {operations :operations result :result element-requirements :required-preconditions}
+        (segred-body/lower-contraction-element-operations
+         element {:index reduced-index :coordinate reduced-index :dtype dtype
+                  ;; The verified contraction region declares the product result dtype even when
+                  ;; a synthetic surface fixture carries no walker metadata on its outer call.
+                  ;; This fact applies only to the region result; nested scalar calls remain typed
+                  ;; by their own retained source facts.
+                  :declared-result-dtype dtype
+                  :arrays (set arrays) :scalars (set scalars)
+                  :array-types (into {} (map (fn [id] [id (array-dtype id)])) arrays)
+                  :scalar-types (into {} (map (fn [id] [id (scalar-dtype id)])) scalars)
+                  :element-binding-types
+                  (cond-> (zipmap (mapv :name segment-dims) (repeat :long))
+                    reduced-index (assoc reduced-index (if wide-indices? :long :int)))
+                  :index-region (cond-> index-region reduction-header
+                                  (assoc :inner-loop reduction-header))
+                  :coordinate-lower element-coordinate-lower
+                  :load-predicate active-mask
+                  :load-other (body/literal identity dtype)})
+          reduction-result (if map-only? result 'segment-result)
+          parameter-map (into {} (map (juxt :id clojure.core/identity)) parameters)
           lowered-transform
           (when result-region
             (scalar-region-lower/lower
@@ -287,6 +336,10 @@
               :store-dtype output-dtype
               :parameters parameter-map
               :coordinate-lower epilogue-coordinate-lower
+              :index-region {:parameters parameters :indices segment-indices :launch segment-launch
+                             :condition-definition segment-condition :if-region segment-branch
+                             :index-definitions decomposition
+                             :required-preconditions axis-domain-preconditions}
               :predicate active-mask}))
           stored-result (or (:result lowered-transform) reduction-result)]
       {:kernel-body
@@ -296,49 +349,40 @@
          :stable-reads (mapv body/stable-read
                              (distinct (remove #{output}
                                                (concat arrays (map :sym transform-operands)))))
-         :indices (vec (concat
-                        [(body/->IndexBinding group-index :group 0)
-                         (body/->IndexBinding local-index :local 0)
-                         (body/->IndexCompute
-                          segment-index
-                          (body/expression :add
-                                           (body/expression :mul
-                                                            (widen-builtin group-index)
-                                                            (widen-builtin workgroup-size))
-                                           (widen-builtin local-index)))]
-                        decomposition))
+         :indices segment-indices
          :masks [(body/->Mask active-mask
-                              [(body/predicate :lt segment-index
-                                               (widen-builtin '_nseg))])]
+                              [(body/predicate :lt segment-index (widen-builtin '_nseg))])]
          :operations
-         (vec
+         [segment-condition
+          (assoc segment-branch
+           :then-operations (conj (vec (concat decomposition
           (concat
            (if map-only?
              operations
-             [(body/->ForLoop
-             (body/value reduced-index (if wide-indices? :long :int))
-             (widen-builtin 0) reduced-bound 1
-             [(body/->LoopArg (body/value accumulator dtype)
+             [(assoc reduction-header
+             :iter-args [(body/->LoopArg (body/value accumulator dtype)
                               (body/literal identity dtype))]
-             (vec (concat
+             :operations (vec (concat
                    operations
                    [(body/->ScalarCompute
                      (body/value next-accumulator dtype)
                      (body/scalar-expression operator dtype [accumulator result]))
                     (body/->Yield [next-accumulator])]))
-             [(body/value reduction-result dtype)]
-             {})])
+             :results [(body/value reduction-result dtype)])])
            (:operations lowered-transform)
-           [(body/->ScalarStore output [segment-index] stored-result active-mask)]))
+           [(body/->ScalarStore output [segment-index] stored-result active-mask)])))
+                 (body/->Yield []))
+           :else-operations [(body/->Yield [])])]
          :schedule {:strategy (if map-only? :independent-segments :sequential-segments)
                     :workgroup-size workgroup-size
                     :reduction-operator operator}
-         :launch (launch/spec
-                  {:workgroup-size [workgroup-size]
-                   :group-count [(launch/ceil-div launch-segment-count workgroup-size)]})
+         :launch segment-launch
          :provenance {:dialect :kernel-body :source-dialect :segcontract
                       :segop-id (:id segred)}
          :attributes {:kind :portable-contraction
+                      :required-preconditions
+                      (vec (distinct (concat axis-domain-preconditions element-requirements
+                                             (:required-preconditions lowered-transform))))
                       :identity identity :operator operator
                       :segment-count segment-count
                       :launch-segment-count launch-segment-count

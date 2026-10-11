@@ -884,7 +884,7 @@
 
 (defn generate-contraction-kernel-body
   "Emit one scheduled portable contraction KernelBody through the shared C-family boundary."
-  [kernel-body & {:keys [kernel-name-prefix target-dialect]
+  [kernel-body & {:keys [kernel-name-prefix kernel-name target-dialect]
                   :or {kernel-name-prefix "contract" target-dialect :opencl-intel}}]
   (let [kernel-body (kbody/validate! kernel-body)
         parameters (:parameters kernel-body)
@@ -901,12 +901,12 @@
         (vec (map :id (filter #(and (= :scalar (:kind %))
                                     (= :epilogue (:role %))) parameters)))
         scalars (vec (map :id (remove #(= '_nseg (:id %)) scalar-parameters)))
-        kernel-name (str kernel-name-prefix "_" (gensym ""))
+        kernel-name (or kernel-name (str kernel-name-prefix "_" (gensym "")))
         parameter-names (into {output "out" '_nseg "_nseg"}
                               (map (fn [parameter]
                                      [(:id parameter) (ce/c-symbol (:id parameter))]))
                               parameters)
-        source (kernel-body-opencl/emit-scalar-kernel
+        module (kernel-body-opencl/emit-scalar-module
                 kernel-name kernel-body
                 {:target-dialect target-dialect :parameter-names parameter-names})
         abi (kabi/validate!
@@ -921,7 +921,10 @@
     {:kernel-name kernel-name
      :target (kernel-body-c-dialect/target
               (kernel-body-c-dialect/resolve! target-dialect))
-     :source source
+     :source (:source module)
+     :required-preconditions (:required-preconditions module)
+     :compilation (:compilation module)
+     :target-dialect target-dialect
      :abi abi
      :array-params inputs
      :scalar-params scalars
@@ -933,38 +936,34 @@
      :launch (:launch kernel-body)}))
 
 (defn generate-contraction-kernel-artifact
-  "Emit one portable contraction KernelBody as a complete executable compiler value."
-  [kernel-body & {:keys [kernel-name-prefix target-dialect]
+  "Compile the exact checked KernelBody input through the existing complete target boundary."
+  [kernel-body & {:keys [kernel-name-prefix kernel-name target-dialect arguments attributes]
                   :or {kernel-name-prefix "contract" target-dialect :opencl-intel}}]
   (let [kernel-body (kbody/validate! kernel-body)
         emitted (generate-contraction-kernel-body
-                 kernel-body :kernel-name-prefix kernel-name-prefix
+                 kernel-body :kernel-name-prefix kernel-name-prefix :kernel-name kernel-name
                  :target-dialect target-dialect)
         launch-segment-count (get-in kernel-body [:attributes :launch-segment-count])
-        arguments (mapv (fn [parameter]
-                          (if (= '_nseg (:id parameter)) launch-segment-count (:id parameter)))
-                        (:parameters kernel-body))]
-    (kart/make
-     {:kernel-name (:kernel-name emitted)
-      :target (:target emitted)
-      :source (:source emitted)
-      :abi (:abi emitted)
-      :arguments arguments
-      :launch (:launch emitted)
-      :effects {:kind :pure-contraction}
-      :provenance {:dialect :kernel-body
-                   :source-dialect :segcontract
-                   :segop-id (get-in kernel-body [:provenance :segop-id])}
-      :attributes {:array-params (:array-params emitted)
+        arguments (or arguments (mapv #(if (= '_nseg (:id %)) launch-segment-count (:id %))
+                        (:parameters kernel-body)))
+        scheduled (scheduled-body/make
+                   {:source kernel-body :body kernel-body :arguments arguments
+                    :scalar-bindings (scheduled-body/derive-scalar-bindings kernel-body arguments)
+                    :preconditions (kbody/required-preconditions kernel-body)
+                    :effects {:kind :pure-contraction
+                              :uses (scheduled-body/derive-uses kernel-body arguments)}
+                    :legality {:kind :checked-kernel-body-input}
+                    :numerics {:mode :exact :policy :same-typed-ssa-evaluation-order}})]
+    (kernel-body-target/emit-artifact
+     (:kernel-name emitted) scheduled target-dialect
+     {:parameter-names (into {} (map (juxt :name :c-name)) (:abi emitted))
+      :attributes (merge {:array-params (:array-params emitted)
                    :scalar-params (:scalar-params emitted)
                    :epilogue-operands (:epilogue-operands emitted)
                    :epilogue-scalars (:epilogue-scalars emitted)
                    :written-arrays #{(:output emitted)}
-                   :kernel-body kernel-body
                    :strategy (get-in kernel-body [:schedule :strategy])
-                   :out-elems launch-segment-count
-                   :emission-route :kernel-body
-                   :target-dialect target-dialect}})))
+                   :out-elems launch-segment-count} attributes)})))
 
 (defn generate-segmented-reduce-kernel
   "NAIVE segmented reduction (a contraction) → OpenCL. One work-item per SEGMENT (free-axis

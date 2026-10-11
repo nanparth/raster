@@ -13,6 +13,7 @@
    actually rejects each historical shape."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.passes.parallel.contract-route :as route]))
 
@@ -55,9 +56,12 @@
                        :dtype :double))))
     ;; The source template remains an explicit correctness fallback only where no physical
     ;; operand layout can be proven (these deliberately unbound gather coordinates model that).
-    (is (= :naive-segred (:strategy (route/route-contraction
-                                     '(raster.par/contract C [[b 2] [i 4] [j 3]] [[l 5]]
-                                                           (* (aget A x) (aget B y))) :dtype :double))))
+    (let [fallback (route/route-contraction
+                    '(raster.par/contract C [[b 2] [i 4] [j 3]] [[l 5]]
+                                         (* (aget A x) (aget B y))) :dtype :double)]
+      (is (= :naive-segred (:strategy fallback)))
+      (is (not (contains? (get-in fallback [:artifact :attributes]) :kernel-body))
+          "source fallback does not claim an absent scheduled body authority"))
     (is (= :full-reduce  (:strategy (route/route-contraction
                                      '(raster.par/contract O [] [[i 8]] (* (aget A i) (aget B i)))
                                      :dtype :double))))
@@ -161,3 +165,41 @@
       ;; The KernelBody route preserves the declared output's mangled name instead of the
       ;; historical source emitter's fixed "out" placeholder; source and ABI still agree.
       (is (= ["input_buffer" "out_buffer" "_nseg"] (mapv :c-name (:abi d)))))))
+
+(deftest scalar-reduction-clamps-only-generated-negative-geometry
+  (let [routed (route/route-contraction
+                 '(raster.par/contract O [] [[i 4] [j 6]] (aget A (+ (* i 6) j))) :dtype :float)
+        checked (get-in routed [:artifact :attributes :kernel-body])
+        definitions (:indices checked)
+        wide-bound (first (filter #(= 'wide-bound (:id %)) definitions))
+        evaluate (fn evaluate [expression values]
+                   (cond (integer? expression) (bigint expression)
+                         (symbol? expression) (get values expression)
+                         (instance? raster.compiler.ir.kernel_body.IndexCast expression)
+                         (evaluate (:argument expression) values)
+                         :else (let [[a b] (mapv #(evaluate % values) (:arguments expression))]
+                                 (case (:op expression)
+                                   :add (+ a b) :sub (- a b) :mul (* a b)
+                                   :min (min a b) :max (max a b)
+                                   :ceil-div (quot (+ a b -1) b)))))
+        geometry (fn [n groups group lane old?]
+                   (reduce (fn [values definition]
+                             (if-let [expression (:expression definition)]
+                               (assoc values (:id definition)
+                                      (evaluate (if (and old? (= 'wide-bound (:id definition)))
+                                                  (body/index-cast '_n_bound :long :exact) expression) values))
+                               values))
+                           {'_n_bound (bigint n) 'group-count (bigint groups)
+                            'group-index (bigint group) 'local-index (bigint lane)} definitions))]
+    (is (some? checked))
+    (is (= :max (get-in wide-bound [:expression :op])))
+    (is (= (body/index-cast '_n_bound :long :exact)
+           (first (get-in wide-bound [:expression :arguments]))))
+    (doseq [n [Integer/MIN_VALUE -1 0] groups [1 3 17]
+            group [0 1 16] lane [0 255] old? [false true]
+            :let [values (geometry n groups group lane old?)]]
+      (is (<= (get values 'group-end) (get values 'global-index))
+          "negative/empty generated geometry evaluates no element; neutral tree remains unchanged"))
+    (doseq [n [1 24 Integer/MAX_VALUE] groups [1 3 17] group [0 1 16] lane [0 255]]
+      (is (= (geometry n groups group lane true) (geometry n groups group lane false))
+          "positive geometry and every original index definition retain their values"))))

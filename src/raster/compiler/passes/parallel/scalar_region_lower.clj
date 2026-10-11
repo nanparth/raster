@@ -171,7 +171,7 @@
    a declared operand axis-map to one or more scheduled storage coordinates. The returned `:result` is cast to
    `store-dtype`, so ScalarStore remains completely typed."
   [region {:keys [accumulator accumulator-dtype store-dtype parameters coordinate-lower predicate
-                  id-prefix]}]
+                  id-prefix index-region]}]
   (let [result-dtype (dtype/canon (:result-dtype region))
         accumulator-id (first (:parameters region))
         operand-by-id (into {} (map (juxt :sym identity)) (:operands region))
@@ -309,11 +309,16 @@
                 (decline! :result-transform-expression
                           "result-transform expression references an unbound or unsupported value"
                           {:expression expression})))]
-      (let [typed-result (lower-expression (:expression region) {})
-            stored-result (cast typed-result store-dtype)]
-        {:operations @operations
-         :result (:value stored-result)
-         :result-dtype (:dtype stored-result)}))))
+      (let [lower-result (fn []
+                           (let [typed-result (lower-expression (:expression region) {})
+                                 stored-result (cast typed-result store-dtype)]
+                             {:operations @operations
+                              :result (:value stored-result)
+                              :result-dtype (:dtype stored-result)}))
+            result (if index-region
+                     ((:with-index-region builder) index-region lower-result)
+                     (lower-result))]
+        (assoc result :required-preconditions ((:required-preconditions builder)))))))
 
 (defn lower-region
   "Close a semantic ScalarRegion as validated, target-neutral scalar SSA for a store site."

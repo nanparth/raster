@@ -8,15 +8,18 @@
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.extent-expression :as extent-expression]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled-body]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.passes.parallel.segfoldmap-body :as fold-body]
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar-expression]
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
@@ -187,7 +190,8 @@
   (mapcat (fn [operation]
             (cons operation
                   (cond
-                    (instance? raster.compiler.ir.kernel_body.ForLoop operation)
+                    (or (instance? raster.compiler.ir.kernel_body.ForLoop operation)
+                        (instance? raster.compiler.ir.kernel_body.Guard operation))
                     (operation-tree (:operations operation))
                     (instance? raster.compiler.ir.kernel_body.IfRegion operation)
                     (concat (operation-tree (:then-operations operation))
@@ -942,3 +946,304 @@
       (catch clojure.lang.ExceptionInfo exception
         (is (= :typed-soac-segmented-fold-map-fold-closure
                (:reason (ex-data exception))))))))
+
+(defn- long-ordered-operation
+  ([] (long-ordered-operation source))
+  ([source]
+  (let [types {'nsegments :long 'width :long}
+        program (:program (route/attempt source :float {'values :float 'out :float}
+                                         {:scalar-types types}))
+        scheduled (:form (segop-lower/segop-lower-pass program
+                           {:dtype :float :target-device :ocl:0
+                            :array-types {'values :float 'out :float}
+                            :scalar-types types}))]
+    (first (:operations (first (:equations scheduled)))))))
+
+(deftest ordered-long-final-stores-retain-portable-loop-domain-proof
+  (let [operation (long-ordered-operation)
+        options {:array-types {'values :float 'out :float}
+                 :scalar-types {'nsegments :long 'width :long}}
+        checked (:kernel-body (fold-body/lower operation options))
+        conditions (body/required-preconditions checked)
+        outer (first (:operations checked))
+        inner (last (butlast (:operations outer)))
+        artifact (segop-opencl/generate-segfoldmap-kernel operation
+                   :target-dialect :opencl-portable
+                   :array-types (:array-types options) :scalar-types (:scalar-types options))]
+    (is (= :segment-grid-stride (get-in outer [:attributes :role])))
+    (is (= :final-map (get-in inner [:attributes :role])))
+    (is (= checked (body/validate! checked)))
+    (is (re-find #"if \(\(ulong\)\([^\n]+<= \(ulong\)\([^\n]+\)\) break;" (:source artifact))
+        "dynamic Long loop compares unsigned remaining distance before its increment")
+    (is (= conditions (:preconditions artifact)))
+    (doseq [[n f] [[0 Long/MIN_VALUE] [0 Long/MAX_VALUE] [Long/MAX_VALUE 0]
+                   [Long/MAX_VALUE 1] [1 -1] [2 3]]]
+      (is (precondition/check! conditions {'_nseg n 'nsegments (max 1 n) 'width f}) (str [n f])))
+    (is (thrown? ArithmeticException
+                 (precondition/check! conditions {'_nseg 2 'nsegments 2 'width Long/MAX_VALUE})))
+    (doseq [[n d f] [[0 Long/MIN_VALUE Long/MIN_VALUE] [0 0 3]
+                     [2 1 3] [2 7 3] [7 2 3]]]
+      (is (precondition/check! conditions {'_nseg n 'nsegments d 'width f})
+          (str "distinct outer bound and actual divisor " [n d f])))
+    (doseq [d [0 -1 Long/MIN_VALUE]
+            f [0 -1]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"kernel scalar precondition failed"
+                           (precondition/check! conditions {'_nseg 2 'nsegments d 'width f}))
+          "axis modulo executes on outer entry before an empty inner loop"))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                         #"resolved launch dimension must be an integer"
+                         (precondition/check! conditions {'_nseg 2 'width 3}))
+        "the actual modulo divisor binding is required independently of the outer bound")
+    (doseq [condition conditions]
+      (is (= :kernel-body-index-precondition
+             (try (body/validate! (update-in checked [:attributes :required-preconditions]
+                                   #(vec (remove #{condition} %)))) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+          (pr-str condition)))))
+
+(deftest ordered-affine-facts-do-not-escape-the-inner-loop-or-borrow-another-abi
+  (let [operation (long-ordered-operation)
+        checked (:kernel-body (fold-body/lower operation
+                   {:array-types {'values :float 'out :float}
+                    :scalar-types {'nsegments :long 'width :long}}))
+        outer (first (:operations checked))
+        inner-position (- (count (:operations outer)) 2)
+        inner (nth (:operations outer) inner-position)
+        store-position (first (keep-indexed #(when (instance? raster.compiler.ir.kernel_body.ScalarStore %2) %1)
+                                            (:operations inner)))
+        store (nth (:operations inner) store-position)
+        coordinate (first (:coordinates store))
+        prefix (body/->IndexCompute 'preinner-address-product (first (:arguments coordinate)))
+        preinner (-> checked
+                     (assoc-in [:operations 0 :operations]
+                       (vec (concat (take inner-position (:operations outer)) [prefix]
+                                    (drop inner-position (:operations outer)))))
+                     (assoc-in [:operations 0 :operations (inc inner-position) :operations store-position :coordinates]
+                       [(body/expression :add 'preinner-address-product (:id (:index inner)))]))
+        other-abi (-> checked
+                      (update :parameters conj (body/->KernelParameter 'other-width :scalar :long [] nil nil :parameter))
+                      (assoc-in [:operations 0 :operations inner-position :operations store-position :coordinates]
+                        [(body/expression :add (body/expression :mul (:id (:index outer)) 'other-width)
+                                              (:id (:index inner)))]))]
+    (let [changed-divisor (-> checked
+                              (update :parameters conj
+                                (body/->KernelParameter 'other-nsegments :scalar :long [] nil nil :parameter))
+                              (update :operations
+                                #(walk/postwalk-replace {'nsegments 'other-nsegments} %)))
+          positive-condition (second (body/quotient-domain-preconditions '_nseg 'nsegments))
+          missing-positive (update-in checked [:attributes :required-preconditions]
+                             #(vec (remove #{positive-condition} %)))]
+      (is (some #{positive-condition} (body/required-preconditions checked)))
+      (is (some #(and (instance? raster.compiler.ir.kernel_body.IndexCompute %)
+                       (= :mod (get-in % [:expression :op]))
+                       (some #{'other-nsegments}
+                         (tree-seq coll? seq (:expression %))))
+                (tree-seq coll? seq (:operations changed-divisor)))
+          "changed divisor survives in the actual modulo definition")
+      (doseq [candidate [changed-divisor missing-positive]]
+        (is (= :kernel-body-index-precondition
+               (try (body/validate! candidate) nil
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+            "actual modulo divisor and its positivity obligation cannot be borrowed")))
+    (is (= :mul (:op (:expression prefix))))
+    (is (= :final-map (get-in preinner [:operations 0 :operations (inc inner-position) :attributes :role])))
+    (doseq [candidate [preinner other-abi]]
+      (is (= :kernel-body-index-precondition
+             (try (body/validate! candidate) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+          "valid typed SSA cannot acquire an inner-loop domain before entry or from equal ABI values"))))
+
+(deftest static-positive-final-map-extent-keeps-its-existing-portable-route
+  (let [operation (long-ordered-operation (walk/postwalk-replace {'width 4} source))
+        checked (:kernel-body (fold-body/lower operation
+                    {:array-types {'values :float 'out :float}
+                     :scalar-types {'nsegments :long 'width :long}}))
+        conditions (body/required-preconditions checked)
+        artifact (segop-opencl/generate-segfoldmap-kernel operation
+                   :target-dialect :opencl-portable
+                   :array-types {'values :float 'out :float}
+                   :scalar-types {'nsegments :long 'width :long})]
+    (is (= checked (body/validate! checked)))
+    (is (string? (:source artifact)))
+    (is (precondition/check! conditions {'_nseg 0 'nsegments 1 'width 4}))
+    (is (precondition/check! conditions {'_nseg 2 'nsegments 2 'width 4}))
+    (is (thrown? ArithmeticException
+                 (precondition/check! conditions {'_nseg Long/MAX_VALUE 'nsegments Long/MAX_VALUE 'width 4})))))
+
+(deftest cooperative-address-domains-come-from-the-real-uniform-guard
+  (let [operation (certified-operation)
+        options {:array-types {'values :float 'out :float} :scalar-types {'rows :long 'width :long}}
+        checked (:kernel-body (fold-body/lower operation options))
+        guard (first (:operations checked))
+        axis (first (:operations guard))
+        scheduled (fold-body/schedule operation options)
+        artifact (segop-opencl/generate-segfoldmap-kernel operation
+                   :target-dialect :opencl-portable :array-types (:array-types options)
+                   :scalar-types (:scalar-types options))
+        conditions (body/required-preconditions checked)
+        args (mapv #(if (= :scalar (:kind %))
+                      {:type (:dtype %) :value (if (= 'width (:name %)) 3 2)}
+                      (Object.)) (:abi artifact))
+        no-guard (assoc checked :operations (:operations guard))
+        wrong-bound (assoc-in checked [:masks 0 :predicates 0 :arguments 1] 'width)
+        varying-guard (assoc-in checked [:masks 0 :predicates 0 :arguments 0]
+                               (body/index-cast 'foldmap-lane :long :exact))
+        premature-axis (-> checked
+                           (update :indices conj axis)
+                           (assoc-in [:operations 0 :operations] (vec (rest (:operations guard)))))]
+    (is (instance? raster.compiler.ir.kernel_body.Guard guard))
+    (is (instance? raster.compiler.ir.kernel_body.IndexCompute axis))
+    (is (= :mod (get-in axis [:expression :op])))
+    (is (= ['foldmap-segment '_nseg] (get-in checked [:masks 0 :predicates 0 :arguments])))
+    (is (= checked (body/validate! checked)))
+    (is (= conditions (:preconditions scheduled) (:preconditions artifact)))
+    (is (= [7] (get-in (kcall/make artifact args {:group-count [7]}) [:geometry :group-count]))
+        "oversized scheduling overrides are valid; complete workgroups past the bound are masked")
+    (is (precondition/check! conditions {'_nseg 0 'rows Long/MIN_VALUE 'width Long/MIN_VALUE}))
+    (is (precondition/check! conditions {'_nseg Long/MAX_VALUE 'rows 1 'width 0}))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"kernel scalar precondition failed"
+                         (precondition/check! conditions {'_nseg 2 'rows 0 'width 0})))
+    (doseq [candidate [no-guard wrong-bound premature-axis]]
+      (is (= :kernel-body-index-precondition
+             (try (body/validate! candidate) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+          "neither a later guard nor a different bound can certify actual modulo/address prefixes"))
+    (is (= :kernel-body-index-precondition (reason-of #(body/validate! varying-guard)))
+        "a lane predicate cannot supply the segment's missing actual address domain")
+    (let [barrier (body/->WorkgroupBarrier :workgroup #{:workgroup} :acquire-release
+                                         (body/full-participation))
+          uniform-barrier (assoc-in checked [:operations 0 :operations] [barrier])
+          varying-barrier (assoc-in varying-guard [:operations 0 :operations] [barrier])
+          loop-position (first (keep-indexed
+                                 (fn [position operation]
+                                   (when (and (instance? raster.compiler.ir.kernel_body.ForLoop operation)
+                                              (= :cooperative-lane-fold (get-in operation [:attributes :role])))
+                                     position)) (:operations guard)))
+          zero-stride (assoc-in checked [:operations 0 :operations loop-position :step] 0)
+          escaped (update checked :operations conj
+                    (body/->ScalarLoad (body/value 'postguard-load :float) 'values
+                      [(body/expression :mul 'foldmap-segment 'width)] nil nil :cached))]
+      (is (= uniform-barrier (body/validate! uniform-barrier)))
+      (is (= :kernel-body-divergent-workgroup-barrier
+             (reason-of #(body/validate! varying-barrier)))
+          "valid typed lane-dependent control cannot contain a full-participation barrier")
+      (is (instance? raster.compiler.ir.kernel_body.ForLoop
+                     (get-in zero-stride [:operations 0 :operations loop-position])))
+      (is (= 0 (get-in zero-stride [:operations 0 :operations loop-position :step])))
+      (let [error (try (body/validate! zero-stride) nil
+                       (catch clojure.lang.ExceptionInfo error error))
+            actual-loop (get-in zero-stride [:operations 0 :operations loop-position])
+            dynamic-zero (assoc-in checked [:operations 0 :operations loop-position :step]
+                           (body/index-cast 0 :long :exact))]
+        (is (instance? clojure.lang.ExceptionInfo error))
+        (is (= "kernel for-loop requires typed carried values and explicit bounds" (ex-message error)))
+        (is (= actual-loop (:loop (ex-data error))))
+        (is (= :kernel-body-loop-step-positive (reason-of #(body/validate! dynamic-zero)))
+            "valid typed dynamic zero reaches independent step positivity validation"))
+      (is (= :kernel-body-index-precondition (reason-of #(body/validate! escaped)))
+          "segment guard facts cannot escape into a sibling pointer consumer")
+      (is (= :scheduled-kernel-body-scalar-bindings
+             (reason-of #(scheduled-body/validate!
+                           (update scheduled :scalar-bindings
+                             (fn [bindings] (filterv (fn [binding] (not= '_nseg (:parameter binding))) bindings)))))))
+      (is (= :scheduled-kernel-body-required-preconditions
+             (reason-of #(scheduled-body/validate! (assoc scheduled :preconditions []))))))))
+
+(deftest range-only-loop-intervals-never-become-partial-entered-domains
+  (let [upper (body/expression :min 'a 'b)
+        info (body/entered-for-loop-info (body/index-cast 0 :long :exact)
+               {:type :long :range {:lower Long/MIN_VALUE :upper Long/MAX_VALUE}} 1 :exclusive)
+        builder (scalar-expression/make-lowerer
+                  {:array-types {} :scalar-types {'a :long 'b :long 'f :long}
+                   :arrays #{} :index-scope #{'a 'b 'f 'outer 'inner} :lower-index identity
+                   :affine-domain {:index 'outer :bound 'N} :id-prefix "range-only"
+                   :decline! (fn [& args] (throw (ex-info "unexpected decline" {:arguments args})))})
+        lowered ((:with-loop-index builder) 'inner (body/index-cast 0 :long :exact) upper :exclusive
+                  #((:compute builder) :* :long ['inner 'f] {:overflow :trap}))
+        checked (body/make
+                  {:id :range-only-entered-test
+                   :parameters (mapv #(body/->KernelParameter % :scalar :long [] nil nil :parameter) '[N a b f])
+                   :indices [(body/->IndexBinding 'group :group 0)
+                             (body/->IndexCompute 'outer (body/index-cast 'group :long :exact))]
+                   :masks [(body/->Mask :active [(body/predicate :lt 'outer 'N)])]
+                   :operations [(body/->Guard :active
+                                  [(body/->ForLoop (body/value 'inner :long) (body/index-cast 0 :long :exact)
+                                     upper 1 [] (conj (vec (:operations lowered)) (body/->Yield [])) [] {})])]
+                   :launch (launch/spec {:workgroup-size [1] :group-count [1] :shared-memory-bytes 0})
+                   :attributes {:required-preconditions [{:expression 'N :op :>= :value 0}]}})]
+    (is (= {:lower 0 :upper (dec (bigint Long/MAX_VALUE))} (:range info)))
+    (is (not (contains? info :entered-loop-index)))
+    (is (= :trap (get-in lowered [:operations 0 :expression :options :overflow])))
+    (is (= checked (body/validate! checked)))))
+
+(deftest actual-legacy-affine-obligations-keep-their-original-selection
+  (let [legacy (body/affine-product-preconditions 'N 'F)
+        spec {:id :legacy-affine-selection
+              :parameters [(body/->KernelParameter 'values :input :float [1] :global
+                             (layout/row-major [1] :float) :operand)
+                           (body/->KernelParameter 'N :scalar :long [] nil nil :bound)
+                           (body/->KernelParameter 'F :scalar :long [] nil nil :parameter)]
+              :stable-reads [(body/stable-read 'values)]
+              :indices [(body/->IndexBinding 'group :group 0)
+                        (body/->IndexCompute 'outer (body/index-cast 'group :long :exact))]
+              :masks [(body/->Mask :active [(body/predicate :lt 'outer 'N)])]
+              :operations [(body/->Guard :active
+                             [(body/->ForLoop (body/value 'inner :long) (body/index-cast 0 :long :exact)
+                                'F 1 [] [(body/->ScalarLoad (body/value 'loaded :float) 'values
+                                          [(body/expression :mul 'outer 'F)] nil nil :cached)
+                                         (body/->Yield [])] [] {})])]
+              :launch (launch/spec {:workgroup-size [1] :group-count [1] :shared-memory-bytes 0})
+              :attributes {:required-preconditions legacy}}
+        checked (body/make spec)
+        activated (body/make (assoc-in spec [:attributes :required-preconditions]
+                              (body/entered-affine-address-preconditions 'N 'F)))]
+    (is (= checked (body/validate! checked)))
+    (is (= legacy (body/required-preconditions checked)))
+    (is (= activated (body/validate! activated)))
+    (doseq [condition legacy]
+      (is (= :kernel-body-index-precondition
+             (reason-of #(body/validate!
+                           (update-in checked [:attributes :required-preconditions]
+                             (fn [conditions] (filterv (fn [c] (not= condition c)) conditions))))))
+          "partial legacy requirements cannot silently replace complete entered obligations"))))
+
+(deftest loop-header-obligations-are-collected-before-the-inner-binder
+  (doseq [bound-position [:lower :upper]]
+    (let [parameters (mapv #(body/->KernelParameter % :scalar :long [] nil nil :parameter) '[N d])
+          indices [(body/->IndexBinding 'header-group :group 0)
+                   (body/->IndexCompute 'header-flat (body/index-cast 'header-group :long :exact))]
+          axis (body/->IndexCompute 'header-axis (body/expression :mod 'header-flat 'd))
+          expression (body/expression :add 'header-axis (body/index-cast 1 :long :exact))
+          zero (body/index-cast 0 :long :exact)
+          lower (if (= bound-position :lower) expression zero)
+          upper (if (= bound-position :upper) expression zero)
+          loop (body/->ForLoop (body/value 'header-inner :long) lower upper 1 [] [(body/->Yield [])] [] {})
+          guard (body/->Guard :header-active [axis loop])
+          masks [(body/->Mask :header-active [(body/predicate :lt 'header-flat 'N)])]
+          launch-spec (launch/spec {:workgroup-size [1] :group-count [1]})
+          base (body/quotient-domain-preconditions 'N 'd)
+          builder (scalar-expression/make-lowerer
+                    {:array-types {} :scalar-types {'N :long 'd :long} :arrays #{}
+                     :index-scope #{'N 'd 'header-flat 'header-axis 'header-inner} :lower-index identity
+                     :decline! (fn [& args] (throw (ex-info "unexpected header decline" {:arguments args})))})
+          region {:parameters parameters :indices indices :masks masks :launch launch-spec
+                  :guard guard :index-definitions [axis] :required-preconditions base}
+          _ ((:with-index-region builder) region
+              #((:with-loop-index builder) 'header-inner lower upper :exclusive (fn [] :entered)))
+          conditions ((:required-preconditions builder))
+          header-conditions (vec (remove (set base) conditions))
+          checked (body/make {:id [:header-prefix bound-position] :parameters parameters :indices indices
+                              :masks masks :launch launch-spec :operations [guard]
+                              :attributes {:required-preconditions conditions}})]
+      (is (seq header-conditions))
+      (is (not-any? #{'header-inner} (mapcat #(concat (launch/expression-references (:expression %))
+                                                    (launch/expression-references (:value %))) conditions)))
+      (is (= checked (body/validate! checked)))
+      (is (precondition/check! conditions {'N 0 'd Long/MIN_VALUE}))
+      (is (thrown? clojure.lang.ExceptionInfo (precondition/check! conditions {'N 1 'd 0})))
+      (doseq [condition header-conditions]
+        (is (= :kernel-body-index-precondition
+               (try (body/validate! (assoc-in checked [:attributes :required-preconditions]
+                                              (vec (remove #{condition} conditions)))) :accepted
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+            "an empty inner loop does not erase a bound that was already evaluated")))))

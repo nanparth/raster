@@ -201,6 +201,41 @@
                         (index-expression/lower
                          expression (set/union index-scope extra-scope) decline!)
                         (merge index-types extra-types))))
+        group-index 'map-group
+        local-index 'map-lane
+        launch-index (if sequential-effects? 'effect-launch index)
+        ;; These are physical capacities supplied by the enclosing graph, not a proof that
+        ;; arbitrary indexed accesses are in bounds. The iteration extent remains independent.
+        pointer-shape (fn [id] (get array-shapes id ['_n_bound]))
+        parameters
+        (vec (concat
+              (map #(body/->KernelParameter
+                     % :input (get array-types %) (pointer-shape %) :global
+                     (layout/row-major (pointer-shape %) (get array-types %)) :operand)
+                   read-only-inputs)
+              (map #(body/->KernelParameter
+                     % (if (contains? inout %) :inout :output)
+                     (get array-types %) (pointer-shape %) :global
+                     (layout/row-major (pointer-shape %) (get array-types %)) :result)
+                   outputs)
+              (map #(body/->KernelParameter % :scalar (get scalar-types %) [] nil nil :parameter)
+                   scalars)
+              [(body/->KernelParameter '_n_bound :scalar bound-dtype [] nil nil :bound)]))
+        indices [(body/->IndexBinding group-index :group 0)
+                 (body/->IndexBinding local-index :local 0)
+                 (body/->IndexCompute launch-index
+                  (widen-index-expression
+                   (body/expression :add (body/expression :mul group-index workgroup-size) local-index)
+                   {group-index :int local-index :int}))]
+        base-masks [(body/->Mask :map-active
+                     [(if sequential-effects? (body/predicate :eq launch-index 0)
+                          (body/predicate :lt index (body/index-cast '_n_bound :long :exact)))])]
+        launch-spec (if sequential-effects?
+                      (launch/spec {:workgroup-size [1] :group-count [1]})
+                      (launch/spec {:workgroup-size [workgroup-size]
+                                    :group-count [(launch/maximum 1 (launch/ceil-div '_n_bound workgroup-size))]}))
+        extent-preconditions (if sequential-effects? [] [{:expression '_n_bound :op :>= :value 0}])
+        scalar-guard (body/->Guard :map-active [])
         strict-effects? (soac-dialect/strict-effect-scalar-policy? effects)
         lowerer (scalar-expression/make-lowerer
                  (cond-> {:array-types array-types :scalar-types scalar-types
@@ -235,7 +270,13 @@
               :environment (assoc environment (:result lowered) (:type lowered))}))
          {:substitutions {} :operations [] :environment base-environment}
          locals))
-        local-state (lower-locals locals base-environment)
+        lowered-state
+        ((if sequential-effects? (fn [_ f] (f)) (:with-varying-index-region lowerer))
+         {:parameters parameters :indices indices :launch launch-spec :masks base-masks
+          :guard scalar-guard :index-definitions [] :required-preconditions extent-preconditions}
+         (fn []
+           (let [
+                  local-state (lower-locals locals base-environment)
         forms (if ordered-effects?
                 []
                 (scalar-forms (util/subst-syms (:substitutions local-state) result)))
@@ -270,13 +311,12 @@
                       (decline! :explicit-store-target
                                 "map store targets an undeclared result"
                                 {:operation (:id segmap) :statement form :target array}))
-                  coordinate-value (when (or (contains-indexed-load? coordinate)
-                                             (index-expression/requires-scalar-evaluation? coordinate))
-                                     ((:lower lowerer) coordinate :long environment))
-                  coordinate-expression (if coordinate-value
-                                          (:result coordinate-value)
-                                          (lower-index coordinate (set (keys environment))
-                                                       environment))
+                  coordinate-value
+                  ((:source-coordinate lowerer) array coordinate environment
+                   (when-not (or (contains-indexed-load? coordinate)
+                                 (index-expression/requires-scalar-evaluation? coordinate))
+                     (lower-index coordinate (set (keys environment)) environment)))
+                  coordinate-expression (:coordinate coordinate-value)
                   _ ((:require-index lowerer) coordinate-expression)
                   lowered ((:lower lowerer) expression (get array-types array) environment)]
               (concat (:operations coordinate-value)
@@ -519,15 +559,12 @@
                                        "ordered effect targets an undeclared result"
                                        {:operation (:id segmap) :effect effect}))
                            (let [coordinate-value
-                                 (when (or (contains-indexed-load? destination-index)
-                                           (index-expression/requires-scalar-evaluation?
-                                            destination-index))
-                                   ((:lower lowerer) destination-index :long environment))
-                                 coordinate-expression
-                                 (if coordinate-value
-                                   (:result coordinate-value)
-                                   (lower-index destination-index
-                                                (set (keys environment)) environment))
+                                 ((:source-coordinate lowerer) destination destination-index environment
+                                  (when-not (or (contains-indexed-load? destination-index)
+                                                (index-expression/requires-scalar-evaluation?
+                                                 destination-index))
+                                    (lower-index destination-index (set (keys environment)) environment)))
+                                 coordinate-expression (:coordinate coordinate-value)
                                  _ ((:require-index lowerer) coordinate-expression)
                                  lowered-value
                                  ((:lower lowerer) value (get array-types destination) environment)
@@ -611,9 +648,9 @@
                      (when primary-output
                        [(body/->ScalarStore primary-output [index]
                                             (:result primary-lowered) :map-active)])))
-        group-index 'map-group
-        local-index 'map-lane
-        launch-index (if sequential-effects? 'effect-launch index)
+             ]
+             {:scalar-operations scalar-operations :effect-masks (:masks effect-state)})))
+        scalar-operations (:scalar-operations lowered-state)
         scheduled-operations
         (if sequential-effects?
           [(body/->ForLoop
@@ -628,64 +665,26 @@
           ;; The physical launch is padded to a workgroup multiple. Guard the complete logical
           ;; iteration, not only its loads/stores: checked casts and arithmetic in ScalarCompute
           ;; also carry observable exceptional control and must not run for padding lanes.
-          [(body/->Guard :map-active scalar-operations)])
-        ;; These are physical capacities supplied by the enclosing graph, not a proof that
-        ;; arbitrary indexed accesses are in bounds. The iteration extent remains independent.
-        pointer-shape (fn [id] (get array-shapes id ['_n_bound]))
-        parameters
-        (vec (concat
-              (map #(body/->KernelParameter
-                     % :input (get array-types %) (pointer-shape %) :global
-                     (layout/row-major (pointer-shape %) (get array-types %)) :operand)
-                   read-only-inputs)
-              (map #(body/->KernelParameter
-                     % (if (contains? inout %) :inout :output)
-                     (get array-types %) (pointer-shape %) :global
-                     (layout/row-major (pointer-shape %) (get array-types %)) :result)
-                   outputs)
-              (map #(body/->KernelParameter % :scalar (get scalar-types %) [] nil nil :parameter)
-                   scalars)
-              [(body/->KernelParameter '_n_bound :scalar bound-dtype [] nil nil :bound)]))]
+          [(assoc scalar-guard :operations scalar-operations)])]
     {:kernel-body
      (body/make
       {:id [:segmap (:id segmap) :portable-one-item]
        :parameters parameters
        :stable-reads (mapv body/stable-read read-only-inputs)
-       :indices [(body/->IndexBinding group-index :group 0)
-                 (body/->IndexBinding local-index :local 0)
-                 (body/->IndexCompute
-                  launch-index
-                  (let [expression (body/expression :add
-                                                    (body/expression :mul group-index workgroup-size)
-                                                    local-index)]
-                    (if (seq ((:required-preconditions lowerer)))
-                      (widen-index-expression expression {group-index :int local-index :int})
-                      (body/index-cast expression :long :exact))))]
-       :masks (into [(body/->Mask
-                      :map-active
-                      [(if sequential-effects?
-                         (body/predicate :eq launch-index 0)
-                         (body/predicate :lt index
-                                         (body/index-cast '_n_bound :long :exact)))])]
-                    (:masks effect-state))
+       :indices indices
+       :masks (into base-masks (:effect-masks lowered-state))
        :operations scheduled-operations
        :schedule {:strategy (if sequential-effects?
                               :one-work-item-ordered-loop
                               :one-work-item-per-element)
                   :association (if sequential-effects? :ordered :independent)
                   :workgroup-size workgroup-size}
-       :launch (if sequential-effects?
-                 (launch/spec {:workgroup-size [1] :group-count [1]})
-                 (launch/spec {:workgroup-size [workgroup-size]
-                               ;; Empty maps still have a valid driver launch. The existing
-                               ;; extent mask suppresses every operation, including effects.
-                               :group-count [(launch/maximum
-                                              1 (launch/ceil-div '_n_bound workgroup-size))]}))
+       :launch launch-spec
        :provenance {:dialect :kernel-body :source-dialect :segmap
                     :segop-id (:id segmap)}
        :attributes (cond-> {:kind :portable-segmap :extent bound :no-write-alias true
                             :effect-iteration-order iteration-order
-                            :required-preconditions ((:required-preconditions lowerer))}
+                            :required-preconditions (vec (distinct (concat extent-preconditions ((:required-preconditions lowerer)))))}
                      (:address-projection segmap)
                      (assoc :address-projection (:address-projection segmap)))})
      :bound bound :inputs read-only-inputs :outputs outputs :scalars scalars}))

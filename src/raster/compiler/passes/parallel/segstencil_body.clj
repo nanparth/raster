@@ -132,11 +132,11 @@
                  (body/->IndexBinding local-index :local 0)
                  (body/->IndexCompute
                   index
-                  (body/index-cast
+                  (widen-index-expression
                    (body/expression :add
                                     (body/expression :mul group-index workgroup-size)
                                     local-index)
-                   :long :exact))]
+                   {group-index :int local-index :int}))]
        :masks [(body/->Mask
                 :stencil-active
                 [(body/predicate :lt index (body/index-cast '_n_bound :long :exact))])]

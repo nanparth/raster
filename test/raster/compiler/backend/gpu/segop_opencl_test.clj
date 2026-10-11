@@ -14,6 +14,7 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-body :as kernel-body]
+            [raster.compiler.ir.scalar-range :as scalar-range]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-call :as kcall]
@@ -24,6 +25,7 @@
             [raster.compiler.passes.parallel.scheduled-equation-graph :as equation-graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.segmap-body :as segmap-body]
+            [raster.compiler.passes.parallel.scalar-expression-body :as scalar-body]
             [raster.compiler.passes.parallel.map-read-requirements :as map-reads]
             [raster.compiler.passes.parallel.segmap-capacity-fixture :as capacity-fixture]
             [raster.compiler.passes.parallel.segred-body :as segred-body]
@@ -151,7 +153,11 @@
     (is (= unconditional (kernel-body/validate! unconditional))
         "the contradictory preferred body is independently valid, not malformed setup")
     (is (= artifact (kart/validate! artifact)))
-    (is (empty? (:preconditions ordinary)))
+    (is (= [{:expression '_n_bound :op :>= :value 0}] (:preconditions ordinary))
+        "the actual nonnegative launch extent remains explicit even without address arithmetic")
+    (is (true? (precondition/check! (:preconditions ordinary) (fn [_] 0))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (precondition/check! (:preconditions ordinary) (fn [_] -1))))
     (is (= ordinary (kart/validate! ordinary)))
     (let [scan (get-in (emitted-scan-graph
                        '(raster.par/scan out acc 0.0 i 64 double (+ acc (aget values i))))
@@ -706,7 +712,8 @@
     (is (= [carry-width] (get-in carry [:launch :workgroup-size])))
     (is (= scan-width
            (get-in carry [:attributes :kernel-body :schedule :scan-block-size])))
-    (is (= (kernel-body/expression :floor-div 'scan-index scan-width)
+    (is (= (kernel-body/expression :floor-div 'scan-index
+                                   (kernel-body/index-cast scan-width :long :exact))
            (:expression scan-block)))))
 
 ;; ================================================================
@@ -965,12 +972,16 @@
         loop (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
                             (:operations kernel-body)))
         index-expressions (into {} (map (juxt :id :expression) (:indices kernel-body)))]
-    (is (= '[wide-bound wide-group-index wide-group-count wide-local-index]
-           (mapv :id casts)))
+    (is (= '[wide-group-index wide-group-count wide-local-index] (mapv :id casts)))
+    (is (= (kernel-body/expression :max
+                  (kernel-body/index-cast '_n_bound :long :exact)
+                  (kernel-body/index-cast 0 :long :exact))
+           (get index-expressions 'wide-bound))
+        "only generated zero-trip geometry is clamped; the original bound conversion stays exact")
     (is (every? #(= :long (get-in % [:expression :dtype])) casts))
     (is (= :long (get-in loop [:index :type])))
     (is (= :ceil-div (get-in index-expressions ['group-chunk :op]))
-        "the checked index algebra handles zero without forming n-1 or n+groups-1")
+        "the actual Long ceil-div addition prefix is independently checked, including zero")
     (is (= :add (:op (get index-expressions 'group-end))))))
 
 (deftest completed-scalar-reduction-transform-is-terminal-and-numerically-explicit
@@ -1352,8 +1363,8 @@
                       :target-dialect :opencl-portable)
                      nil
                      (catch clojure.lang.ExceptionInfo error (ex-data error)))]
-        (is (= :kernel-body-index-precondition (:reason result))
-            (str "unrelated Long operands cannot claim quotient correlation: " replacement))))))
+        (is (= :kernel-body-c-trap-unsupported (:reason result))
+            (str "unrelated Long operands retain checked arithmetic and portable emission rejects: " replacement))))))
 
 (deftest actual-keyword-operand-cannot-overwrite-conditional-index-prefix
   (let [operation (assoc (quotient-neighbour-operation)
@@ -1472,6 +1483,27 @@
                                        :array-types {'output :double 'fine :double}
                                        :target-dialect :opencl-portable))
 
+(defn- assert-independent-address-contract [artifact]
+  (let [checked (get-in artifact [:attributes :kernel-body])
+        scheduled (get-in artifact [:attributes :scheduled-kernel-body])
+        conditions (:preconditions artifact)]
+    (is (= artifact (kart/validate! artifact)))
+    (is (= conditions (kernel-body/required-preconditions checked)))
+    (is (= conditions (:preconditions scheduled)))
+    (is (= conditions (:required-preconditions
+                        (scalar-emitter/emit-scalar-module
+                         "independent_address_contract" checked {:target-dialect :opencl-portable}))))
+    (is (some #(and (= :<= (:op %))
+                    (instance? raster.compiler.ir.kernel_launch.Sum (:expression %))) conditions)
+        "distinct operands retain a separately checked sum cap")
+    (doseq [condition conditions]
+      (is (contains? #{:kernel-body-index-precondition :kernel-body-intrinsic-overflow}
+                     (try (kernel-body/validate!
+                            (assoc-in checked [:attributes :required-preconditions]
+                                      (vec (remove #{condition} conditions)))) :accepted
+                          (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+          "every independent divisor/prefix condition is reconstructed at consumption"))))
+
 (defn- remaining-product-trap [operation scalar-types]
   (let [scheduled (segmap-body/schedule operation {:scalar-types scalar-types
                                                   :array-types {'output :double 'fine :double}})]
@@ -1541,11 +1573,11 @@
     (is (thrown? ArithmeticException
                  (precondition/check! required (bindings 1 Long/MAX_VALUE Long/MAX_VALUE))))
     (doseq [init ['(rem other divisor)]]
-      (is (= :kernel-body-index-precondition
+      (is (= {:reason :kernel-body-c-trap-unsupported :operation :* :type :long}
              (try (remaining-product-artifact
                    (-> operation (assoc-in [:scalar-region :locals 1 :init] init)
                        (update :scalars conj 'other)) (assoc types 'other :long)) nil
-                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+                  (catch clojure.lang.ExceptionInfo error (select-keys (ex-data error) [:reason :operation :type]))))
           "an unrelated numerator cannot inherit the guarded index's range"))
     (let [separate (remaining-product-artifact
                     (-> operation (assoc-in [:scalar-region :locals 1 :init] '(rem (long flat) other))
@@ -1723,15 +1755,32 @@
   (let [types {'n :long 'divisor :long 'other :long}
         bindings (fn [n d other] (fn [id] (case id _n_bound n divisor d other other)))
         same (remaining-product-artifact
-              (recomposition-store-operation '(rem (long row) divisor) #{'divisor}) types)]
+              (recomposition-store-operation '(rem (long row) divisor) #{'divisor}) types)
+        changed (remaining-product-artifact
+                 (recomposition-store-operation '(rem (long row) other) #{'divisor 'other}) types)
+        computes (filter #(instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                         (tree-seq coll? seq (get-in changed [:attributes :kernel-body])))
+        quotient (first (filter #(= :quot (get-in % [:expression :op])) computes))
+        remainder (first (filter #(= :rem (get-in % [:expression :op])) computes))]
     (is (= same (kart/validate! same)))
     (is (precondition/check! (:preconditions same) (bindings Long/MAX_VALUE 1 1)))
-    (doseq [remainder ['(rem (long row) other) '(rem other divisor)]]
-      (is (= :kernel-body-index-precondition
-             (try (remaining-product-artifact
-                   (recomposition-store-operation remainder #{'divisor 'other}) types) nil
-                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
-          "distinct actual divisor/numerator identities cannot fall through unresolved address arithmetic"))))
+    (is (= 'other (last (get-in remainder [:expression :arguments]))))
+    (is (not= (get-in quotient [:expression :arguments])
+              (get-in remainder [:expression :arguments])))
+    (assert-independent-address-contract changed)
+    (is (precondition/check! (:preconditions changed) (bindings 1 1 1)))
+    (is (precondition/check! (:preconditions changed) (bindings 0 Long/MIN_VALUE Long/MIN_VALUE)))
+    (doseq [d [0 -1]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (precondition/check! (:preconditions changed) (bindings 1 1 d)))))
+    (is (thrown? ArithmeticException
+                 (precondition/check! (:preconditions changed) (bindings Long/MAX_VALUE 1 3)))
+        "the independently retained sum cap rejects MAX-1 plus a remainder bound of two")
+    (is (= {:reason :kernel-body-c-trap-unsupported :operation :+ :type :long}
+           (try (remaining-product-artifact
+                  (recomposition-store-operation '(rem other divisor) #{'divisor 'other}) types) :accepted
+                (catch clojure.lang.ExceptionInfo error
+                  (select-keys (ex-data error) [:reason :operation :type])))))))
 
 (deftest explicit-store-and-atomic-addresses-retain-independent-obligations
   (doseq [store ['(clojure.core/aset output (+ k width 1) 0.0)
@@ -1848,14 +1897,27 @@
                    (fn [loop-operation] (assoc loop-operation :step 2))
                    (fn [loop-operation] (assoc-in loop-operation [:attributes :upper-bound] :inclusive))]]
     (is (= checked (kernel-body/validate! checked)))
-    (doseq [mutate mutations]
+    (doseq [[position mutate] (map-indexed vector mutations)]
       (let [candidate (walk/postwalk
                        #(if (instance? raster.compiler.ir.kernel_body.ForLoop %) (mutate %) %)
                        checked)
             result (try (kernel-body/validate! candidate) nil
                         (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))]
-        (is (= :kernel-body-intrinsic-overflow result)
-            (str "a schema-valid noncanonical loop cannot retain the old multiplication proof: " result))))))
+        (if (= position 1)
+          (let [conditions (kernel-body/required-preconditions candidate)
+                loops (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                              (tree-seq coll? seq candidate))]
+            (is (= candidate (kernel-body/validate! candidate)))
+            (is (every? #(= 2 (:step %)) loops))
+            (is (= 5 (count conditions)))
+            (doseq [condition conditions]
+              (is (contains? #{:kernel-body-index-precondition :kernel-body-intrinsic-overflow}
+                             (try (kernel-body/validate!
+                                    (assoc-in candidate [:attributes :required-preconditions]
+                                              (vec (remove #{condition} conditions)))) :accepted
+                                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+          (is (= :kernel-body-intrinsic-overflow result)
+              (str "unknown lower and inclusive loops do not acquire the exclusive entered proof: " result)))))))
 
 (deftest quotient-address-ancestry-survives-checked-aliases-and-backedges
   (let [operation (recomposition-store-operation '(rem (long row) divisor) #{'divisor})
@@ -2027,17 +2089,38 @@
                  (update-in [:scalar-region :locals] #(vec (take 4 %)))
                  (assoc-in [:scalar-region :result] '(aget fine (+ (* q2 seq-len) r2))))
         types {'n :long 'ss :long 'seq-len :long 'slab :long 'head-dim :long 'other :long}
-        positive (remaining-product-artifact base types)]
+        positive (remaining-product-artifact base types)
+        bindings (fn [n ss seq-len other]
+                   (fn [id] (case id _n_bound n ss ss seq-len seq-len other other slab 1 head-dim 1)))]
     (is (= positive (kart/validate! positive)))
-    (doseq [r2 ['(rem r1 other) '(rem q1 seq-len)]]
-      (let [different (-> base
-                          (update :scalars conj 'other)
-                          (assoc-in [:scalar-region :locals 3 :init] r2))]
-        (is (= :kernel-body-index-precondition
-               (try (remaining-product-artifact different types) nil
-                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
-            "an unrelated actual nested numerator/divisor cannot inherit the exact recomposition relation")))))
-
+    (doseq [[position r2] (map-indexed vector ['(rem r1 other) '(rem q1 seq-len)])]
+      (let [different (-> base (update :scalars conj 'other)
+                          (assoc-in [:scalar-region :locals 3 :init] r2))
+            artifact (remaining-product-artifact different types)
+            computes (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                                   (contains? #{:quot :rem} (get-in % [:expression :op])))
+                             (tree-seq coll? seq (get-in artifact [:attributes :kernel-body])))
+            [q1 r1 q2 actual-r2] computes
+            actual-arguments (get-in actual-r2 [:expression :arguments])]
+        (is (= 4 (count computes)))
+        (is (= (get-in (if (zero? position) r1 q1) [:result :id]) (first actual-arguments)))
+        (is (= (if (zero? position) 'other 'seq-len) (second actual-arguments)))
+        (is (not= (get-in q2 [:expression :arguments]) actual-arguments)
+            "the emitted source keeps the mismatched operands rather than replacing the remainder")
+        (assert-independent-address-contract artifact)
+        (is (precondition/check! (:preconditions artifact) (bindings 1 1 1 1)))
+        (is (precondition/check! (:preconditions artifact)
+                                (bindings 0 Long/MIN_VALUE Long/MIN_VALUE Long/MIN_VALUE)))
+        (doseq [divisor [0 -1]]
+          (is (thrown? clojure.lang.ExceptionInfo
+                       (precondition/check! (:preconditions artifact)
+                         (if (zero? position) (bindings 1 1 1 divisor)
+                             (bindings 1 1 divisor 1))))))
+        (is (thrown? ArithmeticException
+                     (precondition/check! (:preconditions artifact)
+                       (if (zero? position) (bindings Long/MAX_VALUE 3 1 3)
+                           (bindings Long/MAX_VALUE 1 3 1))))
+            "this binding violates the actual retained conservative sum cap, not a claimed device counterexample")))))
 
 (deftest broad-valid-overflow-proof-does-not-erase-the-static-read-domain
   (let [graph (capacity-fixture/inferred-graph '(let* [k (+ i j)] (aget a k)))
@@ -2056,3 +2139,1123 @@
       (is (nil? (map-reads/static-read-requirements
                  indirect {:dtype :float :array-types {'a :float 'b :float 'C :float}}))
           "unknown loaded contents cannot supply an input capacity"))))
+
+
+(defn- ordinary-typed-quotient-address-operation [coordinate]
+  (assoc (remaining-product-map nil #{'numerator 'divisor})
+         :inputs #{'fine}
+         :scalar-region
+         {:locals [{:id 'q :dtype :long :init '(quot numerator divisor)}
+                   {:id 'alias :dtype :long :init '(long q)}]
+          :result (list 'aget 'fine coordinate)}))
+
+(deftest typed-quotient-result-retains-its-declared-range-at-an-exact-identity-cast
+  (let [captured (atom nil)
+        original kernel-body/validate!
+        result (with-redefs [kernel-body/validate!
+                            (fn [checked]
+                              (reset! captured checked)
+                              (original checked))]
+                 (try
+                   {:scheduled (segmap-body/schedule
+                                (ordinary-typed-quotient-address-operation 'alias)
+                                {:scalar-types {'n :long 'numerator :long 'divisor :long}
+                                 :array-types {'fine :double 'output :double}})}
+                   (catch clojure.lang.ExceptionInfo error {:error (ex-data error)})))
+        quotient (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                                      (= :quot (get-in % [:expression :op])))
+                                (tree-seq coll? seq @captured)))]
+    (is (some? quotient) "the actual typed quotient reaches independent body validation")
+    (is (= :long (get-in quotient [:expression :result-type])))
+    (is (= {} (get-in quotient [:expression :options]))
+        "optional range bookkeeping does not certify or change division semantics")
+    (is (nil? (:error result)) (str "same-Long identity cast retains declared range: " (:error result)))
+    (when-let [scheduled (:scheduled result)]
+      (is (= (:body scheduled) (original (:body scheduled)))))))
+
+(deftest typed-quotient-range-fallback-does-not-certify-overflowing-address-arithmetic
+  (let [operation (ordinary-typed-quotient-address-operation '(+ alias (long 1)))
+        options {:scalar-types {'n :long 'numerator :long 'divisor :long}
+                 :array-types {'fine :double 'output :double}}
+        scheduled (segmap-body/schedule operation options)
+        operations (tree-seq coll? seq (:body scheduled))
+        load (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                                  (= 'fine (:buffer %))) operations))
+        coordinate (first (:coordinates load))
+        compute (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                                     (= coordinate (get-in % [:result :id]))) operations))]
+    (is (symbol? coordinate))
+    (is (= :+ (get-in compute [:expression :op])))
+    (is (= :long (get-in compute [:expression :result-type])))
+    (is (= :trap (get-in compute [:expression :options :overflow]))
+        "unknown quotient range does not certify unchecked addition; actual source checks remain")
+    (is (= (:body scheduled) (kernel-body/validate! (:body scheduled))))
+    (doseq [target [:opencl-intel :cuda :hip]]
+      (is (str/includes? (:source (sg/generate-scheduled-segmap-kernel operation
+                                   :scalar-types (:scalar-types options)
+                                   :array-types (:array-types options) :target-dialect target))
+                         "rstr_trap_add_i64")))
+    (is (= :kernel-body-c-trap-unsupported
+           (try (sg/generate-scheduled-segmap-kernel operation
+                  :scalar-types (:scalar-types options) :array-types (:array-types options)
+                  :target-dialect :opencl-portable)
+                nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+  (doseq [divisor [{:lower 0 :upper 0} {:lower -1 :upper -1}
+                   (scalar-range/for-dtype :long)]]
+    (is (nil? (scalar-range/quotient [(scalar-range/for-dtype :long) divisor]))
+        "unknown or exceptional divisor domains acquire no interval proof")))
+
+
+(defn- nested-quotient-numerator-address-operation []
+  (let [typed-long (fn [form]
+                     (walk/postwalk #(if (seq? %) (with-meta % {:raster.type/tag 'long}) %) form))]
+    (assoc (remaining-product-map nil #{'slab 'group 'other 'different})
+           :inputs #{'fine}
+           :scalar-region
+           {:locals [{:id 'q :dtype :long :init (typed-long '(quot (long row) slab))}
+                     {:id 'r :dtype :long :init (typed-long '(rem (long row) slab))}
+                     {:id 'g :dtype :long :init (typed-long '(quot q group))}]
+            :result '(aget fine (+ (* g slab) r))})))
+
+(deftest nested-quotient-numerator-retains-its-actual-identity-and-activation
+  (let [operation (nested-quotient-numerator-address-operation)
+        result (try
+                 {:scheduled (segmap-body/schedule
+                              operation
+                              {:scalar-types {'n :long 'slab :long 'group :long 'other :long 'different :long}
+                               :array-types {'fine :double 'output :double}})}
+                 (catch clojure.lang.ExceptionInfo error {:error (ex-data error)}))]
+    (is (nil? (:error result))
+        (str "actual broadcast q=quot(row,slab),g=quot(q,group),r=rem(row,slab) address must close: " (:error result)))
+    (when-let [error (:error result)]
+      (is (= :kernel-body-index-precondition (:reason error))
+          "the retained complete chain reaches independent address closure, not a setup decline"))
+    (when-let [scheduled (:scheduled result)]
+      (let [checked (:body scheduled)
+            computes (filter #(instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                             (tree-seq coll? seq checked))
+            quotients (filter #(= :quot (get-in % [:expression :op])) computes)
+            inner (last quotients)
+            outer (first quotients)
+            options (get-in inner [:expression :options])
+            conditions (get-in checked [:attributes :required-preconditions])]
+        (is (= 2 (count quotients)))
+        (is (= (get-in outer [:result :id]) (first (get-in inner [:expression :arguments]))))
+        (is (= {} options))
+        (is (= checked (kernel-body/validate! checked)))
+        (is (precondition/check! conditions
+                                (fn [id] (case id _n_bound 0 slab Long/MIN_VALUE group Long/MIN_VALUE
+                                               other Long/MIN_VALUE different Long/MIN_VALUE))))
+        (doseq [replacement ['different 'other]]
+          (let [position (if (= replacement 'different) 0 1)
+                changed (walk/postwalk
+                         (fn [value]
+                           (if (= value inner)
+                             (update-in value [:expression :arguments] assoc position replacement)
+                             value)) checked)
+                reason (try (kernel-body/validate! changed) nil
+                            (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))]
+            (is (contains? #{:kernel-body-index-precondition :kernel-body-required-preconditions
+                             :kernel-body-scalar-precondition} reason)
+                (str "changed actual numerator/divisor cannot inherit original obligations: " reason))))))))
+
+
+(deftest different-origin-nonnegative-address-sum-requires-a-complete-proof
+  (let [captured (atom nil)
+        original kernel-body/validate!
+        _ (with-redefs [kernel-body/validate! (fn [checked]
+                                               (reset! captured checked)
+                                               (original checked))]
+            (try
+              (segmap-body/schedule
+               (nested-quotient-numerator-address-operation)
+               {:scalar-types {'n :long 'slab :long 'group :long 'other :long 'different :long}
+                :array-types {'fine :double 'output :double}})
+              (catch clojure.lang.ExceptionInfo _ nil)))
+        outer-upper (klaunch/maximum 0 (klaunch/sum
+                                       (klaunch/ceil-div '_n_bound (klaunch/maximum 'slab 1)) -1))
+        inner-upper (klaunch/maximum 0 (klaunch/sum
+                                       (klaunch/ceil-div (klaunch/sum outer-upper 1)
+                                                        (klaunch/maximum 'group 1)) -1))
+        ;; Independently declare the current child multiplication obligations. The
+        ;; validator still reconstructs them; this does not certify the parent sum.
+        required (vec (distinct (concat (get-in @captured [:attributes :required-preconditions])
+                                        [{:expression 'slab :op :>= :value 0}
+                                         {:expression (klaunch/product inner-upper
+                                                        (klaunch/product (klaunch/minimum '_n_bound 1) 'slab))
+                                          :op :<= :value Long/MAX_VALUE}])))
+        checked (assoc-in @captured [:attributes :required-preconditions] required)
+        load (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                                  (= 'fine (:buffer %))) (tree-seq coll? seq checked)))
+        coordinate (first (:coordinates load))
+        child (first (:arguments coordinate))
+        child-only (walk/postwalk #(if (= % load) (assoc % :coordinates [child]) %) checked)
+        result (try {:body (original checked)}
+                    (catch clojure.lang.ExceptionInfo error {:error (ex-data error)}))]
+    (is (= :add (:op coordinate)))
+    (is (= :mul (:op child)))
+    (is (= child-only (original child-only))
+        "the actual child multiply is independently valid before claiming anything about the sum")
+    (is (nil? (:error result))
+        (str "different checked origins with the same activation require an independent combined bound: " (:error result)))
+    (when-let [error (:error result)]
+      (is (= :kernel-body-index-precondition (:reason error)))
+      (is (= :add (get-in error [:expression :op]))
+          "the discrimination reaches the parent addition after valid child obligations"))))
+
+
+(deftest compositional-address-obligations-cannot-be-dropped-or-forged
+  (let [scheduled (segmap-body/schedule
+                   (nested-quotient-numerator-address-operation)
+                   {:scalar-types {'n :long 'slab :long 'group :long 'other :long 'different :long}
+                    :array-types {'fine :double 'output :double}})
+        checked (:body scheduled)
+        conditions (get-in checked [:attributes :required-preconditions])
+        caps (filter #(and (= :<= (:op %)) (= Long/MAX_VALUE (:value %))) conditions)
+        load (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                                  (= 'fine (:buffer %))) (tree-seq coll? seq checked)))
+        coordinate (first (:coordinates load))
+        child (first (:arguments coordinate))
+        rejection (fn [body]
+                    (try (kernel-body/validate! body) nil
+                         (catch clojure.lang.ExceptionInfo error (ex-data error))))]
+    (is (= checked (kernel-body/validate! checked)))
+    (is (= 2 (count caps)) "separate child multiplication and final addition bounds are retained")
+    (doseq [condition conditions]
+      (let [changed (assoc-in checked [:attributes :required-preconditions]
+                              (vec (remove #{condition} conditions)))]
+        (is (= :kernel-body-index-precondition (:reason (rejection changed)))
+            (str "each inherited/child/parent obligation is independently required: " condition))))
+    (let [sum-cap (first (filter #(instance? raster.compiler.ir.kernel_launch.Sum (:expression %)) caps))
+          without-sum (assoc-in checked [:attributes :required-preconditions]
+                                (vec (remove #{sum-cap} conditions)))
+          child-only (walk/postwalk #(if (= % load) (assoc % :coordinates [child]) %) without-sum)]
+      (is (some? sum-cap))
+      (is (= child-only (kernel-body/validate! child-only)))
+      (is (= :add (get-in (rejection without-sum) [:expression :op]))))
+    (let [without-guard (update checked :operations
+                                #(vec (mapcat (fn [operation]
+                                                (if (instance? raster.compiler.ir.kernel_body.Guard operation)
+                                                  (:operations operation) [operation])) %)))
+          forged (with-meta (assoc-in without-guard [:attributes :active-upper] '_n_bound)
+                   {:active-upper '_n_bound :quotient-address-origin? false})]
+      (is (zero? (count (filter #(instance? raster.compiler.ir.kernel_body.Guard %)
+                               (tree-seq coll? seq without-guard)))))
+      (is (= :kernel-body-index-precondition (:reason (rejection without-guard))))
+      (is (= :kernel-body-index-precondition (:reason (rejection forged)))
+          "caller metadata cannot supply the removed actual activation"))
+    (let [different-activation
+          (update checked :masks
+                  (fn [masks]
+                    (walk/postwalk
+                     (fn [value]
+                       (if (and (instance? raster.compiler.ir.kernel_body.IndexCast value)
+                                (= '_n_bound (:argument value)))
+                         (assoc value :argument 'other) value)) masks)))]
+      (is (= :kernel-body-index-precondition (:reason (rejection different-activation)))
+          "a different actual guard bound cannot borrow the original domain obligations"))))
+
+(deftest independently-nonnegative-quotient-address-sums-still-reject-active-overflow
+  (let [typed-long (fn [form]
+                     (walk/postwalk #(if (seq? %) (with-meta % {:raster.type/tag 'long}) %) form))
+        operation (assoc (remaining-product-map nil #{'d1 'd2}) :inputs #{'fine}
+                         :scalar-region
+                         {:locals [{:id 'q1 :dtype :long :init (typed-long '(quot (long row) d1))}
+                                   {:id 'q2 :dtype :long :init (typed-long '(quot (long row) d2))}]
+                          :result '(aget fine (+ q1 q2))})
+        scheduled (segmap-body/schedule operation
+                                       {:scalar-types {'n :long 'd1 :long 'd2 :long}
+                                        :array-types {'fine :double 'output :double}})
+        conditions (get-in scheduled [:body :attributes :required-preconditions])
+        bindings (fn [n d1 d2] (fn [id] (case id _n_bound n d1 d1 d2 d2)))]
+    (is (= (:body scheduled) (kernel-body/validate! (:body scheduled))))
+    (is (precondition/check! conditions (bindings 0 Long/MIN_VALUE Long/MIN_VALUE)))
+    (is (precondition/check! conditions (bindings 1 Long/MAX_VALUE Long/MAX_VALUE)))
+    (is (> (*' 2 (dec Long/MAX_VALUE)) Long/MAX_VALUE)
+        "the actual active row MAX-1 produces two individually fitting values whose sum overflows")
+    (is (thrown? ArithmeticException
+                 (precondition/check! conditions (bindings Long/MAX_VALUE 1 1))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (precondition/check! conditions (bindings 1 0 1))))))
+
+
+(deftest computed-uniform-quotient-loop-keeps-its-signed-evaluated-prefix
+  (let [typed-long (fn [form]
+                     (walk/postwalk #(if (seq? %) (with-meta % {:raster.type/tag 'long}) %) form))
+        operation (assoc (remaining-product-map nil #{'in 'out})
+                         :space (segop/make-seg-space 'ro 'n) :inputs #{'fine}
+                         :scalar-region
+                         {:locals [{:id 'o :dtype :long :init (typed-long '(rem (long ro) out))}
+                                   {:id 'nsb :dtype :long :init (typed-long '(quot in (long 256)))}
+                                   {:id 'sbb :dtype :long :init (typed-long '(* o nsb))}]
+                          :result '(fold {:accumulator acc :index sb :identity 0.0 :lower 0
+                                          :extent nsb :dtype :double :association :ordered}
+                                         (lambda [acc sb]
+                                           (region [] [(+ acc (aget fine (+ sbb sb)))])))})
+        captured (atom nil)
+        original kernel-body/validate!
+        result (with-redefs [kernel-body/validate! (fn [checked]
+                                                   (reset! captured checked)
+                                                   (original checked))]
+                 (try {:scheduled (segmap-body/schedule operation
+                                         {:scalar-types {'n :long 'in :long 'out :long}
+                                          :array-types {'fine :double 'output :double}})}
+                      (catch clojure.lang.ExceptionInfo error {:error (ex-data error)})))
+        computes (filter #(instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                         (tree-seq coll? seq @captured))
+        quotient (first (filter #(= :quot (get-in % [:expression :op])) computes))
+        prefix (first (filter #(= :* (get-in % [:expression :op])) computes))
+        loop (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                           (tree-seq coll? seq @captured)))]
+    (is (= {} (get-in quotient [:expression :options])))
+    (is (= :long (get-in prefix [:expression :result-type])))
+    (is (= :trap (get-in prefix [:expression :options :overflow]))
+        "the actual signed prefix is checked before entering the computed-bound loop")
+    (is (some? loop) "the ordered [0,quot(in,256)) loop remains explicit")
+    (is (nil? (:error result))
+        (str "the actual Q4_K computed factor/prefix/loop/load chain requires a complete proof: " (:error result)))
+    (when-let [error (:error result)]
+      (is (= :kernel-body-index-precondition (:reason error)))
+      (is (= :add (get-in error [:expression :op]))))))
+
+
+(defn- checked-loaded-offset-operation []
+  (let [typed-long (fn [form]
+                     (walk/postwalk #(if (seq? %) (with-meta % {:raster.type/tag 'long}) %) form))]
+    (assoc (remaining-product-map nil #{'n-slices 'total-dim 'slice-dim})
+           :inputs #{'indices 'fine}
+           :scalar-region
+           {:locals [{:id 'e :dtype :long :init (typed-long '(quot (long row) n-slices))}
+                     {:id 's :dtype :long :init (typed-long '(rem (long row) n-slices))}
+                     {:id 'ia :dtype :long :init '(aget indices e)}
+                     {:id 'off-a :dtype :long :init (typed-long '(+ (* ia (int total-dim))
+                                                                  (* s (int slice-dim))))}]
+            :result '(fold {:accumulator acc :index d :identity 0.0 :lower 0
+                            :extent slice-dim :dtype :double :association :ordered}
+                           (lambda [acc d]
+                             (region [] [(+ acc (aget fine (+ off-a d)))])))})))
+
+(deftest checked-loaded-long-addresses-retain-scalar-ssa-and-target-traps
+  (let [operation (checked-loaded-offset-operation)
+        types {'n :long 'n-slices :long 'total-dim :long 'slice-dim :long}
+        arrays {'indices :long 'fine :double 'output :double}
+        captured (atom nil)
+        original kernel-body/validate!
+        result (with-redefs [kernel-body/validate! (fn [checked]
+                                                   (reset! captured checked)
+                                                   (original checked))]
+                 (try {:scheduled (segmap-body/schedule operation
+                                         {:scalar-types types :array-types arrays})}
+                      (catch clojure.lang.ExceptionInfo error {:error (ex-data error)})))
+        load (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                                  (= 'fine (:buffer %))) (tree-seq coll? seq @captured)))
+        coordinate (first (:coordinates load))
+        address-compute (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                                             (= coordinate (get-in % [:result :id])))
+                                       (tree-seq coll? seq @captured)))]
+    (is (some? load) "the actual Long-index loaded prefix and entered-loop load reach body validation")
+    (is (symbol? coordinate) "the source checked address is a typed scalar SSA result, not raw C index addition")
+    (is (nil? (:error result)) (str "signed checked source address must remain typed: " (:error result)))
+    (when-let [scheduled (:scheduled result)]
+      (is (= (:body scheduled) (original (:body scheduled))))
+      (is (= :+ (get-in address-compute [:expression :op])))
+      (is (= :long (get-in address-compute [:expression :result-type])))
+      (is (= :trap (get-in address-compute [:expression :options :overflow])))
+      (doseq [target [:opencl-intel :cuda :hip]]
+        (let [artifact (sg/generate-scheduled-segmap-kernel operation
+                        :scalar-types types :array-types arrays :target-dialect target)]
+          (is (str/includes? (:source artifact) "rstr_trap_add_i64"))))
+      (is (= :kernel-body-c-trap-unsupported
+             (try (sg/generate-scheduled-segmap-kernel operation
+                    :scalar-types types :array-types arrays :target-dialect :opencl-portable)
+                  nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))))
+
+(deftest checked-address-selection-preserves-reduction-owner-coordinate-mapping
+  (let [source '(aget fine (+ original-index offset))
+        calls (atom [])
+        mapped (kernel-body/expression :add 'element-index 'offset)
+        lowered (segred-body/lower-element-operations
+                 source
+                 {:index 'original-index :coordinate 'element-index :dtype :double
+                  :arrays #{'fine} :array-types {'fine :double}
+                  :scalars #{'offset} :scalar-types {'offset :long}
+                  :declared-result-dtype :double
+                  :coordinate-lower (fn [coordinate]
+                                      (swap! calls conj coordinate)
+                                      (when (= '(+ original-index offset) coordinate) mapped))})
+        load (first (filter #(instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                            (:operations lowered)))]
+    (is (= ['(+ original-index offset)] @calls))
+    (is (= [mapped] (:coordinates load))
+        "the actual reduction owner retains its admitted element-index mapping")
+    (is (not-any? #{'original-index} (tree-seq coll? seq (:operations lowered))))
+    (is (= :indexed-load
+           (try (segred-body/lower-element-operations
+                 source
+                 {:index 'original-index :coordinate 'element-index :dtype :double
+                  :arrays #{'fine} :array-types {'fine :double}
+                  :scalars #{'offset} :scalar-types {'offset :long}
+                  :declared-result-dtype :double :coordinate-lower (constantly nil)})
+                nil
+                (catch clojure.lang.ExceptionInfo error (:missing-rule (ex-data error)))))
+        "source materialization cannot bypass the owner's coordinate admission")))
+
+(deftest checked-address-selection-keeps-unbound-staged-geometry-structural
+  (let [coordinate (kernel-body/expression :add 'staged-axis (kernel-body/literal 1 :long))
+        seen (atom [])
+        lowerer (scalar-body/make-lowerer
+                 {:arrays #{'fine} :array-types {'fine :double} :scalar-types {}
+                  :index-scope #{'staged-axis}
+                  :lower-index (fn [source _]
+                                 (swap! seen conj source)
+                                 coordinate)
+                  :decline! (fn [rule message data]
+                              (throw (ex-info message (assoc data :missing-rule rule))))})
+        source '(aget fine (+ staged-axis (long 1)))
+        lowered ((:lower lowerer) source :double {})
+        load (first (filter #(instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                            (:operations lowered)))]
+    (is (= ['(+ staged-axis (long 1))] @seen))
+    (is (= [coordinate] (:coordinates load)))
+    (is (not-any? #(instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                  (:operations lowered))
+        "unbound scheduling geometry is not guessed to be a typed source scalar")))
+
+(defn- checked-store-address-operation [kind]
+  (let [typed-long #(walk/postwalk (fn [node] (if (seq? node)
+                                             (with-meta node {:raster.type/tag 'long}) node)) %)
+        scatter? (= :scatter kind)
+        locals (if scatter?
+                 [{:id 'block :dtype :long :init (typed-long '(quot (long row) width))}
+                  {:id 'r :dtype :long :init (typed-long '(rem (long row) width))}
+                  {:id 'destination :dtype :int :init '(aget indices block)}]
+                 [{:id 'half-width :dtype :long :init (typed-long '(quot head-dim (long 2)))}
+                  {:id 'per-row :dtype :long :init (typed-long '(* heads half-width))}
+                  {:id 't :dtype :long :init (typed-long '(quot (long row) per-row))}
+                  {:id 'rest0 :dtype :long :init (typed-long '(rem (long row) per-row))}
+                  {:id 'h :dtype :long :init (typed-long '(quot rest0 half-width))}
+                  {:id 'i :dtype :long :init (typed-long '(rem rest0 half-width))}
+                  {:id 'base :dtype :long :init (typed-long '(+ (* t (* heads head-dim))
+                                                             (* h head-dim)))}])
+        result (if scatter?
+                 '(if (>= destination 0)
+                    (if (< destination indexed-blocks)
+                      (clojure.core/aset output (+ (* destination width) r) (aget fine row))))
+                 '(do (clojure.core/aset output (+ base i) (aget fine (+ base i)))
+                      (clojure.core/aset output (+ (+ base i) half-width)
+                                        (aget fine (+ (+ base i) half-width)))))]
+    (assoc (remaining-product-map result (if scatter? #{'width 'indexed-blocks} #{'heads 'head-dim}))
+           :out-sym nil :inputs (if scatter? #{'indices 'fine} #{'fine})
+           :scalar-region {:locals locals :result result})))
+
+(deftest checked-scatter-store-retains-its-loaded-index-and-branch-placement
+  (let [captured (atom nil) original kernel-body/validate!
+        result (with-redefs [kernel-body/validate! (fn [body] (reset! captured body) (original body))]
+                 (try {:scheduled (segmap-body/schedule (checked-store-address-operation :scatter)
+                                    {:scalar-types {'n :long 'width :long 'indexed-blocks :long}
+                                     :array-types {'indices :int 'fine :double 'output :double}})}
+                      (catch clojure.lang.ExceptionInfo error {:error (ex-data error)})))
+        nodes (tree-seq coll? seq @captured)]
+    (is (= 1 (count (filter #(instance? raster.compiler.ir.kernel_body.ScalarStore %) nodes))))
+    (is (= 2 (count (filter #(instance? raster.compiler.ir.kernel_body.IfRegion %) nodes))))
+    (is (some #(and (instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                    (= 'indices (:buffer %)) (= :int (get-in % [:result :type]))) nodes))
+    (is (nil? (:error result)) (str "actual scatter destination arithmetic remains typed: " (:error result)))
+    (when-let [scheduled (:scheduled result)]
+      (let [inner (first (filter #(and (instance? raster.compiler.ir.kernel_body.IfRegion %)
+                                      (some (fn [node] (instance? raster.compiler.ir.kernel_body.ScalarStore node))
+                                            (:then-operations %))) nodes))
+            operations (:then-operations inner)
+            store (first (filter #(instance? raster.compiler.ir.kernel_body.ScalarStore %) operations))
+            coordinate (first (:coordinates store))
+            compute (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                                         (= coordinate (get-in % [:result :id]))) operations))
+            payload (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                                         (= (:value store) (get-in % [:result :id]))) operations))]
+        (is (symbol? coordinate))
+        (is (= :trap (get-in compute [:expression :options :overflow])))
+        (let [definitions (into {} (for [node nodes
+                                         :when (instance? raster.compiler.ir.kernel_body.ScalarCompute node)]
+                                     [(get-in node [:result :id]) node]))
+              address-computes
+              (letfn [(dependencies [id]
+                        (when-let [node (get definitions id)]
+                          ;; Source q/r already execute before the destination branch.
+                          ;; Newly materialized address arithmetic and casts do not.
+                          (when-not (contains? #{:quot :rem} (get-in node [:expression :op]))
+                            (cons node (mapcat dependencies (get-in node [:expression :arguments]))))))]
+                (set (dependencies coordinate)))
+              multiply (first (filter #(= :* (get-in % [:expression :op])) address-computes))
+              outer (first (filter #(and (instance? raster.compiler.ir.kernel_body.IfRegion %)
+                                         (some #{inner} (:then-operations %))) nodes))]
+          (is (some? multiply) "the loaded destination multiplication is an actual dependency")
+          (is (every? (set operations) address-computes)
+              "every generated address arithmetic/cast dependency stays in the inner branch")
+          (is (some? outer) "the inner destination-limit branch remains under the nonnegative guard")
+          (is (some #{'width} (mapcat #(get-in % [:expression :arguments]) address-computes)))
+          (is (every? #(< (.indexOf operations %) (.indexOf operations payload)) address-computes)))
+        (is (< (.indexOf operations compute) (.indexOf operations payload) (.indexOf operations store))
+            "destination arithmetic stays inside both source branches, before value evaluation/store")
+        (is (= (:body scheduled) (original (:body scheduled))))))
+    (when-let [error (:error result)]
+      (is (= :kernel-body-index-precondition (:reason error))))))
+
+(deftest checked-paired-stores-retain-both-source-addresses
+  (let [captured (atom nil) original kernel-body/validate!
+        result (with-redefs [kernel-body/validate! (fn [body] (reset! captured body) (original body))]
+                 (try {:scheduled (segmap-body/schedule (checked-store-address-operation :paired)
+                                    {:scalar-types {'n :long 'heads :long 'head-dim :long}
+                                     :array-types {'fine :double 'output :double}})}
+                      (catch clojure.lang.ExceptionInfo error {:error (ex-data error)})))
+        nodes (tree-seq coll? seq @captured)]
+    (is (= 2 (count (filter #(instance? raster.compiler.ir.kernel_body.ScalarStore %) nodes))))
+    (is (= 2 (count (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                                 (= 'fine (:buffer %))) nodes))))
+    (is (nil? (:error result)) (str "both actual paired destination additions remain checked: " (:error result)))
+    (when-let [scheduled (:scheduled result)]
+      (doseq [store (filter #(instance? raster.compiler.ir.kernel_body.ScalarStore %) nodes)]
+        (let [coordinate (first (:coordinates store))
+              compute (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                                           (= coordinate (get-in % [:result :id]))) nodes))]
+          (is (symbol? coordinate))
+          (is (= :trap (get-in compute [:expression :options :overflow])))
+          (is (= :map-active (:predicate store)))))
+      (is (= (:body scheduled) (original (:body scheduled)))))
+    (when-let [error (:error result)]
+      (is (= :kernel-body-index-precondition (:reason error))))))
+
+(deftest devirtualized-checked-address-uses-semantic-operands-only
+  (let [coordinate (with-meta (list '.invk 'implementation-receiver 'alias '(long 1))
+                     {:raster.op/original 'raster.numeric/+ :raster.type/tag 'long})
+        scheduled (segmap-body/schedule (ordinary-typed-quotient-address-operation coordinate)
+                    {:scalar-types {'n :long 'numerator :long 'divisor :long}
+                     :array-types {'fine :double 'output :double}})
+        nodes (tree-seq coll? seq (:body scheduled))
+        load (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                                  (= 'fine (:buffer %))) nodes))
+        id (first (:coordinates load))
+        compute (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                                     (= id (get-in % [:result :id]))) nodes))]
+    (is (symbol? id))
+    (is (= :+ (get-in compute [:expression :op])))
+    (is (= :trap (get-in compute [:expression :options :overflow])))
+    (is (not-any? #{'implementation-receiver} nodes))
+    (is (= (:body scheduled) (kernel-body/validate! (:body scheduled))))
+    (is (= :unbound-index-symbol
+           (try (segmap-body/schedule
+                 (ordinary-typed-quotient-address-operation
+                  (with-meta (list '.invk 'implementation-receiver 'alias 'unknown-operand)
+                    {:raster.op/original 'raster.numeric/+ :raster.type/tag 'long}))
+                 {:scalar-types {'n :long 'numerator :long 'divisor :long}
+                  :array-types {'fine :double 'output :double}})
+                nil
+                (catch clojure.lang.ExceptionInfo error (:missing-rule (ex-data error)))))
+        "excluding an implementation receiver does not authorize an unknown semantic operand")))
+
+(deftest guarded-affine-address-keeps-product-and-loop-sum-authority
+  (let [source '(let* [effect (raster.par/map-void!
+                              i rows
+                              (if (> enabled 0)
+                                (dotimes [j width]
+                                  (aset out (+ (* i width) j)
+                                        (aget input (+ (* i width) j))))))] effect)
+        types {'rows :long 'width :long 'enabled :int}
+        result (typed-route/attempt source :float {'out :float 'input :float}
+                                   {:scalar-types types})
+        program (-> result :program :equations first :algorithm)
+        operation (first (lower/lower-typed-effect-map program :ze:0 :dtype :float))
+        artifact (sg/generate-scheduled-segmap-kernel
+                  operation :dtype :float :target-dialect :opencl-portable
+                  :array-types {'out :float 'input :float} :scalar-types types)
+        checked (get-in artifact [:attributes :kernel-body])
+        required (kernel-body/required-preconditions checked)
+        affine (kernel-body/affine-product-preconditions '_n_bound 'width)
+        arguments (fn [n width]
+                    (mapv (fn [slot]
+                            (case (:name slot)
+                              _n_bound {:type :long :value n}
+                              width {:type :long :value width}
+                              enabled {:type :int :value 1}
+                              nil)) (:abi artifact)))]
+    (is (= checked (kernel-body/validate! checked)))
+    (is (every? (set required) affine))
+    (is (kcall/validate-preconditions! artifact (arguments 2 3)))
+    (is (kcall/validate-preconditions! artifact (arguments 1 Long/MAX_VALUE)))
+    (is (thrown? ArithmeticException
+                 (kcall/validate-preconditions! artifact (arguments 2 Long/MAX_VALUE))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (kcall/validate-preconditions! artifact (arguments 0 -1)))
+        "the conservative affine cohort keeps its nonnegative factor requirement")
+    (let [prefix-source '(let* [effect (raster.par/map-void!
+                                        i rows
+                                        (let* [^long offset (* i width)]
+                                          (dotimes [j width]
+                                            (aset out (+ offset j) (aget input (+ offset j))))))] effect)
+          prefix-result (typed-route/attempt prefix-source :float {'out :float 'input :float}
+                                             {:scalar-types types})
+          prefix-operation (first (lower/lower-typed-effect-map
+                                   (-> prefix-result :program :equations first :algorithm)
+                                   :ze:0 :dtype :float))
+          prefix-artifact (sg/generate-scheduled-segmap-kernel
+                           prefix-operation :dtype :float :target-dialect :opencl-portable
+                           :array-types {'out :float 'input :float} :scalar-types types)
+          prefix-arguments (mapv (fn [slot]
+                                   (case (:name slot)
+                                     _n_bound {:type :long :value 1}
+                                     width {:type :long :value -1}
+                                     enabled {:type :int :value 1} nil)) (:abi prefix-artifact))
+          prefix-nodes (kernel-body-operations prefix-artifact)]
+      (is (some #(and (= "ScalarCompute" (operation-kind %))
+                      (= :* (get-in % [:expression :op]))) prefix-nodes))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (kcall/validate-preconditions! prefix-artifact prefix-arguments))
+          "the actual product evaluated before an empty loop retains its factor contract"))
+    (doseq [condition affine]
+      (let [missing (update-in checked [:attributes :required-preconditions]
+                               #(vec (remove #{condition} %)))]
+        (is (thrown? clojure.lang.ExceptionInfo (kernel-body/validate! missing))
+            "independent validation reconstructs each actual product obligation")))))
+
+(deftest affine-product-transfer-retains-the-exact-matched-orientation
+  (let [full {:lower Long/MIN_VALUE :upper Long/MAX_VALUE}
+        values {'factor {:type :long :range full :abi-scalar-identity 'factor :active-upper 'wrong-n}
+                'row {:type :long :range {:lower 0 :upper Long/MAX_VALUE} :active-upper 'n}}
+        transfer (kernel-body/conditional-integer-transfer
+                  (kernel-body/scalar-expression :* :long ['factor 'row] {}) values)]
+    (is (= 'row (get-in transfer [:fact :origin])))
+    (is (= 'n (get-in transfer [:fact :bound])))
+    (is (= 'factor (get-in transfer [:fact :factor])))
+    (is (= (kernel-body/affine-product-preconditions 'n 'factor)
+           (:required-preconditions transfer)))
+    (is (nil? (kernel-body/conditional-integer-transfer
+               (kernel-body/scalar-expression :* :long ['factor 'row] {})
+               (update values 'row dissoc :active-upper))))))
+
+(defn- guarded-affine-effect-body []
+  (let [source '(let* [effect (raster.par/map-void!
+                              i rows (if (> enabled 0)
+                                       (dotimes [j width]
+                                         (aset out (+ (* i width) j)
+                                               (aget input (+ (* i width) j))))))] effect)
+        types {'rows :long 'width :long 'enabled :int}
+        result (typed-route/attempt source :float {'out :float 'input :float} {:scalar-types types})
+        operation (first (lower/lower-typed-effect-map
+                          (-> result :program :equations first :algorithm) :ze:0 :dtype :float))]
+    (get-in (sg/generate-scheduled-segmap-kernel operation :dtype :float :target-dialect :opencl-portable
+              :array-types {'out :float 'input :float} :scalar-types types) [:attributes :kernel-body])))
+
+(defn- affine-pointer-node? [node]
+  (or (instance? raster.compiler.ir.kernel_body.ScalarLoad node)
+      (instance? raster.compiler.ir.kernel_body.ScalarStore node)))
+
+(defn- affine-address-alias-body [checked cast?]
+  (let [serial (atom 0)]
+    (walk/postwalk
+     (fn [node]
+       (if (instance? raster.compiler.ir.kernel_body.ForLoop node)
+         (update node :operations
+           #(vec (mapcat (fn [operation]
+                           (if (affine-pointer-node? operation)
+                             (let [id (symbol (str "permanent-address-alias-" (swap! serial inc)))
+                                   expression (first (:coordinates operation))]
+                               [(kernel-body/->IndexCompute id expression)
+                                (assoc operation :coordinates
+                                       [(if cast? (kernel-body/index-cast id :long :exact) id)])])
+                             [operation])) %))) node)) checked)))
+
+(deftest raw-affine-address-proof-cannot-disappear-at-an-index-alias
+  (let [checked (guarded-affine-effect-body)
+        unsafe (assoc-in checked [:attributes :required-preconditions] [])
+        zero (kernel-body/index-cast 0 :long :exact)
+        hidden (kernel-body/expression :min zero
+                 (kernel-body/expression :max zero (kernel-body/expression :mul 'width 'width)))
+        top (-> (walk/postwalk #(if (affine-pointer-node? %)
+                                 (assoc % :coordinates ['permanent-top-alias]) %) unsafe)
+                (update :indices conj (kernel-body/->IndexCompute 'permanent-top-alias hidden)))
+        without-guard (update checked :operations
+                        #(vec (mapcat (fn [operation]
+                                       (if (instance? raster.compiler.ir.kernel_body.Guard operation)
+                                         (:operations operation) [operation])) %)))
+        different-bound (update checked :masks
+                          (fn [masks]
+                            (mapv (fn [mask]
+                                    (update mask :predicates
+                                      #(mapv (fn [predicate]
+                                               (let [upper (second (:arguments predicate))]
+                                                 (if (and (= :lt (:op predicate))
+                                                          (or (= '_n_bound upper)
+                                                              (= '_n_bound (:argument upper))))
+                                                   (assoc-in predicate [:arguments 1]
+                                                     (if (map? upper) (assoc upper :argument 'width) 'width))
+                                                   predicate))) %))) masks)))]
+    (is (= checked (kernel-body/validate! checked)))
+    (doseq [cast? [false true]]
+      (let [safe (affine-address-alias-body checked cast?)]
+        (is (= safe (kernel-body/validate! safe)) "actual complete lexical obligations permit the alias")))
+    (doseq [candidate [unsafe (affine-address-alias-body unsafe false)
+                       (affine-address-alias-body unsafe true) top without-guard different-bound]]
+      (is (= :kernel-body-index-precondition
+             (try (kernel-body/validate! candidate) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+          "the same unchecked source tree cannot become a checked machine value through an alias"))
+    (let [ordinary (-> (walk/postwalk #(if (affine-pointer-node? %)
+                                       (assoc % :coordinates ['permanent-ordinary-index]) %) checked)
+                       (update :indices conj
+                         (kernel-body/->IndexCompute 'permanent-ordinary-index
+                           (kernel-body/expression :mul (kernel-body/expression :add 2 3) 4))))]
+      (is (= ordinary (kernel-body/validate! ordinary)) "independently bounded ordinary index arithmetic remains valid"))))
+
+(deftest checked-scalar-casts-cannot-launder-an-earlier-unchecked-index
+  (let [checked (guarded-affine-effect-body)
+        unsafe (affine-address-alias-body (assoc-in checked [:attributes :required-preconditions] []) false)
+        serial (atom 0)
+        converted (walk/postwalk
+          (fn [node]
+            (if (instance? raster.compiler.ir.kernel_body.ForLoop node)
+              (update node :operations
+                #(vec (mapcat (fn [operation]
+                                (if (affine-pointer-node? operation)
+                                  (let [old (first (:coordinates operation))
+                                        fp (symbol (str "address-floating-" (swap! serial inc)))
+                                        integer (symbol (str "address-integer-" (swap! serial inc)))]
+                                    [(kernel-body/->ScalarCompute (kernel-body/value fp :double)
+                                      (kernel-body/scalar-expression :cast :double [old]
+                                        {:rounding :nearest-even :overflow :exact}))
+                                     (kernel-body/->ScalarCompute (kernel-body/value integer :long)
+                                      (kernel-body/scalar-expression :cast :long [fp]
+                                        {:rounding :toward-zero :overflow :exact}))
+                                     (assoc operation :coordinates [integer])]) [operation])) %))) node)) unsafe)]
+    (is (= :kernel-body-index-precondition
+           (try (kernel-body/validate! converted) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        "actual typed conversion contracts preserve unresolved source ancestry across floating values")))
+
+(deftest loop-backedges-preserve-unchecked-index-history
+  (let [checked (guarded-affine-effect-body)
+        zero (kernel-body/index-cast 0 :long :exact)
+        hidden (kernel-body/expression :min zero
+                 (kernel-body/expression :max zero (kernel-body/expression :mul 'width 'width)))
+        carry-body
+        (fn [unsafe?]
+          (walk/postwalk
+           (fn [node]
+             (if (instance? raster.compiler.ir.kernel_body.ForLoop node)
+               (assoc node :iter-args [(kernel-body/->LoopArg (kernel-body/value 'address-carry :long)
+                                                      (kernel-body/literal 0 :long))]
+                          :results [(kernel-body/value 'address-loop-result :long)]
+                          :operations
+                          (vec (concat
+                                 (map #(if (affine-pointer-node? %)
+                                         (assoc % :coordinates ['address-carry]) %)
+                                      (pop (:operations node)))
+                                 [(kernel-body/->IndexCompute 'address-next (if unsafe? hidden zero))
+                                  (kernel-body/->Yield ['address-next])]))) node)) checked))
+        unsafe (carry-body true) safe (carry-body false)]
+    (is (= safe (kernel-body/validate! safe)) "ordinary carry values keep the same loop and claim semantics")
+    (is (= :kernel-body-index-precondition
+           (try (kernel-body/validate! unsafe) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        "the second iteration's address cannot ignore the actual raw backedge definition")))
+
+(deftest zero-trip-loop-results-retain-the-actual-initial-index-history
+  (let [checked (guarded-affine-effect-body)
+        zero (kernel-body/index-cast 0 :long :exact)
+        hidden (kernel-body/expression :min zero
+                 (kernel-body/expression :max zero (kernel-body/expression :mul 'width 'width)))
+        original-loop (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                                     (tree-seq coll? seq checked)))
+        candidate (fn [expression]
+                    (-> checked
+                        (update :indices conj (kernel-body/->IndexCompute 'zero-trip-initial expression))
+                        (update :operations into
+                          [(assoc original-loop :index (kernel-body/value 'zero-trip-index :long)
+                             :lower zero :upper zero :step 1
+                             :iter-args [(kernel-body/->LoopArg (kernel-body/value 'zero-trip-carry :long)
+                                                               'zero-trip-initial)]
+                             :results [(kernel-body/value 'zero-trip-result :long)]
+                             :operations [(kernel-body/->Yield [(kernel-body/literal 0 :long)])])
+                           (kernel-body/->ScalarStore 'out ['zero-trip-result]
+                                                       (kernel-body/literal 0 :float) :map-active)])))
+        safe (candidate zero) unsafe (candidate hidden)]
+    (is (= safe (kernel-body/validate! safe)))
+    (is (= :kernel-body-index-precondition
+           (try (kernel-body/validate! unsafe) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        "zero iterations return the actual initial value, even when the unentered yield is ordinary")))
+
+(deftest logical-long-launch-geometry-widens-before-every-arithmetic-prefix
+  (let [scheduled (segmap-body/schedule
+                    (ordinary-typed-quotient-address-operation '(long 0))
+                    {:scalar-types {'n :long 'numerator :long 'divisor :long}
+                     :array-types {'fine :double 'output :double}})
+        checked (:body scheduled)
+        indices (:indices checked)
+        hardware (filter #(instance? raster.compiler.ir.kernel_body.IndexBinding %) indices)
+        group (:id (first (filter #(= :group (:source %)) hardware)))
+        local (:id (first (filter #(= :local (:source %)) hardware)))
+        coordinate (:expression (first (filter #(instance? raster.compiler.ir.kernel_body.IndexCompute %) indices)))
+        evaluate (fn evaluate [node values]
+                   (cond (symbol? node) (get values node)
+                         (integer? node) (bigint node)
+                         (instance? raster.compiler.ir.kernel_body.IndexCast node)
+                         (evaluate (:argument node) values)
+                         (instance? raster.compiler.ir.kernel_body.IndexExpr node)
+                         (apply ({:add +' :mul *'} (:op node))
+                                (map #(evaluate % values) (:arguments node)))))
+        nodes (tree-seq coll? seq coordinate)]
+    (is (= :add (:op coordinate)))
+    (is (= 3 (count (filter #(instance? raster.compiler.ir.kernel_body.IndexCast %) nodes))))
+    (is (every? #(= :long (:dtype %))
+                (filter #(instance? raster.compiler.ir.kernel_body.IndexCast %) nodes)))
+    (is (= 2147483648N (evaluate coordinate {group 8388608 local 0})))
+    (is (= (klaunch/geometry {:workgroup-size [256] :group-count [8388609]})
+           (kernel-body/validate-launch-index-ranges!
+             checked (klaunch/geometry {:workgroup-size [256] :group-count [8388609]}))))
+    (is (= :kernel-launch-index-range
+           (try (kernel-body/validate-launch-index-ranges!
+                  checked (klaunch/geometry {:workgroup-size [256] :group-count [2147483649]})) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (is (= checked (kernel-body/validate! checked)))))
+
+(deftest strided-loop-entry-ranges-come-from-the-actual-exclusive-exit-contract
+  (let [checked (guarded-affine-effect-body)
+        template (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                                (tree-seq coll? seq checked)))
+        scalar-var (ns-resolve 'raster.compiler.ir.kernel-body 'scalar-info!)
+        original (var-get scalar-var)
+        run (fn [lower upper step mode proof]
+              (let [seen (atom nil)
+                    dynamic? (= step :dynamic)
+                    induction 'verified-strided-index
+                    loop (assoc template :index (kernel-body/value induction :long)
+                           :lower 'verified-strided-lower
+                           :upper 'verified-strided-upper
+                           :step (if dynamic? (kernel-body/index-cast 'verified-positive-step :long :exact) step)
+                           :iter-args [] :results []
+                           :attributes {:upper-bound mode}
+                           :operations
+                           [(kernel-body/->ScalarCompute (kernel-body/value 'verified-strided-copy :long)
+                              (kernel-body/scalar-expression :+ :long [induction (kernel-body/literal 0 :long)]
+                                {:overflow :no-overflow :proof (assoc proof :kind :typed-scalar-range)}))
+                            (kernel-body/->Yield [])])
+                    candidate (cond-> (assoc checked :operations
+                                               [(kernel-body/->ScalarCompute
+                                                  (kernel-body/value 'verified-strided-lower :long)
+                                                  (kernel-body/cast-expression (kernel-body/literal lower :long) :long :exact :exact))
+                                                (kernel-body/->ScalarCompute
+                                                  (kernel-body/value 'verified-strided-upper :long)
+                                                  (kernel-body/cast-expression (kernel-body/literal upper :long) :long :exact :exact))
+                                                loop])
+                                dynamic? (update :indices conj
+                                           (kernel-body/->IndexBinding 'verified-positive-step :group-count 0)))
+                    outcome (with-redefs-fn
+                              {scalar-var (fn [expression values]
+                                            (when (contains? values induction)
+                                              (reset! seen (:range (get values induction))))
+                                            (original expression values))}
+                              #(try {:valid (kernel-body/validate! candidate)}
+                                    (catch clojure.lang.ExceptionInfo error {:error (ex-data error)})))]
+                (assoc outcome :range @seen)))
+        exclusive (run -5 10 3 :exclusive {:lower -5 :upper 9})
+        inclusive (run -5 10 3 :inclusive {:lower -5 :upper 9})
+        dynamic (run -5 10 :dynamic :exclusive {:lower -5 :upper 10})
+        empty (run 10 5 3 :exclusive {:lower 5 :upper 10})
+        edge (run (- Long/MAX_VALUE 2) Long/MAX_VALUE 4 :exclusive
+                  {:lower (- Long/MAX_VALUE 2) :upper Long/MAX_VALUE})]
+    (is (some? (:valid exclusive)))
+    (is (= {:lower -5 :upper 7} (:range exclusive)))
+    (is (= :kernel-body-intrinsic-overflow (get-in inclusive [:error :reason])))
+    (is (= {:lower -5 :upper 10} (:range inclusive)))
+    (is (some? (:valid dynamic)))
+    (is (= {:lower -5 :upper 10} (:range dynamic)))
+    (is (some? (:valid empty)))
+    (is (= {:lower 5 :upper 10} (:range empty)))
+    (is (some? (:valid edge)) (pr-str edge))
+    (is (= {:lower (- Long/MAX_VALUE 2) :upper (- Long/MAX_VALUE 2)} (:range edge)))))
+
+(deftest static-local-pointer-ranges-come-only-from-the-validated-launch
+  (let [checked (guarded-affine-effect-body)
+        local (:id (first (filter #(and (instance? raster.compiler.ir.kernel_body.IndexBinding %)
+                                        (= :local (:source %))) (:indices checked))))
+        coordinate (kernel-body/expression :add local 128)
+        load (kernel-body/->ScalarLoad (kernel-body/value 'validated-local-read :float)
+                                       'input [coordinate] nil nil :cached)
+        candidate (fn [extent]
+                    (assoc checked :operations [load]
+                           :launch (klaunch/spec {:workgroup-size [extent] :group-count [1]})))
+        static (candidate 256)
+        dynamic (candidate (klaunch/runtime-value 'width))
+        oversized (candidate (inc (long Integer/MAX_VALUE)))]
+    (is (= static (kernel-body/validate! static)))
+    (doseq [body [dynamic oversized]]
+      (is (= :kernel-body-index-precondition
+             (try (kernel-body/validate! body) nil
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+          "unproved local extents cannot certify an overflowing Int address prefix"))))
+
+(deftest stencil-logical-long-geometry-widens-before-its-generated-prefixes
+  (let [source '(let* [result (raster.par/stencil! du [u] 1 :dirichlet double i n
+                              (clojure.core/aget u i))] result)
+        typed (-> (typed-route/attempt source :double {'du :double 'u :double}
+                                      {:scalar-types {'n :long}})
+                  :program :equations first :algorithm)
+        stencil (first (lower/lower-typed-stencil typed :cpu:0 :dtype :double))
+        checked (:body (segstencil-body/schedule stencil
+                          {:array-types {'du :double 'u :double}
+                           :scalar-types {'n :long} :workgroup-size 256}))
+        hardware (filter #(instance? raster.compiler.ir.kernel_body.IndexBinding %) (:indices checked))
+        group (:id (first (filter #(= :group (:source %)) hardware)))
+        local (:id (first (filter #(= :local (:source %)) hardware)))
+        coordinate (:expression (first (filter #(instance? raster.compiler.ir.kernel_body.IndexCompute %)
+                                               (:indices checked))))
+        evaluate (fn evaluate [node values]
+                   (cond (symbol? node) (get values node)
+                         (integer? node) (bigint node)
+                         (instance? raster.compiler.ir.kernel_body.IndexCast node)
+                         (evaluate (:argument node) values)
+                         (instance? raster.compiler.ir.kernel_body.IndexExpr node)
+                         (apply ({:add +' :mul *'} (:op node))
+                                (map #(evaluate % values) (:arguments node)))))
+        casts (filter #(instance? raster.compiler.ir.kernel_body.IndexCast %)
+                      (tree-seq coll? seq coordinate))
+        geometry (klaunch/geometry {:workgroup-size [256] :group-count [8388609]})]
+    (is (= :add (:op coordinate)))
+    (is (= 3 (count casts)))
+    (is (every? #(= :long (:dtype %)) casts))
+    (is (= 2147483648N (evaluate coordinate {group 8388608 local 0})))
+    (is (= 2147483903N (evaluate coordinate {group 8388608 local 255})))
+    (is (= checked (kernel-body/validate! checked)))
+    (is (= geometry (kernel-body/validate-launch-index-ranges! checked geometry)))
+    (is (= :kernel-launch-index-range
+           (try (kernel-body/validate-launch-index-ranges! checked
+                  (klaunch/geometry {:workgroup-size [256] :group-count [2147483649]})) nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+
+(deftest bound-source-index-cannot-bypass-a-reduction-owner-remapping
+  (let [mapped (kernel-body/expression :add 'element-index 'offset)
+        lowered (segred-body/lower-element-operations
+                 '(aget fine (+ original-index offset))
+                 {:index 'original-index :coordinate 'element-index :dtype :double
+                  :arrays #{'fine} :array-types {'fine :double}
+                  :scalars #{'offset} :scalar-types {'offset :long}
+                  :element-binding-types {'original-index :long 'element-index :long}
+                  :declared-result-dtype :double
+                  :coordinate-lower (fn [coordinate]
+                                      (when (= '(+ original-index offset) coordinate) mapped))})
+        load (first (filter #(instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                            (:operations lowered)))]
+    (is (= [mapped] (:coordinates load)))
+    (is (not-any? #{'original-index} (tree-seq coll? seq (:operations lowered))))
+    (is (not-any? #(instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                  (:operations lowered)))))
+
+(deftest mixed-resident-and-ordinary-reduction-loads-retain-their-owner-adapter
+  (let [lowered (segred-body/lower-element-operations
+                 '(+ (aget resident 0) (aget fine original-index))
+                 {:index 'original-index :coordinate 'element-index :dtype :double
+                  :arrays #{'resident 'fine} :array-types {'resident :double 'fine :double}
+                  :scalars #{} :scalar-types {}
+                  :element-binding-types {'original-index :long 'element-index :long}
+                  :declared-result-dtype :double
+                  :lower-load-index (fn [array coordinate _]
+                                      (when (and (= array 'resident) (= coordinate 0))
+                                        (kernel-body/index-cast 0 :long :exact)))
+                  :coordinate-lower (fn [coordinate]
+                                      (when (= coordinate 'original-index) 'element-index))})
+        loads (filter #(instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                      (:operations lowered))]
+    (is (= ['resident 'fine] (mapv :buffer loads)))
+    (is (= [(kernel-body/index-cast 0 :long :exact)] (:coordinates (first loads))))
+    (is (= ['element-index] (:coordinates (second loads))))
+    (is (not-any? #{'original-index} (tree-seq coll? seq (:operations lowered))))))
+
+(deftest entered-strided-loops-preserve-the-actual-widened-abi-upper-range
+  (let [info-var (ns-resolve 'raster.compiler.ir.kernel-body 'scalar-info!)
+        original @info-var
+        run (fn [width-type constant expected]
+              (let [seen (atom nil)
+                    width 'typed-entry-width
+                    index 'typed-entry-index
+                    parameter? (nil? constant)
+                    loop (kernel-body/->ForLoop
+                           (kernel-body/value index :long)
+                           (kernel-body/index-cast 'typed-entry-lane :long :exact)
+                           (kernel-body/index-cast width :long :exact) 1024 []
+                           [(kernel-body/->ScalarCompute
+                              (kernel-body/value 'typed-entry-copy :long)
+                              (kernel-body/scalar-expression :+ :long
+                                [index (kernel-body/literal 0 :long)]
+                                {:overflow :no-overflow
+                                 :proof (assoc expected :kind :typed-scalar-range)}))
+                            (kernel-body/->Yield [])] [] {})
+                    spec {:id :typed-entered-upper
+                          :parameters (if parameter?
+                                        [(kernel-body/->KernelParameter width :scalar width-type [] nil nil :parameter)] [])
+                          :indices [(kernel-body/->IndexBinding 'typed-entry-lane :local 0)]
+                          :launch (klaunch/spec {:workgroup-size [1024] :group-count [1]})
+                          :operations (cond-> []
+                                        (not parameter?)
+                                        (conj (kernel-body/->ScalarCompute
+                                                (kernel-body/value width :long)
+                                                (kernel-body/cast-expression
+                                                  (kernel-body/literal constant :long) :long :exact :exact)))
+                                        true (conj loop))}
+                    checked (with-redefs-fn
+                              {info-var (fn [expression values]
+                                          (when (contains? values index)
+                                            (reset! seen (get values index)))
+                                          (original expression values))}
+                              #(kernel-body/make spec))]
+                (is (kernel-body/kernel-body? checked))
+                (is (= expected (:range @seen)))
+                @seen))]
+    (is (= 'typed-entry-width (get-in (run :int nil {:lower 0 :upper (dec (long Integer/MAX_VALUE))})
+                                             [:entered-loop-index :upper])))
+    (is (= 'typed-entry-width (get-in (run :long nil {:lower 0 :upper (dec (bigint Long/MAX_VALUE))})
+                                             [:entered-loop-index :upper])))
+    (doseq [upper [0 -1]]
+      (is (nil? (:entered-loop-index (run :long upper {:lower (min 0 upper) :upper 1023})))))))
+
+
+(deftest scan-generated-global-prefixes-retain-long-width-before-arithmetic
+  (let [emitted (emitted-scan-graph
+                 '(raster.par/scan out acc 0.0 i n double (+ acc (aget values i))))
+        evaluate (fn evaluate [node values]
+                   (cond (symbol? node) (get values node)
+                         (integer? node) (bigint node)
+                         (instance? raster.compiler.ir.kernel_body.IndexCast node)
+                         (evaluate (:argument node) values)
+                         (instance? raster.compiler.ir.kernel_body.IndexExpr node)
+                         (apply ({:add +' :mul *'} (:op node))
+                                (map #(evaluate % values) (:arguments node)))))]
+    (doseq [artifact [(get-in emitted [:nodes 0 :operation])
+                      (get-in emitted [:nodes 2 :operation])]]
+      (let [checked (get-in artifact [:attributes :kernel-body])
+            width (first (get-in checked [:launch :workgroup-size]))
+            coordinate (:expression (first (filter #(= 'scan-index (:id %)) (:indices checked))))
+            casts (filter #(instance? raster.compiler.ir.kernel_body.IndexCast %)
+                          (tree-seq coll? seq coordinate))
+            group (inc (quot Integer/MAX_VALUE width))
+            expected (*' group width)
+            geometry (klaunch/geometry {:workgroup-size [width] :group-count [(inc group)]})]
+        (is (= 3 (count casts)))
+        (is (every? #(and (= :long (:dtype %)) (= :exact (:overflow %))) casts))
+        (is (> expected Integer/MAX_VALUE))
+        (is (= expected (evaluate coordinate {'scan-group group 'scan-lane 0})))
+        (is (= (+ expected (dec width))
+               (evaluate coordinate {'scan-group group 'scan-lane (dec width)})))
+        (is (= :int (:dtype (first (filter #(= '_n_bound (:id %)) (:parameters checked))))))
+        (is (= checked (kernel-body/validate! checked)))
+        (is (= geometry (kernel-body/validate-launch-index-ranges! checked geometry)))
+        (is (= :kernel-launch-index-range
+               (try (kernel-body/validate-launch-index-ranges! checked
+                      (klaunch/geometry {:workgroup-size [width] :group-count [2147483649]})) nil
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))))
+
+(deftest ordinary-quotient-ranges-use-only-closed-verified-nonnegative-origins
+  (let [address-var (ns-resolve 'raster.compiler.ir.kernel-body 'address-expression-uniformity)
+        original @address-var
+        run (fn [numerator divisor external?]
+              (let [seen (atom nil)
+                    spec {:id :ordinary-quotient-origin
+                          :parameters (cond-> [(kernel-body/->KernelParameter
+                                                 'out :output :long [1] :global
+                                                 {:kind :row-major :rank 1 :shape [1] :perm [0] :dtype :long}
+                                                 :result)]
+                                        external? (conj (assoc (kernel-body/->KernelParameter
+                                                                 'external :scalar :int [] nil nil :parameter)
+                                                               :nonnegative? true))
+                                        (= divisor :unknown) (conj (kernel-body/->KernelParameter
+                                                                    'divisor :scalar :long [] nil nil :parameter)))
+                          :indices [(kernel-body/->IndexBinding 'origin-group :group 0)
+                                    (kernel-body/->IndexCompute 'origin-numerator numerator)
+                                    (kernel-body/->IndexCompute 'origin-quotient
+                                      (kernel-body/expression :floor-div 'origin-numerator
+                                        (if (= divisor :unknown) 'divisor
+                                            (kernel-body/index-cast divisor :long :exact))))]
+                          :operations [(kernel-body/->ScalarStore 'out
+                                         [(kernel-body/expression :sub 'origin-quotient
+                                            (kernel-body/index-cast 1 :long :exact))]
+                                         (kernel-body/literal 0 :long) nil)]
+                          :launch (klaunch/spec {:workgroup-size [1] :group-count [1]})}
+                    outcome (try (with-redefs-fn
+                                   {address-var (fn [expression values]
+                                                  (reset! seen (get values 'origin-quotient))
+                                                  (original expression values))}
+                                   #(kernel-body/make spec))
+                                 :accepted
+                                 (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))]
+                {:outcome outcome :info @seen}))
+        widened (kernel-body/expression :mul
+                  (kernel-body/index-cast 'origin-group :long :exact)
+                  (kernel-body/index-cast 256 :long :exact))
+        positive (run widened 16 false)]
+    (is (= :accepted (:outcome positive)))
+    (is (= {:lower 0 :upper (quot (*' Integer/MAX_VALUE 256) 16)}
+           (get-in positive [:info :range])))
+    (doseq [divisor [0 -1 :unknown]]
+      (is (= :kernel-body-index-precondition (:outcome (run widened divisor false)))))
+    (is (= :kernel-body-index-precondition
+           (:outcome (run (kernel-body/index-cast 'external :long :exact) 16 true)))
+        "a producer sign field on an ABI parameter supplies no hardware proof")
+    (is (= :kernel-body-index-precondition
+           (:outcome (run (kernel-body/index-cast
+                            (kernel-body/expression :mul 'origin-group 256) :long :exact) 16 false)))
+        "a widening alias cannot erase the evaluated overflowing Int prefix")))
+
+(deftest varying-map-guard-reconstructs-the-actual-modulo-domain
+  (let [operation (segop/->SegMap
+                   992 (segop/make-seg-space 'row 'n) (segop/->SegLevel :thread :virtual)
+                   '(+ (clojure.core/aget x row)
+                       (clojure.core/aget bias (mod row features)))
+                   nil #{'x 'bias} #{'output} #{'features}
+                   (segop/->KernelGrid 1 256 0) :float 'output nil)
+        options {:scalar-types {'n :long 'features :long}
+                 :array-types {'x :float 'bias :float 'output :float}}
+        scheduled (segmap-body/schedule operation options)
+        checked (:body scheduled)
+        conditions (kernel-body/required-preconditions checked)
+        guard (first (:operations checked))
+        index (:id (last (:indices checked)))
+        region {:parameters (:parameters checked) :indices (:indices checked)
+                :launch (:launch checked) :masks (:masks checked) :guard guard
+                :index-definitions [] :required-preconditions conditions}
+        reason-of (fn [f] (try (f) :accepted
+                              (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+        bindings (fn [n features] (fn [id] (case id _n_bound n features features)))]
+    (is (= checked (kernel-body/validate! checked)))
+    (is (= conditions (:preconditions scheduled)))
+    (is (= '_n_bound (get-in (kernel-body/varying-guard-index-region-info region)
+                             [:values index :active-upper])))
+    (is (= :kernel-body-index-region-guard
+           (reason-of #(kernel-body/scheduled-index-region-info region)))
+        "cooperative entry still requires actual workgroup uniformity")
+    (doseq [candidate [(dissoc region :guard) (assoc region :masks [])
+                       (assoc region :if-region (kernel-body/->IfRegion 'fake [] [] []))]]
+      (is (= :kernel-body-index-region-guard
+             (reason-of #(kernel-body/varying-guard-index-region-info candidate)))))
+    (let [unknown-mask (assoc-in region [:masks 0 :predicates]
+                                 [(kernel-body/predicate :lt 'unknown-index
+                                    (kernel-body/index-cast '_n_bound :long :exact))])]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"kernel mask"
+                           (kernel-body/varying-guard-index-region-info unknown-mask))))
+    (doseq [[n f] [[1 1] [0 0] [0 Long/MIN_VALUE] [0 Long/MAX_VALUE]]]
+      (is (true? (precondition/check! conditions (bindings n f)))))
+    (doseq [[n f] [[1 0] [1 Long/MIN_VALUE] [-1 1]]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (precondition/check! conditions (bindings n f)))))
+    (doseq [condition conditions]
+      (is (= :kernel-body-index-precondition
+             (reason-of #(kernel-body/validate!
+                          (assoc-in checked [:attributes :required-preconditions]
+                                    (vec (remove #{condition} conditions))))))))
+    (let [barrier (kernel-body/->WorkgroupBarrier :workgroup #{:workgroup} :acquire-release
+                                                  (kernel-body/full-participation))]
+      (is (= :kernel-body-divergent-workgroup-barrier
+             (reason-of #(kernel-body/validate!
+                          (assoc-in checked [:operations 0 :operations] [barrier]))))))
+    (is (= :kernel-body-index-precondition
+           (reason-of #(kernel-body/validate! (assoc checked :operations (:operations guard)))))
+        "an unguarded evaluated modulo cannot borrow the later lexical domain")))

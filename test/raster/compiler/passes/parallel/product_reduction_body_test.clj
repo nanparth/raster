@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.product-reduction-body-test
-  (:require [clojure.string :as str]
+  (:require [clojure.set]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is]]
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.kernel-body-target :as target]
@@ -111,6 +112,85 @@
            (mapv :id (take 5 operations))))
     (is (every? #(instance? raster.compiler.ir.kernel_body.IndexCompute %)
                 (take 5 operations)))))
+
+(defn- multi-axis-source [bounds]
+  (let [types {'nrows :long 'outputs :long 'blocks :long 'width :long}
+        base (typed-argmax-segred types)
+        space (assoc (:space base) :dims
+                     (conj (mapv (fn [[name bound]] {:name name :bound bound})
+                                 (map vector '[row output block lane half] bounds))
+                           {:name 'col :bound 'width}))]
+    (-> base (assoc :space space)
+        (assoc-in [:grid :num-blocks]
+                  (list 'max 1 (raster.compiler.ir.segop/seg-space-num-segments-expr space))))))
+
+(deftest multi-axis-generated-division-retains-executed-divisor-contracts
+  (let [types {'nrows :long 'outputs :long 'blocks :long 'width :long}
+        source (multi-axis-source '[nrows outputs blocks 8 2])
+        opts (assoc options :scalar-types types)
+        candidate (product/schedule source opts)
+        axes (take 5 (get-in candidate [:body :operations 1 :then-operations]))
+        requirements (body/required-preconditions (:body candidate))
+        check #(precondition/check! requirements %)
+        eval-index (fn eval-index [expression values]
+                     (cond (integer? expression) (bigint expression)
+                           (symbol? expression) (bigint (get values expression))
+                           (instance? raster.compiler.ir.kernel_body.IndexCast expression)
+                           (eval-index (:argument expression) values)
+                           :else (let [[a b] (map #(eval-index % values) (:arguments expression))]
+                                   (case (:op expression) :floor-div (quot a b) :mod (rem a b)))))]
+    (is (= requirements (:preconditions candidate)))
+    (is (= '[row output block lane half] (mapv :id axes)))
+    (is (not-any? #(and (instance? raster.compiler.ir.kernel_body.IndexExpr %) (= :mul (:op %)))
+                  (tree-seq coll? seq (mapv :expression axes))))
+    (doseq [segment [0 1 31 1023 Long/MAX_VALUE]
+            dims [[3 7 11 8 2] [Long/MAX_VALUE Long/MAX_VALUE 7 8 2]]]
+      (let [env (zipmap '[nrows outputs blocks lane-extent half-extent] dims)
+            env (assoc env 'product-segment segment)]
+        (doseq [[position axis] (map-indexed vector axes)]
+          (let [suffix (reduce *' 1 (drop (inc position) dims))
+                expected (mod (quot (bigint segment) suffix) (nth dims position))]
+            (is (= expected (eval-index (:expression axis) env)))))))
+    (doseq [name '[nrows outputs blocks] value [0 -1 Long/MIN_VALUE]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (check (assoc {'_n_bound 1 'nrows 3 'outputs 7 'blocks 11} name value)))))
+    (is (true? (check {'_n_bound 0 'nrows Long/MIN_VALUE 'outputs 0 'blocks -1})))
+    (doseq [condition requirements]
+      (let [forged (assoc candidate :preconditions (vec (remove #{condition} requirements)))]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (raster.compiler.ir.scheduled-kernel-body/validate! forged)))))
+    (doseq [condition requirements]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (body/validate! (assoc-in (:body candidate) [:attributes :required-preconditions]
+                                             (vec (remove #{condition} requirements)))))))
+    (let [kernel (:body candidate)
+          branch (get-in kernel [:operations 1])
+          false-escape (assoc-in kernel [:operations 1]
+                                 (assoc branch :then-operations (:else-operations branch)
+                                               :else-operations (:then-operations branch)))
+          wrong-bound (assoc-in kernel [:operations 0 :expression :arguments 1 :arguments] ['nrows])
+          wrong-origin (-> kernel
+                           (update :indices #(vec (remove (fn [binding] (= 'product-segment (:id binding))) %)))
+                           (update :parameters conj (body/->KernelParameter 'product-segment :scalar :int [] nil nil :parameter)))]
+      (doseq [mutated [false-escape wrong-bound wrong-origin]]
+        (is (thrown? clojure.lang.ExceptionInfo (body/validate! mutated)))))
+    (let [dormant (product/schedule (multi-axis-source '[nrows outputs blocks 0 2]) opts)
+          check-zero #(precondition/check! (:preconditions dormant) %)]
+      (is (true? (check-zero {'_n_bound 0 'nrows 3 'outputs 7 'blocks 11})))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (check-zero {'_n_bound 1 'nrows 3 'outputs 7 'blocks 11})))
+      (let [zero-source (multi-axis-source '[nrows outputs blocks 0 2])
+            ;; Remove the actual zero-divisor activation condition, not merely N>=0.
+            zero-condition (second (body/quotient-domain-preconditions '_n_bound 0))
+            weakened (vec (remove #{zero-condition} (:preconditions dormant)))
+            forged (-> dormant (assoc :preconditions weakened)
+                       (assoc-in [:body :attributes :required-preconditions] weakened))]
+        (is (some #{zero-condition} (:preconditions dormant)))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (product/validate-source! forged zero-source opts)))
+        ;; The body has no division left: source replay and the runtime scalar contract,
+        ;; rather than an arithmetic UB claim, own the dormant specialization authority.
+        (is (some? (body/validate! (:body forged))))))))
 
 (defn typed-local-address-segred
   ([] (typed-local-address-segred (:scalar-types options)))
@@ -413,6 +493,30 @@
            (catch clojure.lang.ExceptionInfo e
              (is (= :combine-read (:rule (ex-data e)))))))))
 
+(deftest product-dense-read-owner-retains-its-structural-coordinate
+  (let [source (argmax-segred)
+        decline! (fn [rule message data] (throw (ex-info message (assoc data :rule rule))))
+        lowered ((var-get (ns-resolve 'raster.compiler.passes.parallel.product-reduction-regions 'lower-regions))
+                 true source options decline!)
+        production (regions/lower source options decline!)
+        loads (fn [region] (filter #(instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                                   (get-in region [:element :operations])))
+        load (first (loads lowered))
+        coordinate (first (:coordinates load))]
+    (is (instance? raster.compiler.ir.kernel_body.IndexExpr coordinate)
+        "the actual internal storage-analysis view retains its original typed AxisMap coordinate")
+    (is (= ['values] (mapv :buffer (loads lowered)) (mapv :buffer (loads production)))
+        "both uses of the same typed source retain the exact buffer and access occurrence")
+    (is (= {'values (launch/product 'nrows 'width)}
+           (regions/dense-read-requirements source options decline!)))
+    (is (= :dense-read-index
+           (try (regions/dense-read-requirements
+                 (assoc-in source [:reduction :element :results 0]
+                           '(clojure.core/aget values 0)) options decline!)
+                nil
+                (catch clojure.lang.ExceptionInfo error (:rule (ex-data error)))))
+        "structural preservation does not authorize a nonmatching read map")))
+
 (deftest logical-representations-must-be-lowered-before-raw-product-storage
   (doseq [storage-options [{:representation {:kind :quantized :scheme :q4-k}}
                           {:logical-layout {:kind :strided :strides [2]}}]
@@ -495,3 +599,96 @@
           (is (= {'nrows row-type 'width width-type '_n_bound row-type}
                  (into {} (map (juxt :name :kernel-dtype))
                        (filter #(= :scalar (:kind %)) (:abi artifact))))))))))
+
+(deftest checked-long-product-addresses-retain-independent-structural-storage-admission
+  (doseq [[row-type width-type] [[:int :long] [:long :long] [:long :int]]]
+    (let [{:keys [algorithm body graph node]}
+          (graph-context true nil nil {'nrows row-type 'width width-type})
+          options (product/graph-options node graph algorithm body)
+          candidate (try {:scheduled (product/schedule (:operation node) options)}
+                         (catch clojure.lang.ExceptionInfo error {:error (ex-data error)}))]
+      (is (nil? (:error candidate)) (str "actual independent dimension tuple " [row-type width-type] ": " (:error candidate)))
+      (when-let [scheduled (:scheduled candidate)]
+        (is (= scheduled (product/validate-against-node! scheduled node graph algorithm body)))
+        (is (= {'values (launch/product 'nrows 'width)}
+               (regions/dense-read-requirements (:operation node) options
+                 (fn [rule message data] (throw (ex-info message (assoc data :rule rule)))))))
+        (let [nodes (tree-seq coll? seq (:body scheduled))
+              load (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                                        (= 'values (:buffer %))) nodes))
+              coordinate (first (:coordinates load))
+              compute (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                                           (= coordinate (get-in % [:result :id]))) nodes))
+              definitions (into {} (keep #(when (instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                                            [(get-in % [:result :id]) %])) nodes)
+              source-leaves (fn source-leaves [value]
+                              (cond
+                                (symbol? value)
+                                (if-let [definition (get definitions value)]
+                                  (apply clojure.set/union #{}
+                                         (map source-leaves (get-in definition [:expression :arguments])))
+                                  #{value})
+                                :else #{}))]
+          (is (= 1 (count (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                                       (= 'values (:buffer %))) nodes)))
+              "the exact original values access has one production occurrence")
+          (when (= :long width-type)
+            (is (= #{'row 'width 'col} (source-leaves coordinate))
+                "checked coordinate SSA keeps every actual source axis/factor of that access"))
+          (when (= :long width-type)
+            (is (symbol? coordinate))
+            (is (= :+ (get-in compute [:expression :op])))
+            (is (= :trap (get-in compute [:expression :options :overflow])))
+            (is (= :kernel-body-c-trap-unsupported
+                   (try (target/emit-artifact "checked_source_product" scheduled :opencl-portable) nil
+                        (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+            (doseq [dialect [:cuda :hip]]
+              (is (str/includes? (:source (target/emit-artifact "checked_source_product" scheduled dialect))
+                                 "rstr_trap"))))
+          (when (= :int width-type)
+            (is (some? (:source (target/emit-artifact "bounded_source_product" scheduled :opencl-portable))))))))))
+
+(deftest ordinary-raw-index-division-retains-machine-domain-safety
+  (let [make-body (fn [type numerator divisor op]
+                    (body/make
+                     {:id :ordinary-index-division
+                      :parameters [(body/->KernelParameter 'values :input :float [8] :global
+                                     (raster.compiler.core.layout/row-major [8] :float) :operand)]
+                      :indices [] :masks []
+                      :operations [(body/->ScalarCompute (body/value 'numerator type)
+                                     (body/scalar-expression :cast type [(body/literal numerator type)]
+                                                             {:rounding :exact :overflow :exact}))
+                                   (body/->ScalarCompute (body/value 'divisor type)
+                                     (body/scalar-expression :cast type [(body/literal divisor type)]
+                                                             {:rounding :exact :overflow :exact}))
+                                   (body/->ScalarLoad (body/value 'loaded :float) 'values
+                                     [(body/expression op 'numerator 'divisor)] nil nil :cached)]
+                      :launch (launch/spec {:workgroup-size [1] :group-count [1]
+                                            :shared-memory-bytes 0})}))]
+    (doseq [type [:int :long] op [:floor-div :mod]]
+      (is (some? (make-body type 6 2 op)))
+      (is (thrown? clojure.lang.ExceptionInfo (make-body type -8 -2 op)))
+      (doseq [[numerator divisor] [[1 0] [(if (= type :int) Integer/MIN_VALUE Long/MIN_VALUE) -1]]]
+        (is (thrown? clojure.lang.ExceptionInfo (make-body type numerator divisor op)))))))
+
+(deftest static-divisions-use-closed-generated-nonnegative-index-facts
+  (let [make-body (fn [source expression]
+                    (body/make
+                     {:id :static-division-hardware-domain
+                      :parameters [(body/->KernelParameter 'values :input :float [12] :global
+                                      (raster.compiler.core.layout/row-major [12] :float) :operand)]
+                      :indices [(body/->IndexBinding 'group source 0)]
+                      :operations [(body/->ScalarLoad (body/value 'loaded :float) 'values
+                                      [expression] nil nil :cached)]
+                      :launch (launch/spec {:workgroup-size [1] :group-count [1]
+                                            :shared-memory-bytes 0})}))
+        widened (body/index-cast 'group :long :exact)
+        quotient (body/expression :floor-div widened (body/index-cast 3 :long :exact))
+        nested (body/expression :mod quotient (body/index-cast 4 :long :exact))]
+    (is (some? (make-body :group quotient)))
+    (is (some? (make-body :group nested)))
+    ;; Nonnegativity cannot hide an overflowing earlier raw prefix.
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (make-body :group
+                   (body/expression :floor-div
+                     (body/expression :mul 'group Integer/MAX_VALUE) 3))))))

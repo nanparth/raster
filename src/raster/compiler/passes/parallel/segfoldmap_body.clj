@@ -43,6 +43,21 @@
     (static-index-integer (:argument expression))
     :else nil))
 
+(defn- address-bound-identity
+  [expression scalar-types]
+  (cond
+    (and (symbol? expression) (contains? #{:int :long} (dtype/canon (get scalar-types expression))))
+    expression
+    (and (instance? raster.compiler.ir.kernel_body.IndexCast expression)
+         (= :long (:dtype expression)) (= :exact (:overflow expression)))
+    (let [argument (:argument expression)]
+      (cond
+        (and (symbol? argument) (contains? #{:int :long} (dtype/canon (get scalar-types argument)))) argument
+        (and (integer? argument) (<= Integer/MIN_VALUE argument Integer/MAX_VALUE)) argument
+        :else (index-expression/to-launch-expression expression decline!)))
+    (integer? expression) expression
+    :else (index-expression/to-launch-expression expression decline!)))
+
 (defn- capped-ceiling-power-of-two
   [n cap]
   (loop [power 1]
@@ -222,6 +237,24 @@
               (map #(body/->KernelParameter % :scalar (get scalar-types %) [] nil nil :parameter)
                    scalars)
               [(body/->KernelParameter '_nseg :scalar :long [] nil nil :bound)]))
+        indices [(body/->IndexBinding group-index :group 0)
+                 (body/->IndexBinding group-count :group-count 0)
+                 (body/->IndexBinding local-index :local 0)
+                 (body/->IndexCompute first-segment
+                   (body/expression :add
+                     (body/expression :mul (body/index-cast group-index :long :exact)
+                                           (body/index-cast workgroup-size :long :exact))
+                     (body/index-cast local-index :long :exact)))]
+        launch-spec (launch/spec {:workgroup-size [workgroup-size]
+                                  :group-count [grid-group-count]
+                                  :shared-memory-bytes (:shared-mem-bytes source-grid)})
+        segment-step (body/expression :mul (body/index-cast group-count :long :exact)
+                                            (body/index-cast workgroup-size :long :exact))
+        segment-header (body/->ForLoop (body/value segment-index :long)
+                          first-segment '_nseg segment-step [] [] []
+                          {:association :independent :role :segment-grid-stride})
+        index-region {:parameters parameters :indices indices :launch launch-spec
+                      :loop segment-header :index-definitions segment-axis-computes}
         base-env (merge (zipmap (map :name segment-dims) (repeat :long))
                         {(:index segfold) :long}
                         scalar-types)
@@ -244,8 +277,11 @@
                  fold-dtype (dtype/canon (:dtype fold))
                  expression (util/subst-syms {source-index loop-index accumulator carry}
                                              (:step fold))
-                 lowered ((:lower scalar-lower) expression fold-dtype
-                                                (assoc env loop-index :long carry fold-dtype))
+                 lowered ((:with-index-region scalar-lower) index-region
+                           #((:with-loop-index scalar-lower)
+                             loop-index (body/index-cast 0 :long :exact) (lower-index (:extent fold)) :exclusive
+                             (fn [] ((:lower scalar-lower) expression fold-dtype
+                                       (assoc env loop-index :long carry fold-dtype)))))
                  loop (body/->ForLoop
                        (body/value loop-index :long)
                        (body/index-cast 0 :long :exact) (lower-index (:extent fold)) 1
@@ -265,8 +301,11 @@
         (mapcat
          (fn [_ordinal output output-dtype expression]
            (let [expression (util/subst-syms {(:index segfold) map-index} expression)
-                 lowered ((:lower scalar-lower) expression output-dtype
-                                                (assoc (:env fold-state) map-index :long))]
+                 lowered ((:with-index-region scalar-lower) index-region
+                           #((:with-loop-index scalar-lower)
+                             map-index (body/index-cast 0 :long :exact) map-extent :exclusive
+                             (fn [] ((:lower scalar-lower) expression output-dtype
+                                       (assoc (:env fold-state) map-index :long)))))]
              (concat (:operations lowered)
                      [(body/->ScalarStore output [output-coordinate]
                                           (:result lowered) nil)])))
@@ -276,48 +315,34 @@
                         (body/index-cast 0 :long :exact) map-extent 1 []
                         (vec (concat map-operations [(body/->Yield [])])) []
                         {:association :ordered :role :final-map})
-        segment-step
-        (body/expression
-         :mul
-         (body/index-cast group-count :long :exact)
-         (body/index-cast workgroup-size :long :exact))
         segment-loop
-        (body/->ForLoop
-         (body/value segment-index :long) first-segment '_nseg segment-step []
-         (vec (concat segment-axis-computes (:operations fold-state)
-                      [final-loop (body/->Yield [])])) []
-         {:association :independent :role :segment-grid-stride})]
+        (assoc segment-header :operations
+               (vec (concat segment-axis-computes (:operations fold-state)
+                            [final-loop (body/->Yield [])])))]
     {:kernel-body
      (body/make
       {:id [:segmented-fold-map (:id segfold) :portable-ordered]
        :parameters parameters
        :stable-reads (mapv body/stable-read inputs)
-       :indices [(body/->IndexBinding group-index :group 0)
-                 (body/->IndexBinding group-count :group-count 0)
-                 (body/->IndexBinding local-index :local 0)
-                 (body/->IndexCompute
-                  first-segment
-                  (body/expression
-                   :add
-                   (body/expression :mul
-                                    (body/index-cast group-index :long :exact)
-                                    (body/index-cast workgroup-size :long :exact))
-                   (body/index-cast local-index :long :exact)))]
+       :indices indices
        :masks []
        :operations [segment-loop]
        :schedule {:strategy :grid-stride-one-work-item-per-segment
                   :association :ordered :workgroup-size workgroup-size
                   :fold-count (count (:folds segfold))
                   :source-grid source-grid}
-       :launch (launch/spec {:workgroup-size [workgroup-size]
-                             :group-count [grid-group-count]
-                             :shared-memory-bytes (:shared-mem-bytes source-grid)})
+       :launch launch-spec
        :provenance {:dialect :kernel-body :source-dialect :segfoldmap
                     :segop-id (:id segfold)}
        :attributes {:kind :portable-segmented-fold-map
                     :segment-count segment-count :map-extent map-extent
                     :source-grid source-grid
                     :grid-group-count grid-group-count-index
+                    :required-preconditions
+                    (vec (distinct (concat
+                           (body/entered-affine-address-preconditions
+                             '_nseg (address-bound-identity map-extent scalar-types))
+                           ((:required-preconditions scalar-lower)))))
                     :no-write-alias true}})
      :arrays inputs :outputs outputs :scalars scalars
      :segment-count segment-count :map-extent map-extent
@@ -341,6 +366,7 @@
       :body kernel-body
       :arguments arguments
       :scalar-bindings (scheduled-body/derive-scalar-bindings kernel-body arguments)
+      :preconditions (body/required-preconditions kernel-body)
       :effects {:kind :segmented-fold-map
                 :uses (scheduled-body/derive-uses kernel-body arguments)
                 :association :ordered}
@@ -505,7 +531,23 @@
                                              :result))
                    outputs output-dtypes)
               (map #(body/->KernelParameter % :scalar (get scalar-types %) [] nil nil :parameter)
-                   scalars)))
+                   scalars)
+              [(body/->KernelParameter '_nseg :scalar :long [] nil nil :bound)]))
+        indices [(body/->IndexBinding 'foldmap-group :group 0)
+                 (body/->IndexBinding 'foldmap-lane :local 0)
+                 (body/->IndexCompute segment-index (body/index-cast 'foldmap-group :long :exact))]
+        launch-spec (launch/spec
+                      {:workgroup-size [workgroup-size] :group-count [group-count]
+                       :shared-memory-bytes (* workgroup-size (reduce + (map dtype/bytes-of fold-dtypes)))})
+        active-mask (body/->Mask :cooperative-foldmap-active
+                      [(body/predicate :lt segment-index '_nseg)])
+        active-guard (body/->Guard :cooperative-foldmap-active [])
+        address-requirements (body/entered-affine-address-preconditions
+                               '_nseg (address-bound-identity map-extent scalar-types))
+        index-region {:parameters parameters :indices indices :launch launch-spec
+                      :masks [active-mask] :guard active-guard
+                      :required-preconditions address-requirements
+                      :index-definitions segment-axis-computes}
         base-env (merge (zipmap (map :name segment-dims) (repeat :long)) scalar-types)
         scalar-lower (scalar-expression/make-lowerer
                       {:array-types array-types :scalar-types scalar-types
@@ -557,8 +599,14 @@
                                {:operation (:id segfold) :fold ordinal :identity identity}))
                  fold-extent (lower-index (:extent fold))
                  element (util/subst-syms {source-index reduce-index} (:element derived))
-                 element-lowered ((:lower scalar-lower) element fold-dtype
-                                  (assoc env reduce-index :long))
+                 element-header (body/->ForLoop (body/value reduce-index :long)
+                                  (body/index-cast 'foldmap-lane :long :exact) fold-extent
+                                  workgroup-size [] [] []
+                                  {:association :implementation-defined :role :cooperative-lane-fold :fold ordinal})
+                 element-lowered ((:with-index-region scalar-lower)
+                                  (assoc index-region :inner-loop element-header)
+                                  #((:lower scalar-lower) element fold-dtype
+                                    (assoc env reduce-index :long)))
                  name-with-ordinal #(symbol (str % "-" ordinal))
                  lane-accumulator (name-with-ordinal "foldmap-lane-accumulator")
                  next-lane-accumulator (name-with-ordinal "foldmap-next-lane-accumulator")
@@ -622,12 +670,16 @@
          {:operations [] :env base-env :allocations [] :operators []}
          (map vector (range) folds fold-dtypes reduce-indices))
         map-coordinate (body/expression :add base-coordinate map-index)
+        map-header (body/->ForLoop (body/value map-index :long)
+                     (body/index-cast 'foldmap-lane :long :exact) map-extent workgroup-size [] [] []
+                     {:association :independent :role :cooperative-final-map})
         map-operations
         (mapcat
          (fn [_ordinal output output-dtype expression]
            (let [expression (util/subst-syms {source-index map-index} expression)
-                 lowered ((:lower scalar-lower) expression output-dtype
-                                                (assoc (:env fold-state) map-index :long))]
+                 lowered ((:with-index-region scalar-lower) (assoc index-region :inner-loop map-header)
+                          #((:lower scalar-lower) expression output-dtype
+                            (assoc (:env fold-state) map-index :long)))]
              (concat (:operations lowered)
                      [(body/->ScalarStore output [map-coordinate]
                                           (:result lowered) nil)])))
@@ -644,18 +696,13 @@
           :parameters parameters
           :stable-reads (mapv body/stable-read inputs)
           :allocations (:allocations fold-state)
-          :indices (vec (concat
-                         [(body/->IndexBinding 'foldmap-group :group 0)
-                          (body/->IndexBinding 'foldmap-lane :local 0)
-                          (body/->IndexCompute
-                           segment-index
-                           (body/index-cast 'foldmap-group :long :exact))]
-                         segment-axis-computes))
-          :masks (mapv (fn [stride]
-                         (body/->Mask (keyword (str "foldmap-reduce-stride-" stride))
-                                      [(body/predicate :lt 'foldmap-lane stride)]))
-                       strides)
-          :operations (conj (vec (:operations fold-state)) final-map)
+          :indices indices
+          :masks (into [active-mask]
+                   (mapv (fn [stride]
+                           (body/->Mask (keyword (str "foldmap-reduce-stride-" stride))
+                             [(body/predicate :lt 'foldmap-lane stride)])) strides))
+          :operations [(assoc active-guard :operations
+                         (vec (concat segment-axis-computes (:operations fold-state) [final-map])))]
           :schedule {:strategy :one-workgroup-per-segment
                      :association :certified
                      :workgroup-size workgroup-size
@@ -664,14 +711,13 @@
                      :reduction-operators (:operators fold-state)
                      :fold-count (count folds)
                      :mapped-traversal :strided}
-          :launch (launch/spec
-                   {:workgroup-size [workgroup-size]
-                    :group-count [group-count]
-                    :shared-memory-bytes
-                    (* workgroup-size (reduce + (map dtype/bytes-of fold-dtypes)))})
+          :launch launch-spec
           :provenance {:dialect :kernel-body :source-dialect :segfoldmap
                        :segop-id (:id segfold)}
-          :attributes {:kind :cooperative-segmented-fold-map
+          :attributes {:required-preconditions
+                       (vec (distinct (concat address-requirements
+                                              ((:required-preconditions scalar-lower)))))
+                       :kind :cooperative-segmented-fold-map
                        :segment-count segment-count :map-extent map-extent
                        :no-write-alias true}})]
     {:kernel-body kernel-body :arrays inputs :outputs outputs :scalars scalars
@@ -680,14 +726,16 @@
 
 (defn- schedule-cooperative
   [segfold options]
-  (let [{:keys [kernel-body outputs scalars operators] inputs :arrays}
+  (let [{:keys [kernel-body outputs scalars operators segment-count] inputs :arrays}
         (lower-cooperative segfold options)
-        arguments (mapv :id (:parameters kernel-body))]
+        arguments (mapv #(if (= '_nseg (:id %)) segment-count (:id %))
+                        (:parameters kernel-body))]
     (scheduled-body/make
      {:source segfold
       :body kernel-body
       :arguments arguments
       :scalar-bindings (scheduled-body/derive-scalar-bindings kernel-body arguments)
+      :preconditions (body/required-preconditions kernel-body)
       :effects {:kind :segmented-fold-map
                 :uses (scheduled-body/derive-uses kernel-body arguments)
                 :association :implementation-defined}

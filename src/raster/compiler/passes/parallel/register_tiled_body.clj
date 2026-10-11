@@ -94,12 +94,13 @@
 
    A tail workgroup evaluates masks at every coordinate in its complete tile.  For extent `d` and
    tile width `t`, its greatest coordinate is `ceil(d/t)*t - 1`, including padded lanes that never
-   load or store.  IndexBinding and the row/column IndexCompute values are int, so this quantity
-   must not exceed INT_MAX.  The resulting maximum logical extent is
+   load or store. Hardware bindings and physical staging loops remain Int; generated global
+   coordinate intermediates use exact Long widening. The existing public admission and dispatch
+   policy still requires this padded coordinate not to exceed INT_MAX.  The resulting maximum logical extent is
    `floor((INT_MAX+1)/t)*t`.  Keeping this derivation here lets static admission and runtime
    selection consume the same schedule fact. The K constraint is deliberately conservative when
-   a symbolic K selects a long loop induction variable: row/column coordinates remain int and the
-   existing dispatch capacity policy already imposes the stricter positive-domain limit."
+   a symbolic K selects a long loop induction variable: the existing dispatch capacity policy
+   continues to impose the stricter positive-domain limit."
   [[m n k] {:keys [block-m block-n block-k]}]
   (let [limit (fn [tile-width]
                 (when-not (pos-int? tile-width)
@@ -180,6 +181,23 @@
 (defn- mul [& values] (apply body/expression :mul values))
 (defn- div [left right] (body/expression :floor-div left right))
 (defn- modulo [left right] (body/expression :mod left right))
+
+(defn- global-index
+  "Widen only generated global geometry. Closed Int staging div/mod remain total Int
+   expressions, then widen their result; physical loop/control types do not change."
+  [expression long-values]
+  (cond
+    (integer? expression) (body/index-cast expression :long :exact)
+    (symbol? expression) (if (contains? long-values expression) expression
+                            (body/index-cast expression :long :exact))
+    (instance? raster.compiler.ir.kernel_body.IndexExpr expression)
+    (if (contains? #{:add :sub :mul} (:op expression))
+      (apply body/expression (:op expression)
+        (map #(global-index % long-values) (:arguments expression)))
+      (body/index-cast expression :long :exact))
+    (instance? raster.compiler.ir.kernel_body.IndexCast expression)
+    (if (= :long (:dtype expression)) expression (body/index-cast expression :long :exact))
+    :else expression))
 
 (defn- barrier
   []
@@ -363,14 +381,18 @@
         thread-id 'register-thread-id
         block-row 'register-block-row
         block-col 'register-block-col
+        long-values (into #{block-row block-col}
+                       (concat (when (= :long k-index-dtype) ['register-k-block])
+                               (keep (fn [[id type]] (when (= :long (dtype/canon type)) id)) scalar-types)))
+        global-coordinate #(global-index % long-values)
         indices
         [(body/->IndexBinding local-col :local 0)
          (body/->IndexBinding local-row :local 1)
          (body/->IndexBinding group-col :group 0)
          (body/->IndexBinding group-row :group 1)
          (body/->IndexCompute thread-id (add (mul local-row workgroup-by-col) local-col))
-         (body/->IndexCompute block-row (mul group-row block-m))
-         (body/->IndexCompute block-col (mul group-col block-n))]
+         (body/->IndexCompute block-row (global-coordinate (mul group-row block-m)))
+         (body/->IndexCompute block-col (global-coordinate (mul group-col block-n)))]
         row-stage-index 'register-a-index
         col-stage-index 'register-b-index
         ;; Traverse each operand in physical contiguous order. Only its staging store is
@@ -389,10 +411,7 @@
                       (:nn :tn) #(modulo % block-n)
                       :nt #(div % block-k))
         k-block 'register-k-block
-        k-coordinate (fn [offset]
-                       (add k-block (if (= :long k-index-dtype)
-                                      (body/index-cast offset :long :exact)
-                                      offset)))
+        k-coordinate (fn [offset] (global-coordinate (add k-block offset)))
         row-valid-mask :register-a-valid
         col-valid-mask :register-b-valid
         masks
@@ -400,17 +419,21 @@
          (concat
           [(body/->Mask
             row-valid-mask
-            [(body/predicate :lt (add block-row (row-stage-row row-stage-index)) M)
-             (body/predicate :lt (k-coordinate (row-stage-col row-stage-index)) K)])
+            [(body/predicate :lt (global-coordinate (add block-row (row-stage-row row-stage-index)))
+                                 (global-coordinate M))
+             (body/predicate :lt (k-coordinate (row-stage-col row-stage-index)) (global-coordinate K))])
            (body/->Mask
             col-valid-mask
-            [(body/predicate :lt (k-coordinate (col-stage-k col-stage-index)) K)
-             (body/predicate :lt (add block-col (col-stage-n col-stage-index)) N)])]
+            [(body/predicate :lt (k-coordinate (col-stage-k col-stage-index)) (global-coordinate K))
+             (body/predicate :lt (global-coordinate (add block-col (col-stage-n col-stage-index)))
+                                 (global-coordinate N))])]
           (for [mm (range thread-m) nn (range thread-n)]
             (body/->Mask
              (keyword (str "register-store-" mm "-" nn))
-             [(body/predicate :lt (add block-row (mul local-row thread-m) mm) M)
-              (body/predicate :lt (add block-col (mul local-col thread-n) nn) N)]))))
+             [(body/predicate :lt (global-coordinate (add block-row (mul local-row thread-m) mm))
+                                  (global-coordinate M))
+              (body/predicate :lt (global-coordinate (add block-col (mul local-col thread-n) nn))
+                                  (global-coordinate N))]))))
         outer-accumulator-bindings
         (vec (for [mm (range thread-m) nn (range thread-n)]
                (identifier "register-outer-acc" mm nn)))
@@ -482,7 +505,7 @@
           :row-coordinate row-stage-row :col-coordinate row-stage-col
           :source-coordinates
           (fn [index]
-            (let [row-position (add block-row (row-stage-row index))
+            (let [row-position (global-coordinate (add block-row (row-stage-row index)))
                   k-position (k-coordinate (row-stage-col index))]
               (case variant
                 :tn [k-position row-position]
@@ -499,7 +522,7 @@
             (let [k-offset (col-stage-k index)
                   n-offset (col-stage-n index)
                   k-position (k-coordinate k-offset)
-                  n-position (add block-col n-offset)]
+                  n-position (global-coordinate (add block-col n-offset))]
               (case variant
                 (:nn :tn) [k-position n-position]
                 :nt [n-position k-position])))
@@ -528,12 +551,13 @@
                (let [position (+ (* mm thread-n) nn)
                      accumulator (nth accumulator-results position)
                      store-mask (keyword (str "register-store-" mm "-" nn))
-                     row-source (list '+ block-row (list '* local-row thread-m) mm)
-                     col-source (list '+ block-col (list '* local-col thread-n) nn)
-                     coordinates [(contraction-body/lower-index
-                                   row-source store-coordinate-scope)
-                                  (contraction-body/lower-index
-                                   col-source store-coordinate-scope)]
+                     row-source (list '+ block-row (list '* (list 'long local-row) (list 'long thread-m)) (list 'long mm))
+                     col-source (list '+ block-col (list '* (list 'long local-col) (list 'long thread-n)) (list 'long nn))
+                     raw-row (contraction-body/lower-index row-source store-coordinate-scope)
+                     raw-col (contraction-body/lower-index col-source store-coordinate-scope)
+                     global-row (global-coordinate raw-row)
+                     global-col (global-coordinate raw-col)
+                     coordinates [global-row global-col]
                      lowered
                      (when semantic-region
                        (scalar-region-lower/lower
@@ -545,10 +569,15 @@
                          :id-prefix (str "register-store-" mm "-" nn)
                          :coordinate-lower
                          #(mapv (fn [coordinate]
-                                  (contraction-body/lower-index
-                                   (walk/postwalk-replace
-                                    {i row-source j col-source} coordinate)
-                                   store-coordinate-scope))
+                                  ;; Widen the generated row/column subtrees after structural
+                                  ;; lowering, which intentionally unwraps source casts.
+                                  ;; Surrounding source epilogue arithmetic keeps its semantics.
+                                  (walk/postwalk-replace
+                                   {raw-row global-row raw-col global-col}
+                                   (contraction-body/lower-index
+                                    (walk/postwalk-replace
+                                     {i row-source j col-source} coordinate)
+                                    store-coordinate-scope)))
                                 (axis-map/coordinate-exprs %))
                          :predicate store-mask}))]
                  (concat (:operations lowered)

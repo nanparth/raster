@@ -88,6 +88,7 @@
         ;; A schedule may have an array-specific coordinate proof (for example, a resident
         ;; one-element reduction result broadcast into a later fold). Keep that storage fact in
         ;; the owning schedule rather than teaching this shared scalar language about layouts.
+        owner-load-index? (some? lower-load-index)
         lower-load-index (or lower-load-index
                              (fn [_array expression scope]
                                (lower-index expression scope)))
@@ -302,20 +303,103 @@
     (when-not (and (fn? lower-index) (fn? decline!))
       (throw (ex-info "scalar KernelBody lowering requires index and decline callbacks"
                       {:reason :raster/bug :lower-index lower-index :decline decline!})))
-    (letfn [(require-index! [coordinate]
-              (when-let [info (body/conditional-index-info coordinate @conditional-values)]
+    (letfn [(source-coordinate-values-available? [expression env]
+              (cond
+                (symbol? expression)
+                (boolean (or (contains? env expression)
+                             (contains? scalar-types expression)
+                             (numeric-constant/value expression)))
+                (number? expression) true
+                (seq? expression)
+                (every? #(source-coordinate-values-available? % env)
+                        (descriptor/call-args expression))
+                :else false))
+            (source-coordinate [array coordinate env admitted-coordinate]
+              (let [scalar-required? (or (contains-indexed-load? coordinate)
+                                         (index-expression/requires-scalar-evaluation? coordinate))
+                    index-coordinate (when-not scalar-required?
+                                       (or admitted-coordinate
+                                           (lower-load-index array coordinate (set (keys env)))))
+                    checked-source-required?
+                    (and (not owner-load-index?)
+                         (not scalar-required?)
+                         (source-coordinate-values-available? coordinate env)
+                         (index-expression/contains-checked-source-arithmetic? coordinate)
+                         (nil? (body/conditional-index-info index-coordinate @conditional-values)))
+                    value (when (or scalar-required? checked-source-required?)
+                            ;; Evaluate actual typed source once, retaining all intermediate
+                            ;; widths/checks. Owner-admitted structural coordinates stay intact.
+                            (lower coordinate :long env))]
+                {:operations (vec (:operations value))
+                 :coordinate (if value (:result value) index-coordinate)}))
+            (require-index! [coordinate]
+              ;; A declined parent proof must not hide independently needed child
+              ;; arithmetic obligations. This collection does not admit the parent.
+              (cond
+                (instance? raster.compiler.ir.kernel_body.IndexExpr coordinate)
+                (doseq [argument (:arguments coordinate)] (require-index! argument))
+                (instance? raster.compiler.ir.kernel_body.IndexCast coordinate)
+                (require-index! (:argument coordinate)))
+              ;; Raw owner coordinates keep the same conservative affine cohort as
+              ;; the owner's typed scalar path. Exact identities, not arbitrary casts
+              ;; or numeric coincidences, select the original factor requirement.
+              (when (and affine-domain
+                         (instance? raster.compiler.ir.kernel_body.IndexExpr coordinate)
+                         (= :mul (:op coordinate)) (= 2 (count (:arguments coordinate))))
+                (when-let [factor (some (fn [[index factor]]
+                                         (when (and (= index (:index affine-domain))
+                                                    (= :long (get scalar-types factor))) factor))
+                                       [(:arguments coordinate) (reverse (:arguments coordinate))])]
+                  (swap! required #(vec (distinct (into %
+                                       (body/affine-product-preconditions (:bound affine-domain) factor)))))))
+              (when-let [info (body/conditional-index-info coordinate
+                               (with-meta @conditional-values
+                                 (assoc (meta @conditional-values) :required-preconditions
+                                        (vec (distinct (concat (:required-preconditions (meta @conditional-values)) @required))))))]
                 (swap! required #(vec (distinct (into % (:required-preconditions info)))))))
+
 
             (with-loop-index [index lower-bound upper-bound mode f]
               (let [saved-values @conditional-values saved-ranges @value-ranges
+                    ;; Bounds are evaluated in the parent lexical scope, even if the loop is empty.
+                    ;; Collect every actual child/prefix obligation before installing the binder.
+                    _ (require-index! lower-bound)
+                    _ (require-index! upper-bound)
                     info (body/entered-for-loop-info
                           lower-bound (body/conditional-index-info upper-bound saved-values) 1 mode)]
                 (when info
-                  (swap! conditional-values assoc index info)
+                  (swap! conditional-values
+                         (fn [values]
+                           (let [upper (get-in info [:entered-loop-index :upper])]
+                             (with-meta (assoc values index
+                                          (cond-> info upper (assoc-in [:entered-loop-index :index] index)))
+                               (cond-> (meta values)
+                                 upper (update :entered-loop-domains (fnil conj [])
+                                         {:index index :upper upper}))))))
                   (remember-range! index (:range info)))
                 (try (f)
                      (finally (reset! conditional-values saved-values)
                               (reset! value-ranges saved-ranges)))))
+
+            (with-reconstructed-index-region [reconstruct region f]
+              (let [saved-values @conditional-values saved-ranges @value-ranges
+                    reconstructed (reconstruct region)
+                    values (with-meta (merge saved-values (:values reconstructed))
+                                      (meta (:values reconstructed)))]
+                (swap! required #(vec (distinct (into % (:requirements reconstructed)))))
+                (reset! conditional-values values)
+                (doseq [[id info] values]
+                  (when (scalar-range/contained-in-dtype? (:range info) (:type info))
+                    (remember-range! id (:range info))))
+                (try (f)
+                     (finally (reset! conditional-values saved-values)
+                              (reset! value-ranges saved-ranges)))))
+
+            (with-index-region [region f]
+              (with-reconstructed-index-region body/scheduled-index-region-info region f))
+
+            (with-varying-index-region [region f]
+              (with-reconstructed-index-region body/varying-guard-index-region-info region f))
 
             (load-ssa [array coordinates]
               (let [type (some-> (get array-types array) dtype/canon)]
@@ -354,7 +438,10 @@
                     range (or range (scalar-range/for-dtype result-type))]
                 (remember-range! result range)
                 (let [expression (body/scalar-expression operator result-type arguments options)
-                      transfer (body/conditional-integer-transfer expression @conditional-values)]
+                      transfer (body/conditional-integer-transfer expression
+                                 (with-meta @conditional-values
+                                   (assoc (meta @conditional-values) :required-preconditions
+                                          (vec (distinct (concat (:required-preconditions (meta @conditional-values)) @required))))))]
                   (swap! conditional-values assoc result
                          (cond-> {:type result-type :range range}
                            (= :predicate result-type) (assoc :comparison-expression expression)
@@ -616,19 +703,9 @@
                       (decline! :indexed-load
                                 "scalar loads require a declared typed stable tensor"
                                 {:expression expression :array array :array-types array-types}))
-                    (let [coordinate-value
-                          (when (or (contains-indexed-load? coordinate)
-                                    (index-expression/requires-scalar-evaluation? coordinate))
-                            ;; Materialize nested loads and source-width wrapping arithmetic as
-                            ;; typed scalar SSA before using the result as a storage coordinate.
-                            ;; The final coordinate widens; its inner int operation must not.
-                            (lower coordinate :long env))
-                          coordinate-expression
-                          (if coordinate-value
-                            (:result coordinate-value)
-                            (lower-load-index array coordinate (set (keys env))))
-                          loaded (load-ssa array [coordinate-expression])]
-                      (update loaded :operations #(into (vec (:operations coordinate-value)) %))))
+                    (let [coordinate-state (source-coordinate array coordinate env nil)
+                          loaded (load-ssa array [(:coordinate coordinate-state)])]
+                      (update loaded :operations #(into (:operations coordinate-state) %))))
 
                   (and (seq? expression) (descriptor/cast-op? (first expression))
                        (= 2 (count expression)))
@@ -1255,6 +1332,9 @@
                               (and (contains? #{:byte :int :long} operand-type)
                                    (contains? #{:+ :- :*} operator))
                               operand-ranges (mapv :range lowered)
+                              ;; Preserve this owner's existing conservative affine contract.
+                              ;; Collect the exact source factor cohort before selecting a shared
+                              ;; transfer; final replay sees the same independently required set.
                               conditional-factor
                               (when (and (= :* operator) (= :long operand-type) affine-domain
                                          (nil? (intrinsics/source-overflow-policy semantic-operation)))
@@ -1268,11 +1348,12 @@
                                                        (body/affine-product-preconditions
                                                         (:bound affine-domain) conditional-factor)))))))
                               conditional-transfer
-                              (when (and affine-domain
-                                         (nil? (intrinsics/source-overflow-policy semantic-operation)))
+                              (when (nil? (intrinsics/source-overflow-policy semantic-operation))
                                 (body/conditional-integer-transfer
                                  (body/scalar-expression operator result-type (mapv :result lowered) {})
-                                 @conditional-values))
+                                 (with-meta @conditional-values
+                                   (assoc (meta @conditional-values) :required-preconditions
+                                          (vec (distinct (concat (:required-preconditions (meta @conditional-values)) @required)))))))
                               _ (when conditional-transfer
                                   (swap! required #(vec (distinct (into % (:required-preconditions conditional-transfer))))))
                               proven-range (when integral-arithmetic?
@@ -1297,7 +1378,8 @@
                                              :actual (mapv :type lowered)}))
                               result-range (or (:range conditional-transfer)
                                                (case operator
-                                                 :quot (scalar-range/quotient operand-ranges)
+                                                 :quot (or (scalar-range/quotient operand-ranges)
+                                                           (scalar-range/for-dtype result-type))
                                                  :rem (scalar-range/remainder operand-ranges)
                                                  proven-range))
                               computed (compute-ssa operator result-type (mapv :result lowered)
@@ -1328,12 +1410,17 @@
        :cast (fn [lowered target expression]
                (reserve! [lowered expression predicate])
                (cast-lowered lowered target expression))
+       ;; This internal entry selects actual typed source evaluation only when its complete
+       ;; structural index proof is unavailable; owners retain admission and final validation.
+       :source-coordinate source-coordinate
        ;; These typed entries perform no source admission, index proof, promotion or overflow
        ;; inference. Their owner supplies proved coordinates and already-converted operands.
        :load load-ssa
        ;; Store and atomic destinations use the same private coordinate facts as loads.
        :require-index require-index!
        :with-loop-index with-loop-index
+       :with-index-region with-index-region
+       :with-varying-index-region with-varying-index-region
        :compute (fn [operator result-type arguments options]
                   (compute-ssa operator result-type arguments options nil))
        :lower-region

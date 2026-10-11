@@ -7,6 +7,9 @@
             [raster.compiler.backend.jvm.segop-simd :as segop-simd]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.kernel-body :as kernel-body]
+            [raster.compiler.ir.kernel-artifact :as kernel-artifact]
+            [raster.compiler.ir.kernel-precondition :as precondition]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
@@ -406,19 +409,17 @@
                           program {:target-device :ze:0 :dtype :float}))
         operation (first (get-in scheduled [:equations 0 :operations]))
         artifact (segop-opencl/generate-scheduled-segmap-kernel
-                  ;; The scheduled device is :ze:0. `r * feat` is ordinary long arithmetic,
-                  ;; so this concrete artifact uses Intel OpenCL's checked-trap contract.
+                  ;; Retain the scheduled Intel target as well as the portable arithmetic check.
                   operation :dtype :float :target-dialect :opencl-intel
                   :array-types {'x :float 'out :float}
                   :scalar-types {'rows :long 'feat :long})
-        portable-reason (try
-                          (segop-opencl/generate-scheduled-segmap-kernel
-                           operation :dtype :float :target-dialect :opencl-portable
-                           :array-types {'x :float 'out :float}
-                           :scalar-types {'rows :long 'feat :long})
-                          nil
-                          (catch clojure.lang.ExceptionInfo exception
-                            (:reason (ex-data exception))))
+        portable (segop-opencl/generate-scheduled-segmap-kernel
+                  operation :dtype :float :target-dialect :opencl-portable
+                  :array-types {'x :float 'out :float}
+                  :scalar-types {'rows :long 'feat :long})
+        checked (get-in portable [:attributes :kernel-body])
+        requirements (:preconditions portable)
+        bindings (fn [rows feat] {'_n_bound rows 'rows rows 'feat feat})
         jvm (par-simd/simd-pass scheduled :min-elements 1)
         execute (eval (list 'fn '[x out rows feat] (:form jvm)))
         x (float-array [1.0 2.0 3.0 4.0])
@@ -436,8 +437,26 @@
     (testing "the device kernel is a verified KernelBody with a nested loop"
       (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
       (is (nil? (get-in artifact [:attributes :kernel-body-decline])))
-      (is (= :kernel-body-c-trap-unsupported portable-reason)
-          "portable OpenCL does not pretend it can preserve checked long arithmetic")
+      (is (= portable (kernel-artifact/validate! portable)))
+      (is (= :kernel-body (get-in portable [:attributes :emission-route])))
+      (is (= 4 (count requirements)))
+      (is (= requirements (kernel-body/required-preconditions checked)))
+      (is (precondition/check! requirements (bindings 1 1)))
+      (is (precondition/check! requirements (bindings 0 1)))
+      (doseq [[rows feat] [[-1 1] [0 -1] [1 -1]]]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (precondition/check! requirements (bindings rows feat)))))
+      (is (thrown? ArithmeticException
+                   (precondition/check! requirements (bindings Long/MAX_VALUE 2))))
+      (doseq [condition requirements]
+        (is (contains? #{:kernel-body-index-precondition :kernel-body-intrinsic-overflow}
+                       (try (kernel-body/validate!
+                              (assoc-in checked [:attributes :required-preconditions]
+                                        (vec (remove #{condition} requirements)))) :accepted
+                            (catch clojure.lang.ExceptionInfo exception
+                              (:reason (ex-data exception)))))))
+      ;; These conditions certify arithmetic/emission, not the capacity of x/out shapes [rows].
+
       (is (str/includes? (:source artifact) "for (")))
     (testing "the JVM schedule executes the loop"
       (is (nil? (execute x out 2 2)))

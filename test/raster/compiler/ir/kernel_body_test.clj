@@ -1382,3 +1382,59 @@
                                       :upper (bigint Integer/MAX_VALUE)}}))
                   nil
                   (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
+
+(deftest ceil-div-closes-the-emitted-addition-before-division
+  (let [kernel (fn [n d type]
+                 (body/make
+                  {:id :checked-ceil-prefix
+                   :parameters [(body/->KernelParameter 'a :input :long [1] :global
+                                  (layout/row-major [1] :long) :operand)]
+                   :operations [(body/->ScalarCompute (body/value 'n type)
+                                  (body/scalar-expression :cast type [(body/literal n type)]
+                                    {:rounding :exact :overflow :exact}))
+                                (body/->ScalarCompute (body/value 'd type)
+                                  (body/scalar-expression :cast type [(body/literal d type)]
+                                    {:rounding :exact :overflow :exact}))
+                                (body/->ScalarLoad (body/value 'v :long) 'a
+                                  [(body/expression :ceil-div 'n 'd)] nil nil :cached)]
+                   :launch (launch/spec {:workgroup-size [1] :group-count [1]})}))
+        reason (fn [f] (try (f) :accepted
+                           (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+    (is (some? (kernel Integer/MAX_VALUE Integer/MAX_VALUE :long)))
+    (is (some? (kernel 0 1 :long)))
+    (doseq [[n d] [[Long/MAX_VALUE 1] [(dec Long/MAX_VALUE) 2]
+                   [1 0] [1 -1] [Long/MIN_VALUE 1]]]
+      (is (= :kernel-body-index-precondition (reason #(kernel n d :long)))))
+    (is (= :kernel-body-index-precondition (reason #(kernel Integer/MAX_VALUE 1 :int)))
+        "Int n+d overflow is not repaired by the representable final quotient")))
+
+(deftest exclusive-entry-retains-a-closed-hardware-lower-sign
+  (let [base {:id :actual-lower-sign
+              :parameters [(body/->KernelParameter 'a :input :long [1] :global
+                             (layout/row-major [1] :long) :operand)]
+              :indices [(body/->IndexBinding 'g :group 0)
+                        (body/->IndexCompute 'lower (body/index-cast 'g :long :exact))]
+              :operations [(body/->ScalarCompute (body/value 'upper :long)
+                             (body/scalar-expression :cast :long [(body/literal 16 :long)]
+                               {:rounding :exact :overflow :exact}))
+                           (body/->ForLoop (body/value 'i :long) 'lower 'upper 1 []
+                             [(body/->ScalarLoad (body/value 'v :long) 'a
+                                [(body/expression :floor-div 'i (body/index-cast 1 :long :exact))]
+                                nil nil :cached) (body/->Yield [])] [] {})]
+              :launch (launch/spec {:workgroup-size [1] :group-count [1]})}
+        checked (body/make base)
+        opaque (-> checked
+                   (update :parameters conj (body/->KernelParameter 'opaque :scalar :int [] nil nil :parameter))
+                   (assoc-in [:indices 1 :expression] (body/index-cast 'opaque :long :exact)))
+        forged (update opaque :parameters
+                       #(assoc % (dec (count %)) (assoc (last %) :nonnegative? true :index-origin-safe? true)))
+        unsafe (assoc-in checked [:indices 1 :expression]
+                         (body/index-cast (body/expression :mul 'g 256) :long :exact))
+        negative (assoc-in checked [:indices 1 :expression] (body/index-cast -1 :long :exact))
+        inclusive (assoc-in checked [:operations 1 :attributes :upper-bound] :inclusive)
+        reason (fn [f] (try (f) :accepted
+                           (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))]
+    (is (= checked (body/validate! checked)))
+    (doseq [candidate [opaque forged unsafe negative inclusive]]
+      (is (= :kernel-body-index-precondition (reason #(body/validate! candidate)))
+          "unknown/signed/overflowing/inclusive bounds cannot borrow the closed exclusive entry"))))

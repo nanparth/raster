@@ -115,13 +115,26 @@
           (mapv
            (fn [position {:keys [name bound]}]
              (let [following (subvec (vec segments) (inc position))
-                   divisor (product-expression (mapv :bound following))
-                   quotient (if (= 1 divisor) segment-long
-                                (body/expression :floor-div segment-long
-                                                 (lower-index divisor #{})))]
+                   ;; All executed semantic extents are positive under the transported
+                   ;; quotient-domain contracts. Divide in sequence rather than evaluating
+                   ;; a potentially overflowing compiler-generated suffix product.
+                   quotient (reduce (fn [value {:keys [bound]}]
+                                      (if (= 1 bound) value
+                                          (body/expression :floor-div value
+                                                           (lower-index bound #{}))))
+                                    segment-long following)]
                (body/->IndexCompute
-                name (body/expression :mod quotient (lower-index bound #{})))))
+                name (if (some #(= 0 (:bound %)) segments)
+                       ;; The executed-domain contract forces _n_bound=0. Keep the dormant
+                       ;; axis declarations without spelling a constant division by zero.
+                       (body/index-cast 0 :long :exact)
+                       (body/expression :mod quotient (lower-index bound #{}))))))
            (range) segments))
+        axis-domain-preconditions
+        (if single-segment? []
+            (vec (distinct
+                  (mapcat #(body/quotient-domain-preconditions '_n_bound (:bound %))
+                          segments))))
         neutrals (mapv (fn [{:keys [neutral dtype]}]
                          (if-let [evidence (constant/value neutral)]
                            (body/literal (:value evidence) dtype)
@@ -208,7 +221,9 @@
                                 :group-count [(launch/maximum 1 (launch/runtime-value '_n_bound))]
                                 :shared-memory-bytes scratch-bytes})
           :provenance {:dialect :kernel-body :source-dialect :segred :segop-id (:id segred)}
-          :attributes {:kind :product-reduction :component-dtypes types}})]
+          :attributes (cond-> {:kind :product-reduction :component-dtypes types}
+                        (seq axis-domain-preconditions)
+                        (assoc :required-preconditions axis-domain-preconditions))})]
     {:kernel-body kernel-body :rows rows-argument
      :inputs inputs :outputs outputs :scalars scalars}))
 
@@ -218,6 +233,7 @@
     (scheduled/make
      {:source segred :body kernel-body :arguments arguments
       :scalar-bindings (scheduled/derive-scalar-bindings kernel-body arguments)
+      :preconditions (body/required-preconditions kernel-body)
       :effects {:kind :product-reduction :uses (scheduled/derive-uses kernel-body arguments)}
       :legality {:kind :product-workgroup-tree :algebra (:algebra (:reduction segred))
                  :source-schedule (:schedule segred) :aliasing :no-write-alias}

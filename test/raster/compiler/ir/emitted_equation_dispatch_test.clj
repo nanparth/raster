@@ -16,6 +16,7 @@
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
+            [raster.compiler.ir.kernel-artifact :as kernel-artifact]
             [raster.compiler.ir.semantic-fingerprint :as semantic-fingerprint]
             [raster.gpu.indexed-attention-device-test :as indexed-fixture]
             [raster.gpu.dispatch-benchmark :as benchmark]
@@ -466,13 +467,24 @@
                      (assoc selector :default-strategy
                             :indexed-segmented-reduction-subgroup-score-reuse)
                      reassociation))))
-    (is (= :emitted-reduction-artifact-refinement
+    (is (= :kernel-artifact-required-preconditions
            (reason #(equation-dispatch/validate!
                      (assoc certified :alternatives
                             [reference (assoc-in subgroup
                                                  [:graph :nodes 0 :operation :provenance
                                                   :scheduled-operation :numerics :mode]
-                                                 :exact)])))))))
+                                                 :exact)])))))
+    (let [coherent (update-in subgroup [:graph :nodes 0 :operation]
+                             #(-> %
+                                  (assoc-in [:attributes :scheduled-kernel-body :numerics :mode] :exact)
+                                  (assoc-in [:provenance :scheduled-operation :numerics :mode] :exact)))
+          changed (get-in coherent [:graph :nodes 0 :operation])]
+      (is (identical? changed (kernel-artifact/validate! changed))
+          "matching retained schedules pass artifact consistency, not numerical refinement")
+      (is (= :emitted-reduction-artifact-refinement
+             (reason #(equation-dispatch/validate!
+                       (assoc certified :alternatives [reference coherent]))))
+          "a coherent numerical mutation still differs from the independently retained equation"))))
 
 (deftest public-compilation-retains-numerical-dispatch-policy
   (register-target!)

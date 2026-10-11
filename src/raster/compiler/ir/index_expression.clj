@@ -42,6 +42,19 @@
                                                 (:tag (meta (second %)))))))))
                  (tree-seq coll? seq expression))))
 
+(defn contains-checked-source-arithmetic?
+  "Whether actual source arithmetic needs its typed checked evaluation when index
+   algebra cannot independently prove every intermediate representable."
+  [expression]
+  (boolean
+   (some (fn [form]
+           (when (seq? form)
+             (let [op (descriptor/semantic-op form)]
+               (or (contains? #{:add :sub :mul} (get operators op))
+                   (descriptor/increment-op? op)
+                   (descriptor/decrement-op? op)))))
+         (tree-seq coll? seq expression))))
+
 (def ^:private casts
   '#{int long clojure.core/int clojure.core/long})
 

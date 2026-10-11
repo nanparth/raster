@@ -3,6 +3,7 @@
             [clojure.walk :as walk]
             [raster.compiler.backend.gpu.kernel-body-target :as target]
             [raster.compiler.backend.gpu.segop-opencl :as graph-emission]
+            [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
@@ -335,3 +336,43 @@
            (reason #(indexed-body/schedule-reference-for-node
                      changed changed-node source
                      {:subgroup-size 16 :max-workgroup-size 256}))))))
+
+
+(deftest reference-feature-geometry-widens-before-generated-arithmetic
+  ;; Capture the real producer's indices without claiming the unresolved q/k body validates.
+  (let [raw (with-redefs [body/make identity]
+              (indexed-body/lower-dynamic-reference (plan) 16))
+        coordinate (:expression (first (filter #(and (instance? raster.compiler.ir.kernel_body.IndexCompute %)
+                                                     (= 'feature (:id %))) (:indices raw))))
+        casts (filter #(instance? raster.compiler.ir.kernel_body.IndexCast %)
+                      (tree-seq coll? seq coordinate))
+        evaluate (fn evaluate [node values]
+                   (cond (symbol? node) (long (get values node))
+                         (integer? node) (long node)
+                         (instance? raster.compiler.ir.kernel_body.IndexCast node)
+                         (evaluate (:argument node) values)
+                         (instance? raster.compiler.ir.kernel_body.IndexExpr node)
+                         (let [[a b] (map #(evaluate % values) (:arguments node))]
+                           (case (:op node)
+                             :add (Math/addExact (long a) (long b))
+                             :mul (Math/multiplyExact (long a) (long b))))))
+        ;; Independently validate only the actual generated geometry, not source address capacity.
+        checked (body/make {:id :reference-feature-geometry-only
+                            :parameters [] :indices (:indices raw) :masks [] :operations []
+                            :launch (launch/spec {:workgroup-size [16 1] :group-count [134217729 1]})})
+        geometry (launch/geometry {:workgroup-size [16 1] :group-count [134217729 1]})]
+    (is (= :add (:op coordinate)))
+    (is (= 3 (count casts)))
+    (is (every? #(and (= :long (:dtype %)) (= :exact (:overflow %))) casts))
+    (is (= 2147483648 (evaluate coordinate {'indexed-group-x 134217728 'indexed-lane-x 0})))
+    (is (= 2147483663 (evaluate coordinate {'indexed-group-x 134217728 'indexed-lane-x 15})))
+    (is (= checked (body/validate! checked)))
+    (is (= geometry (body/validate-launch-index-ranges! checked geometry)))
+    (is (= :kernel-launch-index-range
+           (reason #(body/validate-launch-index-ranges! checked
+                      (launch/geometry {:workgroup-size [16 1] :group-count [2147483649 1]})))))
+    (is (thrown? ArithmeticException
+                 (evaluate coordinate {'indexed-group-x Long/MAX_VALUE 'indexed-lane-x 0})))
+    (is (= [:long :long :long :long :long :long]
+           (mapv :dtype (filter #(= :scalar (:kind %)) (:parameters raw)))))
+    (is (= :ordered-edge-list (get-in raw [:schedule :membership-traversal])))))

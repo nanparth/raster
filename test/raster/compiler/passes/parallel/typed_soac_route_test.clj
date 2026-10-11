@@ -1052,7 +1052,8 @@
         graph (get-in equation [:attributes :kernel-graph])
         emitted (opencl-pass/opencl-pass scheduled :device-id :ocl:0 :dtype :float)
         [intra _ carry] (:kernels emitted)
-        result-index [(kernel-body/expression :add 'scan-index 1)]]
+        result-index [(kernel-body/expression :add 'scan-index
+                        (kernel-body/index-cast 1 :long :exact))]]
     (is (= :typed-soac (:route stats)))
     (is (= :exclusive
            (get-in (dialect/operation-parts
@@ -1803,7 +1804,25 @@
                  {:refinement (:refinement public-plan)})
                 (is false "a retained matching stage source cannot authorize a changed body")
                 (catch clojure.lang.ExceptionInfo exception
-                  (is (= :emitted-mixed-matrix-artifact-refinement (:reason (ex-data exception)))))))
+                  (is (= :kernel-artifact-required-preconditions (:reason (ex-data exception))))))
+              (let [coherent (update-in emitted [:nodes 0 :operation]
+                                        (fn [artifact]
+                                          (let [changed (assoc-in (get-in artifact [:attributes :kernel-body])
+                                                                  [:attributes :forged] true)]
+                                            (-> artifact
+                                                (assoc-in [:attributes :kernel-body] changed)
+                                                (assoc-in [:attributes :scheduled-kernel-body :body] changed)
+                                                (assoc-in [:provenance :scheduled-operation :body] changed)))))
+                    changed (get-in coherent [:nodes 0 :operation])]
+                (is (identical? changed (kernel-artifact/validate! changed))
+                    "matching body authorities do not authorize a changed generated stage")
+                (try
+                  (emitted-equation/make algorithm body coherent
+                                         {:refinement (:refinement public-plan)})
+                  (is false "coherent body mutation must fail independent mixed-stage refinement")
+                  (catch clojure.lang.ExceptionInfo exception
+                    (is (= :emitted-mixed-matrix-artifact-refinement
+                           (:reason (ex-data exception))))))))
             (let [input (first (get-in planned [:graph :inputs]))
                   repeated (update (:graph planned) :inputs
                                    #(into [(assoc input :elements

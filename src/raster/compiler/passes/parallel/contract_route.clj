@@ -86,6 +86,44 @@
         (klaunch/ceil-div value divisor)
         (klaunch/runtime-value dimension)))))
 
+(defn- descriptor-launch-identity
+  "Compare validated launch expressions without changing their runtime contract. Only exact
+   widening casts, runtime wrappers, singleton products, and closed arithmetic are normalized."
+  [expression]
+  (cond
+    (instance? raster.compiler.ir.kernel_body.IndexCast expression)
+    (if (and (= :exact (:overflow expression)) (= :long (:dtype expression)))
+      (descriptor-launch-identity (:argument expression))
+      expression)
+    (instance? raster.compiler.ir.kernel_launch.RuntimeValue expression)
+    (descriptor-launch-identity (:value expression))
+    (and (seq? expression) (contains? '#{* clojure.core/* raster.numeric/*} (first expression)))
+    (descriptor-launch-identity (apply klaunch/product (rest expression)))
+    (instance? raster.compiler.ir.kernel_launch.Product expression)
+    (let [;; Only a first-factor product repeats the same checked prefix sequence.
+          ;; Later nested factors must resolve before the outer multiplication.
+          raw-factors (loop [factors (:factors expression)]
+                        (if (instance? raster.compiler.ir.kernel_launch.Product (first factors))
+                          (recur (into (vec (:factors (first factors))) (rest factors)))
+                          factors))
+          factors (mapv descriptor-launch-identity raw-factors)]
+      (cond (= 1 (count factors)) (first factors)
+            (every? integer? factors)
+            (try (reduce #(Math/multiplyExact (long %1) (long %2)) 1 factors)
+                 (catch ArithmeticException _ [:product factors]))
+            :else [:product factors]))
+    (instance? raster.compiler.ir.kernel_launch.CeilDiv expression)
+    (let [value (descriptor-launch-identity (:value expression))
+          divisor (descriptor-launch-identity (:divisor expression))]
+      (if (and (integer? value) (not (neg? value)) (integer? divisor) (pos? divisor))
+        (+ (quot value divisor) (if (zero? (rem value divisor)) 0 1))
+        [:ceil-div value divisor]))
+    (instance? raster.compiler.ir.kernel_launch.LaunchSpec expression)
+    {:workgroup-size (mapv descriptor-launch-identity (:workgroup-size expression))
+     :group-count (mapv descriptor-launch-identity (:group-count expression))
+     :shared-memory-bytes (:shared-memory-bytes expression)}
+    :else expression))
+
 (defn- descriptor-artifact
   "Close a validated single-launch contraction descriptor into one executable compiler value."
   [{:keys [strategy kernel-name source abi arguments wg grid out-elems dtype out-dtype]
@@ -94,7 +132,51 @@
                 (every? (set arguments) (klaunch/expression-references out-elems)))
     (throw (ex-info "contract descriptor: symbolic :out-elems references unbound artifact values"
                     {:strategy strategy :out-elems out-elems :arguments arguments})))
-  (kart/make
+  (if (seq (get-in descriptor [:kernel-body :attributes :required-preconditions]))
+    ;; Conditional bodies use the complete checked-module projection, never a source-only map.
+    (let [artifact
+          (sco/generate-contraction-kernel-artifact
+           (:kernel-body descriptor) :kernel-name kernel-name :arguments arguments
+           :target-dialect (or (:target-dialect descriptor) :opencl-intel)
+           :attributes (merge
+                        {:strategy strategy :out-elems out-elems
+                         :dtype dtype :out-dtype out-dtype}
+                        (select-keys descriptor [:fallback-reason :declines :tile :tensorized
+                                                 :packed :fused-epilogue :dims :stages])))]
+      ;; Compilation may reconstruct target certificates, but never replace the descriptor's
+      ;; validated module or ordered physical signature with another executable contract.
+      (doseq [[field expected] [[:kernel-name kernel-name] [:source source] [:abi abi]
+                                [:arguments arguments]]]
+        (when-not (= expected (get artifact field))
+          (throw (ex-info "contract descriptor differs from its checked module projection"
+                          {:reason :contract-descriptor-module-projection
+                           :field field :expected expected :actual (get artifact field)}))))
+      (let [bindings (into {} (map (juxt :parameter :value))
+                           (get-in artifact [:attributes :scheduled-kernel-body :scalar-bindings]))
+            descriptor-launch (klaunch/spec
+                               {:workgroup-size (mapv launch-dimension wg)
+                                :group-count (mapv launch-dimension grid)})
+            expected-launch (klaunch/rebind-spec descriptor-launch bindings)
+            bound-argument (get bindings '_nseg)
+            expected-bound (klaunch/rebind-expression
+                            (get-in descriptor [:kernel-body :attributes :launch-segment-count])
+                            (dissoc bindings '_nseg))]
+        (when-not (= (descriptor-launch-identity expected-launch)
+                     (descriptor-launch-identity (:launch artifact)))
+          (throw (ex-info "contract descriptor geometry differs from its checked body"
+                          {:reason :contract-descriptor-module-projection :field :launch
+                           :expected expected-launch :actual (:launch artifact)})))
+        (when-not (= (descriptor-launch-identity expected-bound)
+                     (descriptor-launch-identity (klaunch/runtime-value bound-argument)))
+          (throw (ex-info "contract descriptor segment bound differs from its free-axis extent"
+                          {:reason :contract-descriptor-module-projection :field :segment-bound
+                           :expected expected-bound :actual bound-argument})))
+        (when-not (= out-elems bound-argument)
+          (throw (ex-info "contract descriptor output extent differs from its bound argument"
+                          {:reason :contract-descriptor-module-projection :field :out-elems
+                           :expected bound-argument :actual out-elems}))))
+      artifact)
+    (kart/make
    {:kernel-name kernel-name
     :source source
     :abi abi
@@ -105,6 +187,7 @@
                {:workgroup-size (mapv launch-dimension wg)
                 :group-count (mapv launch-dimension grid)}))
     :temporaries []
+    :preconditions (get-in descriptor [:kernel-body :attributes :required-preconditions] [])
     :effects {:kind :tensor-contraction}
     :provenance {:dialect :segcontract :strategy strategy}
     :attributes
@@ -112,8 +195,11 @@
             :out-elems out-elems
             :dtype dtype
             :out-dtype out-dtype}
-           (select-keys descriptor [:fallback-reason :declines :tile :tensorized :packed
-                                    :fused-epilogue :dims :stages :kernel-body :emission-route]))}))
+           (cond-> (select-keys descriptor [:fallback-reason :declines :tile :tensorized :packed
+                                           :fused-epilogue :dims :stages :kernel-body :emission-route
+                                           :compilation])
+             (nil? (:kernel-body descriptor)) (dissoc :kernel-body)
+             (nil? (:compilation descriptor)) (dissoc :compilation)))})))
 
 (defn kernel-signature-params
   "The parameter list of the single __kernel in `src`, split at top-level commas. Used to check a
@@ -544,6 +630,8 @@
            {:strategy :segmap
             :emission-route (if emitted :kernel-body :verified-segmap-opencl)
             :kernel-body (:body portable)
+            :compilation (:compilation emitted)
+            :target-dialect (:target-dialect emitted)
             :kernel-name kernel-name :source source :array-params array-params :abi abi
             :dtype dtype :out-dtype dtype :wg [workgroup-size] :grid [(ceil-div nseg workgroup-size)]
             :scalar-args (descriptor-scalar-arguments abi (conj (vec scalar-params) nseg))
@@ -616,6 +704,8 @@
               :epilogue-scalars epilogue-scalars
               :fused-epilogue (boolean epilogue)
               :kernel-body (:body portable)
+              :compilation (:compilation emitted)
+              :target-dialect (:target-dialect emitted)
               :dtype dtype
               :out-dtype (or (some (fn [slot]
                                      (when (= :result (:role slot)) (:dtype slot)))
