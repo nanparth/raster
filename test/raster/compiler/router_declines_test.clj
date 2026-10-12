@@ -18,7 +18,10 @@
    which is the exact inversion this work exists to prevent."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.passes.parallel.contract-route :as cr]
-            [raster.compiler.core.hardware :as chw]))
+            [raster.compiler.core.hardware :as chw]
+            [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]))
 
 (defn- mm
   [m n k & {:keys [sym-dims combine]}]
@@ -139,3 +142,33 @@
           "four pipeline depths must produce four different kernels")
       (is (= :dpas (:strategy (cr/route-contraction (mm 256 256 256) :dtype :half :desc desc)))
           "and threading it must not change which leaf is chosen"))))
+
+
+(deftest compound-portable-extents-use-their-checked-owner-launch-value
+  (let [routed (route (mm 128 128 128 :sym-dims true) :half)
+        kernel (:kernel-body routed)
+        count (get-in kernel [:attributes :launch-segment-count])
+        validated (cr/validate-descriptor routed)]
+    (is (= :portable-segred (:strategy routed)))
+    (is (= count (:out-elems routed)))
+    (is (= count (:value (last (:scalar-args routed))))
+        "the actual ordered ABI keeps one identical checked compiler count value")
+    (is (= 256 (launch/resolve-expression {'M 1} count)))
+    (is (= 384 (launch/resolve-expression {'M 2} count)))
+    (is (thrown? clojure.lang.ExceptionInfo
+          (launch/resolve-expression {'M -2} (launch/ceil-div count 256))))
+    (is (thrown? ArithmeticException (launch/resolve-expression {'M Long/MAX_VALUE} count)))
+    (is (= (body/required-preconditions kernel) (:preconditions (:artifact validated))))
+    (let [original contraction-schedule/plan-portable-body]
+      (is (= :contract-descriptor-segment-count
+             (with-redefs [contraction-schedule/plan-portable-body
+                           (fn [& args]
+                             (update-in (apply original args) [:body :attributes] dissoc :launch-segment-count))]
+               (try (route (mm 128 128 128 :sym-dims true) :half) :accepted
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+    (is (= :launch
+           (try (cr/validate-descriptor (assoc routed :grid [(launch/ceil-div count 128)])) :accepted
+                (catch clojure.lang.ExceptionInfo error
+                  (when (= :contract-descriptor-module-projection (:reason (ex-data error)))
+                    (:field (ex-data error))))))
+        "matching source and arguments cannot hide a changed launch divisor")))

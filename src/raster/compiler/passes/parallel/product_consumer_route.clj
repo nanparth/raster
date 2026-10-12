@@ -6,6 +6,7 @@
   (:require [raster.compiler.backend.gpu.kernel-body-target :as target]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph :as graph]
+            [raster.compiler.ir.kernel-body :as kernel-body]
             [raster.compiler.ir.scheduled-graph-refinement :as refinement]
             [raster.compiler.ir.scheduled-kernel-body :as scheduled]
             [raster.compiler.passes.parallel.product-consumer-body :as body]
@@ -38,6 +39,7 @@
         scheduled
         (scheduled/make
          {:source source :body kernel-body :arguments arguments
+          :preconditions (kernel-body/required-preconditions kernel-body)
           :scalar-bindings (scheduled/derive-scalar-bindings kernel-body arguments)
           :effects {:kind :product-ordered-consumer
                     :uses (scheduled/derive-uses kernel-body arguments)}

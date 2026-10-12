@@ -4,6 +4,9 @@
             [raster.compiler.backend.gpu.segop-opencl :as gpu]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.kernel-precondition :as precondition]
+            [raster.compiler.passes.parallel.segmap-body :as segmap-body]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
@@ -372,3 +375,30 @@
             equation (-> result :program :equations first :algorithm dialect/equations first)]
         (is (= :typed-soac (get-in result [:stats :route])))
         (is (= :sequential (-> equation dialect/operation-parts :attributes :iteration-order)))))))
+
+
+(deftest sequential-carried-source-publishes-real-nested-address-obligations
+  (let [algorithm (-> (continuation-program normalization-source) :equations first :algorithm)
+        operation (first (soac-lower/lower-typed-effect-map algorithm :ze:0))
+        scheduled (segmap-body/schedule operation
+                   {:dtype :float :array-types {'x :float 'packed :float 'scales :float 'sums :float}
+                    :scalar-types {'rows :long 'width :long 'seed :float}})
+        kernel (:body scheduled)
+        conditions (body/required-preconditions kernel)
+        outer (first (:operations kernel))]
+    (is (= :ordered (get-in outer [:attributes :association])))
+    (is (= (body/index-cast 0 :long :exact) (:lower outer)))
+    (is (= (body/index-cast '_n_bound :long :exact) (:upper outer)))
+    (is (seq conditions) "nested evaluated source coordinates collect their real arithmetic caps")
+    (is (= (set conditions) (set (:preconditions scheduled))))
+    (is (precondition/check! conditions {'_n_bound 2 'rows 2 'width 3 'seed 2.5}))
+    (doseq [n [Long/MIN_VALUE -1 0]]
+      (is (precondition/check! conditions {'_n_bound n 'rows n 'width Long/MIN_VALUE 'seed 2.5})
+          "a zero-trip outer loop does not invent a positive dimension contract"))
+    (is (thrown? ArithmeticException
+          (precondition/check! conditions {'_n_bound 3 'rows 3 'width Long/MAX_VALUE 'seed 2.5})))
+    (is (= kernel (body/validate! kernel)))
+    (is (= :kernel-body-index-precondition
+           (try (body/validate! (assoc-in kernel [:attributes :required-preconditions] [])) :accepted
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        "body validation independently rejects publication without the collected source obligations")))

@@ -6,6 +6,7 @@
             [raster.compiler.ir.axis-map :as am]
             [raster.compiler.ir.contraction-facts :as facts]
             [raster.compiler.ir.kernel-call :as call]
+            [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.passes.parallel.staged-contraction-body :as staged]
@@ -187,3 +188,36 @@
               [[:typed (target/emit-artifact "typed_staged_dyadic" (staged/lower source) :opencl-portable)]
                [:scalar (legacy-artifact source false)] [:packed (legacy-artifact source true)]]]
         (is (= expected (execute-artifact compiled [a b da db] (* m n))) (name label))))))
+
+
+(deftest packed-hardware-prefix-widens-without-changing-source-axis-arithmetic
+  (let [scheduled (staged/lower (fixtures/packed-facts 3 5 3 32))
+        kernel (:body scheduled)
+        segment (get-in kernel [:indices 2 :expression])
+        projections (take-while #(instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                                (:operations kernel))
+        outer (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                             (:operations kernel)))
+        inner (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                             (:operations outer)))]
+    (is (= :add (:op segment)))
+    (is (every? #(= :long (:dtype %))
+                [(get-in segment [:arguments 0 :arguments 0])
+                 (get-in segment [:arguments 0 :arguments 1])
+                 (get-in segment [:arguments 1])]))
+    (is (= 2 (count projections)))
+    (doseq [projection projections]
+      (is (= :int (get-in projection [:result :type])))
+      (is (= {:rounding :exact :overflow :wrap}
+             (get-in projection [:expression :options]))))
+    (is (= :int (get-in outer [:index :type])))
+    (is (= :int (get-in inner [:index :type])))
+    (is (= :int (get-in inner [:iter-args 0 :binding :type])))
+    (is (= kernel (body/validate! kernel)))
+    (try
+      (body/validate-launch-index-ranges!
+       kernel (launch/geometry {:workgroup-size [64]
+                                :group-count [(+ 2 (long Integer/MAX_VALUE))]}))
+      (is false "generated Long scheduling does not change the hardware index ABI")
+      (catch clojure.lang.ExceptionInfo e
+        (is (= :kernel-launch-index-range (:reason (ex-data e))))))))

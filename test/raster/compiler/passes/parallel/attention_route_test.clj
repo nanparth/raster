@@ -1,12 +1,14 @@
 (ns raster.compiler.passes.parallel.attention-route-test
   (:require [clojure.string :as str]
             [clojure.set :as set]
+            [clojure.walk :as walk]
             [clojure.java.shell :as shell]
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.attention :as attention-emit]
             [raster.compiler.ir.attention :as attention]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-body :as kbody]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-graph :as kgraph]
@@ -817,3 +819,60 @@
          (try
            (route/route! (problem) {:device-type :cpu})
            (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+
+
+(deftest attention-generated-address-prefixes-widen-before-arithmetic
+  (let [reference (route/route! (problem)
+                               {:device-type :gpu :subgroup-size 16 :max-workgroup-size 256
+                                :segmented-weighted-reduction-schedule :reference})
+        kernel (get-in reference [:artifact :attributes :kernel-body])
+        component (first (filter #(= 'value-component (:id %)) (:indices kernel)))
+        expression (:expression component)
+        values (:values (kbody/initial-scheduled-index-info kernel))]
+    (is (= :add (:op expression)))
+    (is (every? #(and (instance? raster.compiler.ir.kernel_body.IndexCast %)
+                     (= :long (:dtype %)) (= :exact (:overflow %)))
+                [(get-in expression [:arguments 0 :arguments 0])
+                 (get-in expression [:arguments 0 :arguments 1])
+                 (get-in expression [:arguments 1])]))
+    (is (= :long (get-in values ['value-component :type])))
+    (is (= 5 (get-in values ['safe-value-component :range :upper])))
+    (is (true? (get-in values ['safe-value-component :nonnegative?])))
+    (is (true? (get-in values ['safe-value-component :index-origin-safe?])))
+    (is (= kernel (kbody/validate! kernel)))
+    (is (= :kernel-body-index-precondition
+           (try (kbody/validate!
+                 (update kernel :indices
+                         #(mapv (fn [definition]
+                                  (if (= 'value-component (:id definition))
+                                    (assoc definition :expression
+                                           (kbody/index-cast
+                                            (kbody/expression :add
+                                              (kbody/expression :mul 'value-component-tile 6) 'lane)
+                                            :long :exact)) definition)) %)))
+                nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
+    (is (= :kernel-launch-index-range
+           (try (kbody/validate-launch-index-ranges!
+                 kernel (launch/geometry {:workgroup-size [6 1 1]
+                                          :group-count [(+ 2 (long Integer/MAX_VALUE)) 4 4]}))
+                nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+  (let [routed (route/route! (problem :visibility (csr-visibility)) intel-desc)
+        kernel (get-in routed [:artifact :attributes :kernel-body])
+        end-load (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarLoad %)
+                                      (= 'raw-attention-end (get-in % [:result :id])))
+                               (tree-seq coll? seq kernel)))
+        coordinate (first (:coordinates end-load))]
+    (is (some? end-load))
+    (is (= :add (:op coordinate)))
+    (is (= ['query-token 1] (mapv :argument (:arguments coordinate))))
+    (is (every? #(= :long (:dtype %)) (:arguments coordinate)))
+    (is (= kernel (kbody/validate! kernel)))
+    (is (= :kernel-body-index-precondition
+           (try (kbody/validate!
+                 (walk/postwalk
+                  #(if (= % end-load) (assoc % :coordinates [(kbody/expression :add 'query-token 1)]) %)
+                  kernel))
+                nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))

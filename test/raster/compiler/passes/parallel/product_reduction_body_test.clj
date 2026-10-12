@@ -153,8 +153,9 @@
             (is (= expected (eval-index (:expression axis) env)))))))
     (doseq [name '[nrows outputs blocks] value [0 -1 Long/MIN_VALUE]]
       (is (thrown? clojure.lang.ExceptionInfo
-                   (check (assoc {'_n_bound 1 'nrows 3 'outputs 7 'blocks 11} name value)))))
-    (is (true? (check {'_n_bound 0 'nrows Long/MIN_VALUE 'outputs 0 'blocks -1})))
+                   (check (assoc {'_n_bound 1 'nrows 3 'outputs 7 'blocks 11 'width 4} name value)))))
+    (doseq [width [Long/MIN_VALUE -1 0 4]]
+      (is (true? (check {'_n_bound 0 'nrows Long/MIN_VALUE 'outputs 0 'blocks -1 'width width}))))
     (doseq [condition requirements]
       (let [forged (assoc candidate :preconditions (vec (remove #{condition} requirements)))]
         (is (thrown? clojure.lang.ExceptionInfo
@@ -176,9 +177,10 @@
         (is (thrown? clojure.lang.ExceptionInfo (body/validate! mutated)))))
     (let [dormant (product/schedule (multi-axis-source '[nrows outputs blocks 0 2]) opts)
           check-zero #(precondition/check! (:preconditions dormant) %)]
-      (is (true? (check-zero {'_n_bound 0 'nrows 3 'outputs 7 'blocks 11})))
+      (doseq [width [Long/MIN_VALUE -1 0 4]]
+        (is (true? (check-zero {'_n_bound 0 'nrows 3 'outputs 7 'blocks 11 'width width}))))
       (is (thrown? clojure.lang.ExceptionInfo
-                   (check-zero {'_n_bound 1 'nrows 3 'outputs 7 'blocks 11})))
+                   (check-zero {'_n_bound 1 'nrows 3 'outputs 7 'blocks 11 'width 4})))
       (let [zero-source (multi-axis-source '[nrows outputs blocks 0 2])
             ;; Remove the actual zero-divisor activation condition, not merely N>=0.
             zero-condition (second (body/quotient-domain-preconditions '_n_bound 0))
@@ -498,6 +500,7 @@
         decline! (fn [rule message data] (throw (ex-info message (assoc data :rule rule))))
         lowered ((var-get (ns-resolve 'raster.compiler.passes.parallel.product-reduction-regions 'lower-regions))
                  true source options decline!)
+        lowered (assoc lowered :element ((:lower-element lowered) nil))
         production (regions/lower source options decline!)
         loads (fn [region] (filter #(instance? raster.compiler.ir.kernel_body.ScalarLoad %)
                                    (get-in region [:element :operations])))
@@ -692,3 +695,35 @@
                  (make-body :group
                    (body/expression :floor-div
                      (body/expression :mul 'group Integer/MAX_VALUE) 3))))))
+
+(deftest scoped-product-elements-retain-the-actual-generated-axis-interval
+  (let [source (multi-axis-source '[nrows 8])
+        opts (assoc options :scalar-types {'nrows :long 'width :int})
+        candidate (product/schedule source opts)
+        kernel (:body candidate)
+        nodes (tree-seq coll? seq kernel)
+        row-product (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                                         (= :* (get-in % [:expression :op]))
+                                         (some #{'row} (get-in % [:expression :arguments]))) nodes))
+        actual-loop (first (filter #(and (instance? raster.compiler.ir.kernel_body.ForLoop %)
+                                        (= 'col (get-in % [:index :id]))) nodes))]
+    (is (some? row-product) "the retained source row product is actually present")
+    (is (= :no-overflow (get-in row-product [:expression :options :overflow])))
+    (is (seq (:operations actual-loop)) "the proven header is the emitted element loop")
+    (is (= candidate (product/validate-source! candidate source opts)))
+    (is (some? (:source (target/emit-artifact "scoped_product_element" candidate :opencl-portable))))
+    ;; This is source arithmetic and independent structural read admission, not a
+    ;; claim that an arbitrary pointer allocation covers the reconstructed axes.
+    (let [decline! (fn [rule message data] (throw (ex-info message (assoc data :rule rule))))]
+      (is (= :dense-read-index
+             (try (regions/dense-read-requirements source opts decline!)
+                  nil
+                  (catch clojure.lang.ExceptionInfo error (:rule (ex-data error)))))
+          "the added output axis is unused by this source read and remains inadmissible as a dense map")
+      (is (= {'values (launch/product 'nrows 'width)}
+             (regions/dense-read-requirements (argmax-segred) opts decline!))
+          "the original single-axis source retains its matching structural storage map"))
+    (is (true? (precondition/check! (:preconditions candidate)
+                                  {'_n_bound 8 'nrows 1 'width 0})))
+    (is (true? (precondition/check! (:preconditions candidate)
+                                  {'_n_bound 0 'nrows Long/MIN_VALUE 'width 0})))))

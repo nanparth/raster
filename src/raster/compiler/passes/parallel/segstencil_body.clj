@@ -98,8 +98,6 @@
                   :arrays (set inputs) :index-scope index-scope
                   :lower-index lower-index :predicate nil
                   :id-prefix "stencil" :decline! decline!})
-        lowered ((:lower lowerer) (:lambda stencil) result-type
-                                    (assoc scalar-types index :long))
         group-index 'stencil-group
         local-index 'stencil-lane
         ;; The public extent is an ABI scalar.  Clamp it in the body before using it in
@@ -122,13 +120,8 @@
             (layout/row-major ['_n_bound] result-type) :result)]
           (map #(body/->KernelParameter % :scalar (get scalar-types %) [] nil nil :parameter)
                scalars)
-          [(body/->KernelParameter '_n_bound :scalar :int [] nil nil :bound)]))]
-    {:kernel-body
-     (body/make
-      {:id [:segstencil (:id stencil) :portable-one-item]
-       :parameters parameters
-       :stable-reads (mapv body/stable-read inputs)
-       :indices [(body/->IndexBinding group-index :group 0)
+          [(body/->KernelParameter '_n_bound :scalar :int [] nil nil :bound)]))
+        indices [(body/->IndexBinding group-index :group 0)
                  (body/->IndexBinding local-index :local 0)
                  (body/->IndexCompute
                   index
@@ -137,6 +130,18 @@
                                     (body/expression :mul group-index workgroup-size)
                                     local-index)
                    {group-index :int local-index :int}))]
+        launch-spec (launch/spec {:workgroup-size [workgroup-size]
+                             :group-count [(launch/ceil-div '_n_bound workgroup-size)]})
+        lowered ((:with-initial-index-region lowerer)
+                 {:parameters parameters :indices indices :launch launch-spec}
+                 #((:lower lowerer) (:lambda stencil) result-type
+                    (assoc scalar-types index :long)))]
+    {:kernel-body
+     (body/make
+      {:id [:segstencil (:id stencil) :portable-one-item]
+       :parameters parameters
+       :stable-reads (mapv body/stable-read inputs)
+       :indices indices
        :masks [(body/->Mask
                 :stencil-active
                 [(body/predicate :lt index (body/index-cast '_n_bound :long :exact))])]
@@ -175,8 +180,7 @@
         (body/->ScalarStore output [index] result :stencil-active)]
        :schedule {:strategy :one-work-item-per-element :association :independent
                   :workgroup-size workgroup-size :boundary :dirichlet :radius radius}
-       :launch (launch/spec {:workgroup-size [workgroup-size]
-                             :group-count [(launch/ceil-div '_n_bound workgroup-size)]})
+       :launch launch-spec
        :provenance {:dialect :kernel-body :source-dialect :segstencil
                     :segop-id (:id stencil)}
        :attributes {:kind :portable-segstencil :extent bound

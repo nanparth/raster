@@ -30,6 +30,15 @@
                       (do (swap! reserved conj id) id))))
         group (fresh "stage_group") lane (fresh "stage_lane") segment (fresh "stage_segment")
         mask (fresh "stage_mask") packed-index (fresh "stage_word")
+        ;; Shared admission proves every static extent positive and <=IntMAX.
+        ;; Keep source axes Int, with separate wide generated remainder temporaries.
+        projection-ids (into {} (map (fn [[axis _]] [axis (fresh "stage_axis_wide")]) (:free-axes source)))
+        axis-projections (mapv (fn [[axis extent]]
+                                (assert (and (integer? extent) (<= 1 extent Integer/MAX_VALUE)))
+                                (body/->ScalarCompute
+                                 (body/value axis :int)
+                                 (body/cast-expression (get projection-ids axis) :int :exact :wrap)))
+                              (:free-axes source))
         scope (set (concat (map first axes) [group lane segment packed-index]))
         builder (scalar/make-lowerer
                  {:arrays reads :array-types array-types :scalar-types scalar-types
@@ -130,16 +139,20 @@
                  :indices (vec (concat
                                 [(body/->IndexBinding group :group 0) (body/->IndexBinding lane :local 0)
                                  (body/->IndexCompute segment
-                                                     (body/expression :add (body/expression :mul group workgroup-size) lane))]
+                                  (body/expression :add
+                                    (body/expression :mul (body/index-cast group :long :exact)
+                                                         (body/index-cast workgroup-size :long :exact))
+                                    (body/index-cast lane :long :exact)))]
                                 (map-indexed
                                  (fn [i [axis extent]]
-                                   (body/->IndexCompute axis
+                                   (body/->IndexCompute (get projection-ids axis)
                                     (body/expression :mod
                                      (body/expression :floor-div segment
-                                      (reduce *' 1 (map second (drop (inc i) (:free-axes source))))) extent)))
+                                      (body/index-cast (reduce *' 1 (map second (drop (inc i) (:free-axes source)))) :long :exact))
+                                     (body/index-cast extent :long :exact))))
                                  (:free-axes source))))
-                 :masks [(body/->Mask mask [(body/predicate :lt segment n)])]
-                 :operations (conj (into (:operations computation) (:operations stored-result))
+                 :masks [(body/->Mask mask [(body/predicate :lt segment (body/index-cast n :long :exact))])]
+                 :operations (conj (into (into axis-projections (:operations computation)) (:operations stored-result))
                                    (body/->ScalarStore (:out source) [segment]
                                                         (:result stored-result) mask))
                  :launch (launch/spec {:workgroup-size [workgroup-size]

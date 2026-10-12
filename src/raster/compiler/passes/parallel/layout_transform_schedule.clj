@@ -25,11 +25,12 @@
    (body/->IndexBinding :layout-lane :local 0)
    (body/->IndexCompute
     id
-    (body/index-cast
-     (body/expression :add
-                      (body/expression :mul :layout-group workgroup-size)
-                      :layout-lane)
-     :long :exact))])
+    (body/expression
+     :add
+     (body/expression :mul
+                      (body/index-cast :layout-group :long :exact)
+                      (body/index-cast workgroup-size :long :exact))
+     (body/index-cast :layout-lane :long :exact)))])
 
 (defn cast-body
   "Schedule a dense one-dimensional representation conversion.
@@ -125,6 +126,11 @@
         column :layout-column
         rows-id row-extent-id
         cols-id column-extent-id
+        ;; Each dimension is checked at the invocation boundary. Zero-dimensional shapes
+        ;; have no active elements, so totalize this generated scheduling divisor without
+        ;; evaluating a division by zero before the inactive load/store predicate.
+        divisor (body/expression :max (body/index-cast cols-id :long :exact)
+                                 (body/index-cast 1 :long :exact))
         elements (body/expression :mul
                                   (body/index-cast rows-id :long :exact)
                                   (body/index-cast cols-id :long :exact))]
@@ -141,11 +147,9 @@
       :stable-reads [(body/stable-read input)]
       :indices (into (global-index linear)
                      [(body/->IndexCompute
-                       row (body/expression :floor-div linear
-                                            (body/index-cast cols-id :long :exact)))
+                       row (body/expression :floor-div linear divisor))
                       (body/->IndexCompute
-                       column (body/expression :mod linear
-                                               (body/index-cast cols-id :long :exact)))])
+                       column (body/expression :mod linear divisor))])
       :masks [(body/->Mask :layout-active [(body/predicate :lt linear elements)])]
       :operations [(body/->ScalarLoad
                     (body/value :layout-value element-dtype)
@@ -162,4 +166,8 @@
                                workgroup-size)]})
       :provenance {:dialect :kernel-body :source-dialect :layout-transform}
       :attributes {:kind :layout-transform :operation :transpose
+                   :required-preconditions [{:expression rows-id :op :>= :value 0}
+                                            {:expression cols-id :op :>= :value 0}
+                                            {:expression (launch/product rows-id cols-id)
+                                             :op :<= :value Long/MAX_VALUE}]
                    :permutation [1 0] :element-dtype element-dtype}})))

@@ -257,13 +257,12 @@
                                                     index-types :long decline!))
         producer-options {:array-types array-types :scalar-types scalar-types}
         workgroup-regions (when-not subgroup?
-                            (product-regions/lower producer producer-options decline!))
-        element (:element workgroup-regions)
+                            (product-regions/prepare-production producer producer-options decline!))
         combine (:combine workgroup-regions)
         subgroup-regions
         (when subgroup?
           (mapv (fn [offset]
-                  (product-regions/lower
+                  (product-regions/prepare-production
                    producer
                    (assoc producer-options
                           :axis-substitutions (local-offset-substitutions local offset)
@@ -298,7 +297,6 @@
                                                              (lower-index bound #{})))))
               (range) local)
         reduced-compute (body/->IndexCompute (:name reduced) reduced-index)
-        producer-values (some-> element :results vec)
         tree-strides (vec (take-while pos? (iterate #(quot % 2) (quot reduced-width 2))))
         tree-operations
         (when-not subgroup?
@@ -354,7 +352,8 @@
                        [pair (symbol (str "product-consumer-subgroup-partial-"
                                           offset "-" component))]))
                 subgroup-component-pairs))
-        subgroup-operations
+        build-subgroup-operations
+        (fn [subgroup-regions]
         (when subgroup?
           (let [contracts (:subgroup-collectives plan)
                 width (:subgroup-size physical-schedule)]
@@ -393,7 +392,7 @@
                                 (body/value result-id component-type) :reduce :subgroup width lane-value
                                 operator nil (body/full-participation) association arithmetic))
                              result-ids lane-values selected-types selected-contracts))))))
-              (range local-volume) subgroup-regions))))
+              (range local-volume) subgroup-regions)))))
         fold (fold-of consumer)
         {fold-attributes :attributes fold-lambda :lambda} (ordered-fold-parts fold)
         {fold-parameters :parameters fold-locals :locals fold-results :body-results}
@@ -471,15 +470,6 @@
                                                [id (nth component-types component)]))
                                         subgroup-values))
                                 {(:name ordered) :long})
-        fold-update ((:lower-region consumer-lowerer) rewritten-fold carry-types
-                     fold-binding-types fold-environment)
-        writer :product-consumer-writer
-        writer-update
-        (body/->IfRegion
-         writer
-         (conj (vec (:operations fold-update)) (body/->Yield (:results fold-update)))
-         [(body/->Yield carries)]
-         (mapv body/value updated-carries carry-types))
         identities
         (mapv (fn [identity type]
                 (if-let [evidence (constant/value identity)]
@@ -488,12 +478,58 @@
                             "ordered consumer identity requires checked literal evidence"
                             {:identity identity :dtype type})))
               (or (:identities fold-attributes) [(:identity fold-attributes)]) carry-types)
-        ordered-loop
+        ordered-header
         (body/->ForLoop
          (body/value (:name ordered) :long)
          (consumer-lower-index (:lower fold-attributes 0) #{})
          (consumer-lower-index (:extent fold-attributes) #{}) 1
          (mapv #(body/->LoopArg (body/value %1 %2) %3) carries carry-types identities)
+         [] (mapv body/value loop-results carry-types)
+         {:association :ordered :source-order true
+          :inner-reduction :implementation-defined :inner-schedule strategy})
+        shared-bytes (if subgroup? 0
+                       (* workgroup-size (reduce + (map dtype/bytes-of component-types))))
+        actual-launch (launch/spec
+                       {:workgroup-size [physical-workgroup-size]
+                        :group-count [(launch/maximum 1 launch-prefix-count)]
+                        :shared-memory-bytes shared-bytes})
+        initial-indices [(body/->IndexBinding group-index :group 0)
+                         (body/->IndexBinding lane-index (if subgroup? :lane :local) 0)]
+        scoped-definitions (vec (concat prefix-computes (when-not subgroup? local-computes)
+                                        [reduced-compute] (:operations prefix-state)))
+        positive-scaffold (guard-positive-domain (:predicates active-domain)
+                                                 (conj scoped-definitions ordered-header))
+        positive-regions (loop [operation (first positive-scaffold) regions []]
+                           (if (instance? raster.compiler.ir.kernel_body.IfRegion operation)
+                             (recur (first (:then-operations operation)) (conj regions operation)) regions))
+        condition-by-id (into {} (map (juxt #(get-in % [:result :id]) identity)) (:operations active-domain))
+        element-scope (if (seq positive-regions)
+                        {:parameters parameters :indices initial-indices :launch actual-launch
+                         :condition-definition (condition-by-id (:condition (last positive-regions)))
+                         :if-region (last positive-regions) :index-definitions scoped-definitions
+                         :enclosing-if-regions (mapv (fn [region]
+                                                       {:condition-definition (condition-by-id (:condition region))
+                                                        :if-region region}) (butlast positive-regions))
+                         :inner-loop ordered-header}
+                        {:parameters parameters :indices (into initial-indices scoped-definitions)
+                         :launch actual-launch :loop ordered-header})
+        element (when workgroup-regions ((:lower-element workgroup-regions) element-scope))
+        subgroup-regions (when subgroup?
+                           (mapv #(assoc % :element ((:lower-element %) element-scope)) subgroup-regions))
+        producer-values (some-> element :results vec)
+        subgroup-operations (build-subgroup-operations subgroup-regions)
+        fold-update ((:with-index-region consumer-lowerer) element-scope
+                     #((:lower-region consumer-lowerer) rewritten-fold carry-types
+                       fold-binding-types fold-environment))
+        writer :product-consumer-writer
+        writer-update
+        (body/->IfRegion
+         writer
+         (conj (vec (:operations fold-update)) (body/->Yield (:results fold-update)))
+         [(body/->Yield carries)]
+         (mapv body/value updated-carries carry-types))
+        ordered-loop
+        (assoc ordered-header :operations
          (vec (concat
                (if subgroup?
                  subgroup-operations
@@ -509,23 +545,28 @@
                                                               [lane-index (body/literal 0 :int)]))
                 writer-update]
                (when-not subgroup? [(barrier)])
-               [(body/->Yield updated-carries)]))
-         (mapv body/value loop-results carry-types)
-         {:association :ordered :source-order true
-          :inner-reduction :implementation-defined
-          :inner-schedule strategy})
+               [(body/->Yield updated-carries)])))
         tail-locals (subvec (vec (get-in consumer [:scalar-region :locals]))
                             consumer-prefix-count)
         tail-locals (mapv #(update % :init (partial replace-fold-components fold loop-results))
                           tail-locals)
         tail-result (replace-fold-components fold loop-results
                                              (get-in consumer [:scalar-region :result]))
-        tail-state (lower-locals consumer-lowerer tail-locals (:substitutions prefix-state)
-                                 (merge (:environment prefix-state)
-                                        (zipmap loop-results carry-types)))
-        output-value ((:lower consumer-lowerer)
-                      (util/subst-syms (:substitutions tail-state) tail-result)
-                      (array-types output) (:environment tail-state))
+        tail-scope (if (seq positive-regions) (dissoc element-scope :inner-loop)
+                       {:parameters parameters :indices (into initial-indices scoped-definitions)
+                        :launch actual-launch})
+        tail-lowering ((if (seq positive-regions) (:with-index-region consumer-lowerer)
+                           (:with-initial-index-region consumer-lowerer))
+                       tail-scope
+                       #(let [state (lower-locals consumer-lowerer tail-locals (:substitutions prefix-state)
+                                                 (merge (:environment prefix-state)
+                                                        (zipmap loop-results carry-types)))]
+                          {:state state
+                           :value ((:lower consumer-lowerer)
+                                   (util/subst-syms (:substitutions state) tail-result)
+                                   (array-types output) (:environment state))}))
+        tail-state (:state tail-lowering)
+        output-value (:value tail-lowering)
         final-writer-id :product-consumer-final-writer
         final-writer
         (body/->IfRegion
@@ -534,9 +575,6 @@
                       [(body/->ScalarStore output [group-index] (:result output-value) nil)
                        (body/->Yield [])]))
          [(body/->Yield [])] [])
-        shared-bytes (if subgroup?
-                       0
-                       (* workgroup-size (reduce + (map dtype/bytes-of component-types))))
         kernel-body
         (body/make
          {:id [:product-ordered-consumer (:id producer) (:id consumer)]
@@ -550,36 +588,40 @@
                                   (layout/row-major [workgroup-size] component-type)
                                   (dtype/bytes-of component-type)))
                                intermediates component-types))
-          :indices [(body/->IndexBinding group-index :group 0)
-                    (body/->IndexBinding lane-index (if subgroup? :lane :local) 0)]
+          :indices initial-indices
           :operations
           (vec
            (concat
             (:operations active-domain)
-            (guard-positive-domain
-             (:predicates active-domain)
-             (concat prefix-computes (when-not subgroup? local-computes) [reduced-compute]
-                     (when reduced-active-operation [reduced-active-operation])
-                     (:operations prefix-state)
-                     [ordered-loop
-                      (body/->ScalarCompute
-                       (body/value final-writer-id :predicate)
-                       (body/scalar-expression :eq :predicate
-                                               [lane-index (body/literal 0 :int)]))
-                      final-writer]))))
+            (let [work (vec (concat scoped-definitions
+                                    (when reduced-active-operation [reduced-active-operation])
+                                    [ordered-loop
+                                     (body/->ScalarCompute
+                                      (body/value final-writer-id :predicate)
+                                      (body/scalar-expression :eq :predicate
+                                                              [lane-index (body/literal 0 :int)]))
+                                     final-writer]))]
+              ;; Extend the same checked nested branch records after lowering.
+              ;; The generated reduced-active comparison follows the complete
+              ;; shared index prefix; source element and fold order are unchanged.
+              (reduce (fn [nested region]
+                        [(assoc region :then-operations (conj (vec nested) (body/->Yield [])))])
+                      work (reverse positive-regions)))))
           :schedule (cond-> {:strategy strategy
                              :workgroup-size physical-workgroup-size
                              :axis-partition (:axes plan)}
                       subgroup? (assoc :subgroup-size (:subgroup-size physical-schedule)
                                        :local-unrolling (:local-unrolling physical-schedule)
                                        :neutral-padding (:neutral-padding physical-schedule)))
-          :launch (launch/spec
-                   {:workgroup-size [physical-workgroup-size]
-                    :group-count [(launch/maximum 1 launch-prefix-count)]
-                    :shared-memory-bytes shared-bytes})
+          :launch actual-launch
           :provenance {:dialect :kernel-body :source-dialect :segop
                        :source-operations [(:id producer) (:id consumer)]}
-          :attributes {:kind :product-ordered-consumer
+          :attributes {:required-preconditions
+                       (vec (distinct (concat
+                         (when workgroup-regions ((:required-preconditions workgroup-regions)))
+                         (mapcat #((:required-preconditions %)) subgroup-regions)
+                         ((:required-preconditions consumer-lowerer)))))
+                       :kind :product-ordered-consumer
                        :physical-schedule physical-schedule
                        :inner-numerics (get-in plan [:numerics :inner])
                        :outer-numerics (get-in plan [:numerics :outer])}})]

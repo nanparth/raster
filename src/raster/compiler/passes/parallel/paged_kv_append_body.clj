@@ -58,11 +58,10 @@
                 (body/->IndexBinding lane :group 1)
                 (body/->IndexCompute
                  component
-                 (body/index-cast
-                  (body/expression :add
-                                   (body/expression :mul group-x workgroup-x)
-                                   lane-x)
-                  :long :exact))]
+                 (body/expression :add
+                                  (body/expression :mul (body/index-cast group-x :long :exact)
+                                                       (body/index-cast workgroup-x :long :exact))
+                                  (body/index-cast lane-x :long :exact)))]
       :masks [(body/->Mask :append-key-active
                            [(body/predicate :lt component key-elements-per-token)])
               (body/->Mask :append-value-active

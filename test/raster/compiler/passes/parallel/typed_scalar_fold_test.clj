@@ -6,6 +6,7 @@
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.scan :as scan]
+            [raster.compiler.ir.kernel-body :as kbody]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
@@ -250,8 +251,15 @@
     (is (= 1 (count (re-seq #"for \(long [^ ]*product_fold_index_" source)))
         "two component uses must share one emitted multi-carry loop")
     (doseq [target [:cuda :hip]]
-      (let [target-source (body-emit/emit-scalar-kernel
-                           "product_fold" kernel-body {:target-dialect target})]
+      (let [module (body-emit/emit-scalar-module
+                    "product_fold" kernel-body {:target-dialect target})
+            target-source (:source module)]
+        (is (= (kbody/required-preconditions kernel-body) (:required-preconditions module)))
+        (is (seq (:required-preconditions module)))
+        (is (= :discarded-precondition-contract
+               (try (body-emit/emit-scalar-kernel "product_fold" kernel-body {:target-dialect target})
+                    nil
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))
         (is (= 1 (count (re-seq #"for \(long(?: long)? [^ ]*product_fold_index_"
                                 target-source))))))
     (is (= 2 (count (re-seq #"loop\*" (pr-str jvm-form))))
@@ -602,3 +610,43 @@
     (is (true? (get-in report [:route :typed-validated])))
     (is (= {:kernel-body 1} (get-in report [:emission :routes])))
     (is (empty? (get-in report [:emission :declines])))))
+
+
+(deftest carried-source-arithmetic-uses-the-actual-exclusive-header-and-restores-it
+  (let [builder (scalar-body/make-lowerer
+                 {:arrays #{} :array-types {} :scalar-types {'j :long} :index-scope #{'j}
+                  :lower-index (fn [expression _] expression)
+                  :decline! (fn [rule message data] (throw (ex-info message (assoc data :rule rule))))})
+        lower #(let [result ((:lower builder) '(+ j 8) :long {'j :long})]
+                 (first (filter (fn [operation] (= (:result result) (get-in operation [:result :id])))
+                                (:operations result))))
+        one (kbody/index-cast 1 :long :exact)
+        two (kbody/index-cast 2 :long :exact)
+        scoped ((:with-loop-index builder) 'j one two :exclusive lower)]
+    (is (= :no-overflow (get-in scoped [:expression :options :overflow])))
+    (is (= {:lower 9N :upper 9N :kind :typed-scalar-range}
+           (get-in scoped [:expression :options :proof])))
+    (is (= :trap (get-in (lower) [:expression :options :overflow]))
+        "the body-entry range cannot escape its real loop")
+    (is (= :trap (get-in ((:with-loop-index builder) 'j one two :inclusive lower)
+                        [:expression :options :overflow]))
+        "exclusive-only entry reasoning cannot certify an inclusive header")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scope callback"
+          ((:with-loop-index builder) 'j one two :exclusive
+            #(throw (ex-info "scope callback" {})))))
+    (is (= :trap (get-in (lower) [:expression :options :overflow]))))
+  (let [product '(product-fold {:accumulators [sum] :identities [0] :dtypes [:long]
+                               :index j :lower 1 :extent 2 :association :ordered}
+                  (lambda [sum j] (region [] [(+ j 8)])))
+        builder (scalar-body/make-lowerer
+                 {:arrays #{} :array-types {} :scalar-types {} :index-scope #{}
+                  :lower-index (fn [expression _] (kbody/index-cast expression :long :exact))
+                  :decline! (fn [rule message data] (throw (ex-info message (assoc data :rule rule))))})
+        lowered ((:lower builder) (list 'product-component product 0) :long {})
+        loop (first (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %) (:operations lowered)))
+        addition (first (filter #(= :+ (get-in % [:expression :op])) (:operations loop)))]
+    (is (= (kbody/index-cast 1 :long :exact) (:lower loop)))
+    (is (= (kbody/index-cast 2 :long :exact) (:upper loop)))
+    (is (= :no-overflow (get-in addition [:expression :options :overflow])))
+    (is (= [(:id (:index loop)) (kbody/literal 8 :long)] (get-in addition [:expression :arguments])))
+    (is (= [(get-in addition [:result :id])] (:values (peek (:operations loop)))))))

@@ -1208,17 +1208,13 @@
           "partial legacy requirements cannot silently replace complete entered obligations"))))
 
 (deftest loop-header-obligations-are-collected-before-the-inner-binder
-  (doseq [bound-position [:lower :upper]]
+  (doseq [bound-position [:lower :upper]
+          variant [:small :wide]]
     (let [parameters (mapv #(body/->KernelParameter % :scalar :long [] nil nil :parameter) '[N d])
           indices [(body/->IndexBinding 'header-group :group 0)
                    (body/->IndexCompute 'header-flat (body/index-cast 'header-group :long :exact))]
           axis (body/->IndexCompute 'header-axis (body/expression :mod 'header-flat 'd))
-          expression (body/expression :add 'header-axis (body/index-cast 1 :long :exact))
           zero (body/index-cast 0 :long :exact)
-          lower (if (= bound-position :lower) expression zero)
-          upper (if (= bound-position :upper) expression zero)
-          loop (body/->ForLoop (body/value 'header-inner :long) lower upper 1 [] [(body/->Yield [])] [] {})
-          guard (body/->Guard :header-active [axis loop])
           masks [(body/->Mask :header-active [(body/predicate :lt 'header-flat 'N)])]
           launch-spec (launch/spec {:workgroup-size [1] :group-count [1]})
           base (body/quotient-domain-preconditions 'N 'd)
@@ -1226,24 +1222,48 @@
                     {:array-types {} :scalar-types {'N :long 'd :long} :arrays #{}
                      :index-scope #{'N 'd 'header-flat 'header-axis 'header-inner} :lower-index identity
                      :decline! (fn [& args] (throw (ex-info "unexpected header decline" {:arguments args})))})
+          prepared (atom nil)
           region {:parameters parameters :indices indices :masks masks :launch launch-spec
-                  :guard guard :index-definitions [axis] :required-preconditions base}
+                  :guard (body/->Guard :header-active [axis]) :index-definitions [axis]
+                  :required-preconditions base}
           _ ((:with-index-region builder) region
-              #((:with-loop-index builder) 'header-inner lower upper :exclusive (fn [] :entered)))
+              #(let [limit (when (= variant :wide)
+                             ((:lower builder)
+                              (list '+ (body/literal Long/MAX_VALUE :long) (body/literal 0 :long))
+                              :long {}))
+                     expression (body/expression :add 'header-axis
+                                  (if limit (:result limit) (body/index-cast 1 :long :exact)))
+                     lower (if (= bound-position :lower) expression zero)
+                     upper (if (= bound-position :upper) expression zero)
+                     loop (body/->ForLoop (body/value 'header-inner :long) lower upper 1
+                                          [] [(body/->Yield [])] [] {})]
+                 (reset! prepared {:loop loop :prefix (:operations limit)})
+                 ((:with-loop-index builder) 'header-inner lower upper :exclusive (fn [] :entered))))
           conditions ((:required-preconditions builder))
           header-conditions (vec (remove (set base) conditions))
-          checked (body/make {:id [:header-prefix bound-position] :parameters parameters :indices indices
+          guard (body/->Guard :header-active
+                             (vec (concat [axis] (:prefix @prepared) [(:loop @prepared)])))
+          checked (body/make {:id [:header-prefix bound-position variant] :parameters parameters :indices indices
                               :masks masks :launch launch-spec :operations [guard]
                               :attributes {:required-preconditions conditions}})]
-      (is (seq header-conditions))
+      (if (= variant :small)
+        (do (is (= (set base) (set conditions))
+                "the actual evaluated child conditions remain exactly intact")
+            (is (empty? header-conditions)
+                "the actual Int hardware numerator bounds axis+1 inside Long without an added capacity cap"))
+        (is (seq header-conditions)
+            "axis+typedLongMAX is evaluated before entering even a zero-trip inner loop"))
       (is (not-any? #{'header-inner} (mapcat #(concat (launch/expression-references (:expression %))
                                                     (launch/expression-references (:value %))) conditions)))
       (is (= checked (body/validate! checked)))
       (is (precondition/check! conditions {'N 0 'd Long/MIN_VALUE}))
+      (is (precondition/check! conditions {'N 1 'd 1}))
       (is (thrown? clojure.lang.ExceptionInfo (precondition/check! conditions {'N 1 'd 0})))
-      (doseq [condition header-conditions]
-        (is (= :kernel-body-index-precondition
-               (try (body/validate! (assoc-in checked [:attributes :required-preconditions]
-                                              (vec (remove #{condition} conditions)))) :accepted
-                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
-            "an empty inner loop does not erase a bound that was already evaluated")))))
+      (when (= variant :wide)
+        (is (thrown? ArithmeticException (precondition/check! conditions {'N 2 'd 2})))
+        (doseq [condition header-conditions]
+          (is (= :kernel-body-index-precondition
+                 (try (body/validate! (assoc-in checked [:attributes :required-preconditions]
+                                                (vec (remove #{condition} conditions)))) :accepted
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+              "an empty inner loop does not erase its already evaluated wide bound"))))))

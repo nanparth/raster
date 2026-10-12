@@ -40,6 +40,12 @@
           mask (fresh "stage_active") packed-index (fresh "stage_word")
           inner-carry (fresh "stage_dot") inner-result (fresh "stage_dot_result")
           outer-carry (fresh "stage_sum") outer-result (fresh "stage_sum_result")
+          projection-ids (into {} (map (fn [[axis _]] [axis (fresh "stage_axis_wide")]) free-axes))
+          axis-projections (mapv (fn [[axis _]]
+                                  (body/->ScalarCompute
+                                   (body/value axis :int)
+                                   (body/cast-expression (get projection-ids axis) :int :exact :wrap)))
+                                free-axes)
           scope (set (concat axis-ids [group lane segment packed-index '_nseg]))
           lower-index #(index/lower %1 (into scope %2) decline!)
           builder (scalar/make-lowerer
@@ -74,16 +80,23 @@
                    :parameters parameters :stable-reads (mapv body/stable-read array-ids)
                    :indices (vec (concat
                                   [(body/->IndexBinding group :group 0) (body/->IndexBinding lane :local 0)
-                                   (body/->IndexCompute segment (body/expression :add (body/expression :mul group workgroup-size) lane))]
+                                   (body/->IndexCompute segment
+                                    (body/expression :add
+                                      (body/expression :mul (body/index-cast group :long :exact)
+                                                           (body/index-cast workgroup-size :long :exact))
+                                      (body/index-cast lane :long :exact)))]
                                   (map-indexed
                                    (fn [i [axis extent]]
-                                     (body/->IndexCompute axis
+                                     (body/->IndexCompute (get projection-ids axis)
                                       (body/expression :mod
-                                       (body/expression :floor-div segment (reduce *' 1 (map second (drop (inc i) free-axes)))) extent)))
+                                       (body/expression :floor-div segment
+                                        (body/index-cast (reduce *' 1 (map second (drop (inc i) free-axes))) :long :exact))
+                                       (body/index-cast extent :long :exact))))
                                    free-axes)))
-                   :masks [(body/->Mask mask [(body/predicate :lt segment (long n))
-                                             (body/predicate :lt segment '_nseg)])]
+                   :masks [(body/->Mask mask [(body/predicate :lt segment (body/index-cast n :long :exact))
+                                             (body/predicate :lt segment (body/index-cast '_nseg :long :exact))])]
                    :operations
+                   (into axis-projections
                    [(body/->ForLoop
                      (body/value (:axis outer) :int) 0 (:extent outer) 1
                      [(body/->LoopArg (body/value outer-carry :float) (body/literal 0.0 :float))]
@@ -91,7 +104,7 @@
                            (:operations inner-fragment)
                            (:operations lift) (:operations add) [(body/->Yield [(:result add)])]))
                      [(body/value outer-result :float)] {})
-                    (body/->ScalarStore out [segment] outer-result mask)]
+                    (body/->ScalarStore out [segment] outer-result mask)])
                    :launch (launch/spec {:workgroup-size [workgroup-size]
                                          :group-count [(quot (+ (long n) (dec workgroup-size)) workgroup-size)]})
                    :schedule {:strategy :staged-packed :workgroup-size workgroup-size}

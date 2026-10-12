@@ -219,6 +219,13 @@
              (remove str/blank?)
              vec)))))
 
+(defn- portable-descriptor-count [nseg emitted portable]
+  (if (and emitted (not (integer? nseg)))
+    (or (get-in portable [:body :attributes :launch-segment-count])
+        (throw (ex-info "emitted portable descriptor lacks its checked owner segment count"
+                        {:reason :contract-descriptor-segment-count})))
+    nseg))
+
 (defn- descriptor-scalar-arguments
   "Project compatibility descriptor values through the emitted physical scalar ABI.
   Epilogue captures have their own ordered bindings; do not infer a second set of scalar types."
@@ -618,6 +625,12 @@
                         {:array-types (or array-types {}) :scalar-types (or scalar-types {})})
               emitted (when (:ok portable)
                         (sco/generate-contraction-kernel-body (:body portable)))
+              ;; The checked portable owner already projects compound free-axis
+              ;; extents into ordered launch algebra. Reuse that compiler value for
+              ;; the bound argument and descriptor geometry; opaque source forms
+              ;; are not equivalent runtime expression evaluators. Literal counts
+              ;; stay literal so KernelCall retains specialization enforcement.
+              nseg (portable-descriptor-count nseg emitted portable)
               {:keys [kernel-name source array-params scalar-params abi]}
               (or emitted
                   (sco/generate-segmap-nd-kernel
@@ -694,7 +707,8 @@
                            (conj {:leaf :portable-kernel-body
                                   :reason (:reason portable)
                                   :data (:detail portable)}))
-                workgroup-size (or (:workgroup-size portable) 256)]
+                workgroup-size (or (:workgroup-size portable) 256)
+                nseg (portable-descriptor-count nseg emitted portable)]
             (cond->
              {:strategy (if (:ok portable) :portable-segred :naive-segred)
               :emission-route (if emitted (:emission-route emitted) :verified-segmented-opencl)

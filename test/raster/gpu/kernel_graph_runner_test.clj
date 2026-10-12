@@ -166,7 +166,8 @@
               "negative factors fail the actual captured scalar precondition")
           (is (instance? ArithmeticException overflow)
               "the unchanged checked Product evaluator rejects overflowing bounds")
-          (is (= "long overflow" (.getMessage overflow)))
+          ;; ArithmeticException and zero contacts are the contract. The observed
+          ;; exception message and stack vary between cold and warmed executions.
           (is (empty? @contacts) "invalid specialization declines before allocation or driver contact"))
         (doseq [factor [4294967296 3]]
           (let [before (count @calls) prepared (prepare factor)

@@ -5,7 +5,8 @@
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-body :as body]
-            [raster.compiler.ir.kernel-launch :as launch]))
+            [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.kernel-precondition :as precondition]))
 
 (def ^:private matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16})
 (def ^:private acc-layout (layout/mma-frag matrix :float))
@@ -1438,3 +1439,538 @@
     (doseq [candidate [opaque forged unsafe negative inclusive]]
       (is (= :kernel-body-index-precondition (reason #(body/validate! candidate)))
           "unknown/signed/overflowing/inclusive bounds cannot borrow the closed exclusive entry"))))
+
+
+(deftest guarded-quotient-keeps-the-actual-numerator-range-through-remainder
+  (let [params [(body/->KernelParameter 'x :input :float [1] :global (layout/row-major [1] :float) :operand)
+                (body/->KernelParameter 'N :scalar :long [] nil nil :bound)
+                (body/->KernelParameter 'rows :scalar :long [] nil nil :parameter)]
+        hardware [(body/->IndexBinding 'g :group 0)]
+        launch (launch/spec {:workgroup-size [8] :group-count [1]})
+        conditions (vec (distinct (concat (body/quotient-domain-preconditions 'N 8)
+                                          (body/quotient-domain-preconditions 'N 'rows))))
+        condition (body/->ScalarCompute
+                   (body/value 'active :predicate)
+                   (body/scalar-expression :lt :predicate
+                     [(body/cast-expression 'g :long :exact :exact)
+                      (body/cast-expression 'N :long :exact :exact)]))
+        defs [(body/->IndexCompute 'q (body/expression :floor-div
+                                      (body/index-cast 'g :long :exact)
+                                      (body/index-cast 8 :long :exact)))
+              (body/->IndexCompute 'r (body/expression :mod 'q 'rows))]
+        branch (body/->IfRegion 'active defs [(body/->Yield [])] [])
+        region {:parameters params :indices hardware :launch launch :required-preconditions conditions
+                :condition-definition condition :if-region branch :index-definitions defs}
+        values (:values (body/scheduled-index-region-info region))
+        rejection (fn [f]
+                    (try (f) {:outcome :accepted}
+                         (catch Throwable e
+                           {:outcome :rejected :class (.getName (class e))
+                            :message (.getMessage e) :data (ex-data e)})))
+        assert-address-rejection (fn [f]
+                                   (let [outcome (rejection f)]
+                                     (is (= :rejected (:outcome outcome)) (pr-str outcome))
+                                     (is (= :kernel-body-index-precondition
+                                            (get-in outcome [:data :reason])) (pr-str outcome))))
+        max-q (quot Integer/MAX_VALUE 8)
+        make-kernel (fn [parameters indices requirements]
+                      (body/make
+                       {:id :bounded-hardware-quotient :parameters parameters :indices indices :launch launch
+                        :attributes {:required-preconditions requirements}
+                        :operations [condition
+                         (assoc branch :then-operations
+                           (into defs [(body/->ScalarLoad
+                                        (body/value 'loaded :float) 'x
+                                        [(body/expression :mul 'r (body/index-cast 64 :long :exact))]
+                                        nil nil :cached)
+                                       (body/->Yield [])]))]}))]
+    (is (= {:lower 0 :upper max-q} (get-in values ['q :range])))
+    (is (= {:lower 0 :upper max-q} (get-in values ['r :range])))
+    (is (= conditions (get-in values ['r :conditional-integer :requirements])))
+    (is (body/kernel-body? (make-kernel params hardware conditions)))
+    ;; The early r*64 prefix fits, but multiplication by MAX before a later zero
+    ;; does not. Final algebraic zero cannot erase the ordered C intermediate.
+    (let [scale (body/->ScalarCompute
+                 (body/value 'huge-scale :long)
+                 (body/cast-expression (body/literal Long/MAX_VALUE :long) :long :exact :exact))]
+      (is (body/kernel-body?
+           (body/make {:id :typed-long-scale :parameters params :indices hardware :launch launch
+                       :operations [scale]})))
+      (assert-address-rejection
+       #(body/make
+       {:id :late-prefix-overflow :parameters params :indices hardware :launch launch
+        :attributes {:required-preconditions conditions}
+        :operations [scale condition
+                     (assoc branch :then-operations
+                       (into defs [(body/->ScalarLoad
+                                    (body/value 'loaded :float) 'x
+                                    [(body/expression :mul 'r (body/index-cast 64 :long :exact)
+                                      'huge-scale
+                                      (body/index-cast 0 :long :exact))]
+                                    nil nil :cached)
+                                   (body/->Yield [])]))]})))
+    (is (true? (precondition/check! conditions {'N 0 'rows Long/MIN_VALUE})))
+    (doseq [rows [0 -1]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (precondition/check! conditions {'N 1 'rows rows}))))
+    (doseq [i (range (count conditions))]
+      (let [changed (vec (concat (take i conditions) (drop (inc i) conditions)))]
+        (assert-address-rejection #(make-kernel params hardware changed))))
+    (let [escape (body/make
+                  {:id :hardware-only :parameters params :indices hardware :launch launch})]
+      (doseq [operations [(into defs [(body/->ScalarLoad
+                                       (body/value 'loaded :float) 'x
+                                       [(body/expression :mul 'r (body/index-cast 64 :long :exact))]
+                                       nil nil :cached)])
+                          [condition (assoc branch
+                                       :then-operations [(body/->Yield [])]
+                                       :else-operations (into defs
+                                          [(body/->ScalarLoad (body/value 'loaded :float) 'x
+                                            [(body/expression :mul 'r (body/index-cast 64 :long :exact))]
+                                            nil nil :cached)
+                                           (body/->Yield [])]))]]]
+        (assert-address-rejection
+         #(body/validate! (assoc escape :operations operations
+                                       :attributes {:required-preconditions conditions})))))
+    (let [wide-params (conj params (body/->KernelParameter 'wide :scalar :long [] nil nil :parameter))
+          wide-indices [(body/->IndexCompute 'g
+                          (body/expression :max 'wide (body/index-cast 0 :long :exact)))]]
+      (assert-address-rejection #(make-kernel wide-params wide-indices conditions)))
+    (let [abi-params (conj params (body/->KernelParameter 'g :scalar :long [] nil nil :parameter))]
+      (assert-address-rejection #(make-kernel abi-params [] conditions)))
+    (let [unsafe [(body/->IndexBinding 'raw-group :group 0)
+                  (body/->IndexCompute 'g (body/index-cast
+                                          (body/expression :mul 'raw-group 8) :long :exact))]]
+      (assert-address-rejection #(make-kernel params unsafe conditions)))))
+
+
+(deftest computed-exclusive-loop-keeps-its-actual-maximum-without-an-abi-alias
+  (let [parameters [(body/->KernelParameter 'N :scalar :long [] nil nil :bound)]
+        indices [(body/->IndexBinding 'group :group 0)
+                 (body/->IndexCompute 'idx (body/index-cast 'group :long :exact))]
+        actual-launch (launch/spec {:workgroup-size [8] :group-count [1]})
+        condition (body/->ScalarCompute (body/value 'active :predicate)
+                     (body/scalar-expression :lt :predicate ['idx 'N]))
+        domain [{:expression 'N :op :>= :value 0}]
+        branch (body/->IfRegion 'active [(body/->Yield [])] [(body/->Yield [])] [])
+        values (:values (body/scheduled-index-region-info
+                         {:parameters parameters :indices indices :launch actual-launch
+                          :condition-definition condition :if-region branch :index-definitions []
+                          :required-preconditions domain}))
+        scalar-info (ns-resolve 'raster.compiler.ir.kernel-body 'scalar-info!)
+        product-expression (body/scalar-expression :* :long ['idx 'N] {:overflow :no-overflow})
+        product-transfer (body/conditional-integer-transfer product-expression values)
+        product-requirements (:required-preconditions product-transfer)
+        values (with-meta values (assoc (meta values) :required-preconditions
+                                        (vec (distinct (concat domain product-requirements)))))
+        product-info (scalar-info product-expression values)
+        values (assoc values 'computed-product product-info)
+        upper-expression (body/scalar-expression :+ :long ['computed-product (body/literal 1 :long)]
+                                                {:overflow :no-overflow})
+        upper-transfer (body/conditional-integer-transfer upper-expression values)
+        requirements (vec (distinct (concat domain product-requirements (:required-preconditions upper-transfer))))
+        values (with-meta values (assoc (meta values) :required-preconditions requirements))
+        upper-info (scalar-info upper-expression values)
+        entered (body/entered-for-loop-info (body/index-cast 0 :long :exact) upper-info 1 :exclusive)
+        loop (body/->ForLoop (body/value 'entered :long) (body/index-cast 0 :long :exact)
+                            'computed-upper 1 [] [(body/->Yield [])] [] {})
+        operations [(body/->ScalarCompute (body/value 'computed-product :long) product-expression)
+                    (body/->ScalarCompute (body/value 'computed-upper :long) upper-expression) loop
+                    (body/->Yield [])]
+        kernel (body/make {:id :computed-loop-domain :parameters parameters :indices indices
+                           :launch actual-launch :attributes {:required-preconditions requirements}
+                           :operations [condition (assoc branch :then-operations operations)]})]
+    (is (= 'N (get-in entered [:conditional-integer :bound])))
+    (is (nil? (:entered-loop-index entered)) "the computed SSA upper is not an ABI extent")
+    (is (= 6 (launch/resolve-expression {'N 3} (get-in entered [:conditional-integer :upper]))))
+    (is (true? (precondition/check! requirements {'N 3})))
+    (is (= kernel (body/validate! kernel)))
+    (is (thrown? ArithmeticException (precondition/check! requirements {'N Long/MAX_VALUE})))
+    (is (nil? (body/entered-for-loop-info 0 upper-info 2 :exclusive)))
+    (is (nil? (body/entered-for-loop-info 0 upper-info 1 :inclusive)))
+    (let [loop-values (assoc values 'entered (assoc-in entered [:conditional-integer :domain-index] 'entered))]
+      (is (not-any? #(= 'entered (:index %)) (:entered-loop-domains (meta loop-values))))
+      (is (nil? (get-in (body/conditional-index-info (body/expression :mod 'entered 'N) loop-values)
+                       [:conditional-integer]))
+          "activation N does not prove the computed induction variable is below N"))
+    (let [raw-upper (body/expression :add (body/expression :mul 'idx 'N)
+                                                (body/index-cast 1 :long :exact))
+          raw-info (body/conditional-index-info raw-upper values)
+          raw-requirements (vec (distinct (concat domain (:required-preconditions raw-info)
+                                                    (body/quotient-domain-preconditions 'N 'N))))
+          actual-header (assoc loop :upper raw-upper)
+          actual-scope (body/scheduled-index-region-info
+                        {:parameters parameters :indices indices :launch actual-launch
+                         :condition-definition condition
+                         :if-region (assoc branch :then-operations [actual-header (body/->Yield [])])
+                         :index-definitions [] :inner-loop actual-header :required-preconditions raw-requirements})
+          actual-values (:values actual-scope)]
+      (is (= 6 (launch/resolve-expression {'N 3}
+                       (get-in actual-values ['entered :conditional-integer :upper]))))
+      (is (not-any? #(= 'entered (:index %)) (:entered-loop-domains (meta actual-values)))
+          "the actual scoped replay must not publish activation N as the computed binder extent")
+      (is (= 2 (quot 6 3)) "N3/idx2 enters six below the actual computed upper seven")
+      (is (> (*' (quot 6 3) Long/MAX_VALUE) Long/MAX_VALUE)
+          "the falsely inferred quotient zero would conceal a genuinely overflowing product")
+      (let [pointer (body/->KernelParameter 'x :input :float [1] :global
+                                            (layout/row-major [1] :float) :operand)
+            outcome (try
+                      (body/make
+                       {:id :computed-quotient-correlation :parameters (conj parameters pointer)
+                        :indices indices :launch actual-launch
+                        :attributes {:required-preconditions raw-requirements}
+                        :operations [(body/->ScalarCompute (body/value 'huge-scale :long)
+                                                     (body/cast-expression (body/literal Long/MAX_VALUE :long)
+                                                                           :long :exact :exact))
+                                     condition
+                                     (assoc branch :then-operations
+                                            [(assoc actual-header :operations
+                                                    [(body/->ScalarLoad (body/value 'loaded :float) 'x
+                                                       [(body/expression :mul
+                                                          (body/expression :floor-div 'entered 'N) 'huge-scale)] nil nil :cached)
+                                                     (body/->Yield [])])
+                                             (body/->Yield [])])]})
+                      {:outcome :accepted}
+                      (catch clojure.lang.ExceptionInfo error {:outcome :rejected :data (ex-data error)}))]
+        (is (= :rejected (:outcome outcome)) (pr-str outcome))
+        (is (= :kernel-body-index-precondition (get-in outcome [:data :reason])) (pr-str outcome))))
+    (doseq [requirement product-requirements]
+      (let [outcome (try (body/validate!
+                         (assoc-in kernel [:attributes :required-preconditions]
+                                   (vec (remove #{requirement} requirements))))
+                        {:outcome :accepted}
+                        (catch clojure.lang.ExceptionInfo error {:outcome :rejected :data (ex-data error)}))]
+        (is (= :rejected (:outcome outcome)) (pr-str outcome))))))
+
+
+(deftest additive-storage-recurrence-validates-addresses-in-the-real-header-scope
+  (let [input (fn [type] (body/->KernelParameter 'x :input type [4] :global
+                                                (layout/row-major [4] type) :operand))
+        loop (fn [type coordinate upper]
+               (body/->ForLoop
+                (body/value 't :int) 0 upper 1
+                [(body/->LoopArg (body/value 'carry :int) (body/literal 0 :int))]
+                [(body/->ScalarLoad (body/value 'loaded type) 'x [coordinate] nil nil :cached)
+                 (body/->ScalarCompute (body/value 'term :int)
+                                      (body/cast-expression 'loaded :int :exact :exact))
+                 (body/->ScalarCompute (body/value 'next-carry :int)
+                                      (body/scalar-expression :+ :int ['carry 'term] {:overflow :no-overflow}))
+                 (body/->Yield ['next-carry])]
+                [(body/value 'sum :int)] {}))
+        make (fn [type coordinate upper extra]
+               (body/make (merge {:id :address-scoped-additive-byte :parameters [(input type)]
+                                 :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+                                 :operations [(loop type coordinate upper)]} extra)))
+        coordinate (body/expression :add 't 1)
+        kernel (make :byte coordinate 3 {})]
+    (is (= kernel (body/validate! kernel)))
+    ;; Three unconstrained byte loads are safe Int terms. Address t+1 needs the
+    ;; actual t0..2 header; that bound is never borrowed into the numeric term.
+    (is (= 381 (* 3 Byte/MAX_VALUE)))
+    (is (= -384 (* 3 Byte/MIN_VALUE)))
+    (let [outcome (try (make :int coordinate 3 {}) {:outcome :accepted}
+                       (catch clojure.lang.ExceptionInfo error {:outcome :rejected :data (ex-data error)}))]
+      (is (= :rejected (:outcome outcome)) (pr-str outcome))
+      (is (contains? #{:kernel-body-intrinsic-overflow :kernel-body-intrinsic-overflow-proof}
+                     (get-in outcome [:data :reason])) (pr-str outcome))
+      (is (> (*' 3 Integer/MAX_VALUE) Integer/MAX_VALUE)
+          "loaded Int storage cannot borrow the address induction range as a term bound"))
+    (let [unsafe-coordinate (body/expression :add
+                              (body/index-cast (body/expression :mul 'group 256) :long :exact)
+                              (body/index-cast 't :long :exact))
+          outcome (try (make :byte unsafe-coordinate 3
+                             {:indices [(body/->IndexBinding 'group :group 0)]
+                              :launch (launch/spec {:workgroup-size [8] :group-count [1]})})
+                       {:outcome :accepted}
+                       (catch clojure.lang.ExceptionInfo error {:outcome :rejected :data (ex-data error)}))]
+      (is (= :rejected (:outcome outcome)) (pr-str outcome))
+      (is (= :kernel-body-index-precondition (get-in outcome [:data :reason])) (pr-str outcome)))))
+
+
+(deftest raw-safe-loop-upper-retains-only-the-actual-child-domain
+  (let [parameters [(body/->KernelParameter 'N :scalar :long [] nil nil :bound)
+                    (body/->KernelParameter 'M :scalar :long [] nil nil :bound)]
+        indices [(body/->IndexBinding 'group :group 0)
+                 (body/->IndexCompute 'idx (body/index-cast 'group :long :exact))]
+        actual-launch (launch/spec {:workgroup-size [8] :group-count [1]})
+        conditions (body/quotient-domain-preconditions 'N 8)
+        condition (body/->ScalarCompute (body/value 'active :predicate)
+                                       (body/scalar-expression :lt :predicate ['idx 'N]))
+        definitions [(body/->IndexCompute 'q (body/expression :floor-div 'idx (body/index-cast 8 :long :exact)))]
+        upper (body/expression :add 'q (body/index-cast 1 :long :exact))
+        header (body/->ForLoop (body/value 'j :long) (body/index-cast 0 :long :exact) upper 1
+                              [] [(body/->Yield [])] [] {})
+        branch (body/->IfRegion 'active (into definitions [header (body/->Yield [])]) [(body/->Yield [])] [])
+        region {:parameters parameters :indices indices :launch actual-launch
+                :condition-definition condition :if-region branch :index-definitions definitions
+                :inner-loop header :required-preconditions conditions}
+        replay (body/scheduled-index-region-info region)
+        values (:values replay)
+        actual-upper (body/conditional-index-info upper values)]
+    (is (= 'N (get-in actual-upper [:conditional-integer :bound])))
+    (is (= 'N (get-in values ['j :conditional-integer :bound])))
+    (is (nil? (get-in values ['j :entered-loop-index])))
+    (is (= 0 (launch/resolve-expression {'N 0} (get-in values ['j :conditional-integer :upper]))))
+    (is (= 1 (launch/resolve-expression {'N 9} (get-in values ['j :conditional-integer :upper]))))
+    (is (= (quot Integer/MAX_VALUE 8)
+           (launch/resolve-expression {'N Long/MAX_VALUE} (get-in values ['j :conditional-integer :upper]))))
+    (is (= (set conditions) (set (:requirements replay)))
+        "ordinary-safe addition keeps evaluated child conditions without adding a loose host cap")
+    (is (not-any? #(= 'j (:index %)) (:entered-loop-domains (meta values))))
+    (let [kernel (body/make {:id :raw-safe-loop-upper :parameters parameters :indices indices
+                             :launch actual-launch :attributes {:required-preconditions conditions}
+                             :operations [condition branch]})]
+      (is (= kernel (body/validate! kernel))))
+    (let [other-conditions (body/quotient-domain-preconditions 'M 8)
+          other-region (-> region
+                           (assoc :required-preconditions other-conditions)
+                           (assoc-in [:condition-definition :expression :arguments] ['idx 'M]))
+          other-values (:values (body/scheduled-index-region-info other-region))
+          mixed (body/conditional-index-info (body/expression :add 'q 'other-q)
+                                            (assoc values 'other-q (get other-values 'q)))]
+      (is (nil? (:conditional-integer mixed))
+          "separately reconstructed activation bounds must not be merged by a safe numeric sum"))))
+
+(deftest additive-proof-does-not-borrow-an-external-numeric-index-range
+  (let [indices [(body/->IndexBinding 'lane :local 0)
+                 (body/->IndexCompute 'outer-term (body/expression :mod 'lane 2))]
+        scope (:values (body/initial-scheduled-index-info
+                        {:parameters [] :indices indices
+                         :launch (launch/spec {:workgroup-size [8] :group-count [1]})}))
+        operation (body/->ForLoop (body/value 't :int) 0 3 1
+                                  [(body/->LoopArg (body/value 'carry :int) (body/literal 0 :int))]
+                                  [(body/->ScalarCompute (body/value 'next :int)
+                                     (body/scalar-expression :+ :int ['carry 'outer-term] {:overflow :no-overflow}))
+                                   (body/->Yield ['next'])]
+                                  [(body/value 'sum :int)] {})
+        derive (ns-resolve 'raster.compiler.ir.kernel-body 'additive-loop-ranges!)]
+    (is (= {:lower 0 :upper 1} (get-in scope ['outer-term :range])))
+    (is (nil? (derive operation (assoc scope 'carry {:type :int :range {:lower 0 :upper 0}})
+                     {:claimed (atom #{})})))
+    ;; This is an optional recurrence-analysis contract, not a claim that the
+    ;; concrete bounded index would overflow. External range provenance remains excluded.
+    ))
+
+
+(deftest compound-abi-divisors-preserve-checked-source-prefixes-and-active-conditions
+  (let [wide #(body/index-cast % :long :exact)
+        divisor (body/expression :add (wide 'M) (wide 1))
+        host-divisor (launch/sum (wide (launch/runtime-value 'M)) (wide 1))
+        requirements (body/quotient-domain-preconditions 'N host-divisor)
+        indices [(body/->IndexBinding 'compound-group :group 0)
+                 (body/->IndexCompute 'compound-flat (wide 'compound-group))]
+        masks [(body/->Mask :compound-active [(body/predicate :lt 'compound-flat (wide 'N))])]
+        parameters (fn [mtype]
+                     [(body/->KernelParameter 'N :scalar :long [] nil nil :bound)
+                      (body/->KernelParameter 'M :scalar mtype [] nil nil :parameter)
+                      (body/->KernelParameter 'x :input :float [1] :global
+                                             (layout/row-major [1] :float) :operand)])
+        make (fn [mtype divisor conditions]
+               (body/make
+                {:id :compound-divisor-address :parameters (parameters mtype) :indices indices :masks masks
+                 :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+                 :operations [(body/->Guard :compound-active
+                                [(body/->IndexCompute 'compound-axis (body/expression :mod 'compound-flat divisor))
+                                 (body/->ScalarLoad (body/value 'loaded :float) 'x ['compound-axis] nil nil :cached)])]
+                 :attributes {:required-preconditions conditions}}))
+        kernel (make :int divisor requirements)]
+    ;; x[1] makes this an arithmetic/ancestry test; it is not a memory-capacity proof.
+    (is (= kernel (body/validate! kernel)))
+    (is (precondition/check! requirements {'N 3 'M 2}))
+    (doseq [m [-1 -2]]
+      (is (thrown? clojure.lang.ExceptionInfo (precondition/check! requirements {'N 1 'M m})))
+      (is (precondition/check! requirements {'N 0 'M m})))
+    (doseq [condition requirements]
+      (is (= :kernel-body-index-precondition
+             (try (make :int divisor (vec (remove #{condition} requirements))) :accepted
+                  (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))))
+    (is (= :kernel-body-index-precondition
+           (try (make :long divisor requirements) :accepted
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        "full Long M+1 must close its evaluated addition before division")
+    (is (= :kernel-body-index-precondition
+           (try (make :int (wide (body/expression :add 'M 1)) requirements) :accepted
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        "casting after an overflowing Int source prefix cannot certify the divisor")))
+
+
+(deftest entered-affine-cohorts-preserve-the-actual-enforced-outer-policy
+  (let [parameters [(body/->KernelParameter 'N :scalar :long [] nil nil :bound)
+                    (body/->KernelParameter 'width :scalar :long [] nil nil :parameter)
+                    (body/->KernelParameter 'x :input :float [1] :global
+                                           (layout/row-major [1] :float) :operand)]
+        zero (body/index-cast 0 :long :exact)
+        coordinate (body/expression :add (body/expression :mul 'row 'width) 'j)
+        inner (body/->ForLoop (body/value 'j :long) zero 'width 1 []
+                             [(body/->ScalarLoad (body/value 'loaded :float) 'x [coordinate] nil nil :cached)
+                              (body/->Yield [])] [] {})
+        outer (body/->ForLoop (body/value 'row :long) zero 'N 1 []
+                             [inner (body/->Yield [])] [] {})
+        make #(body/make {:id :entered-affine-owner-cohort :parameters parameters
+                          :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+                          :operations [outer] :attributes {:required-preconditions %}})
+        raw (body/entered-affine-address-preconditions 'N 'width)
+        signed (body/entered-affine-address-preconditions (launch/maximum 'N 0) 'width)]
+    ;; Both are arithmetic-only witnesses; x[1] does not certify memory capacity.
+    (doseq [conditions [raw signed]]
+      (let [kernel (make conditions)]
+        (is (= kernel (body/validate! kernel)))
+        (is (precondition/check! conditions {'N 2 'width 3}))
+        (is (thrown? ArithmeticException
+              (precondition/check! conditions {'N 3 'width Long/MAX_VALUE})))
+        (is (= :kernel-body-index-precondition
+               (try (make []) :accepted
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+    (is (= :kernel-body-index-precondition
+           (try (make (vec (remove #{{:expression 'N :op :>= :value 0}} raw))) :accepted
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+        "retained raw capacity caps do not attest the signed cohort after its outer policy is removed")
+    (doseq [n [Long/MIN_VALUE -1]]
+      (is (thrown? clojure.lang.ExceptionInfo (precondition/check! raw {'N n 'width Long/MIN_VALUE})))
+      (is (precondition/check! signed {'N n 'width Long/MIN_VALUE})))
+    (is (precondition/check! raw {'N 0 'width Long/MIN_VALUE}))
+    (is (precondition/check! signed {'N 0 'width Long/MIN_VALUE}))))
+
+
+(deftest inclusive-computed-loop-entry-keeps-the-real-upper-and-exit-safety
+  (let [parameters [(body/->KernelParameter 'N :scalar :long [] nil nil :bound)
+                    (body/->KernelParameter 'x :input :float [1] :global
+                                           (layout/row-major [1] :float) :operand)]
+        wide #(body/index-cast % :long :exact)
+        indices [(body/->IndexBinding 'inclusive-group :group 0)
+                 (body/->IndexCompute 'inclusive-flat (wide 'inclusive-group))]
+        masks [(body/->Mask :inclusive-active [(body/predicate :lt 'inclusive-flat (wide 'N))])]
+        upper (body/->IndexCompute 'inclusive-upper (body/expression :mod 'inclusive-flat (wide 1)))
+        conditions (body/quotient-domain-preconditions 'N 1)
+        header (body/->ForLoop (body/value 'inclusive-index :long) (wide 0) 'inclusive-upper 1 []
+                              [(body/->Yield [])] [] {:upper-bound :inclusive})
+        guard (body/->Guard :inclusive-active [upper header])
+        region {:parameters parameters :indices indices :masks masks
+                :launch (launch/spec {:workgroup-size [1] :group-count [1]})
+                :guard guard :inner-loop header :index-definitions [upper]
+                :required-preconditions conditions}
+        replay (body/scheduled-index-region-info region)
+        entered (get-in replay [:values 'inclusive-index])
+        kernel (body/make {:id :inclusive-computed-header :parameters parameters :indices indices :masks masks
+                           :launch (:launch region) :operations [guard]
+                           :attributes {:required-preconditions conditions}})]
+    (is (= kernel (body/validate! kernel)))
+    (is (= {:lower 0 :upper 0} (:range entered))
+        "inclusive upper zero enters the body once, rather than subtracting one")
+    (is (= 0 (launch/resolve-expression {'N 1} (get-in entered [:conditional-integer :upper]))))
+    (is (= 'N (get-in entered [:conditional-integer :bound])))
+    (is (nil? (:entered-loop-index entered)))
+    (is (nil? (:abi-scalar-identity entered)))
+    (is (not-any? #(= 'inclusive-index (:index %))
+                  (:entered-loop-domains (meta (:values replay))))
+        "the activation bound is not an index<N quotient identity")
+    (let [values (:values replay)
+          huge (body/scalar-expression :+ :long ['inclusive-upper (body/literal Long/MAX_VALUE :long)]
+                                      {:overflow :no-overflow
+                                       :proof {:kind :typed-scalar-range :lower Long/MAX_VALUE :upper Long/MAX_VALUE}})
+          actual-upper ((ns-resolve 'raster.compiler.ir.kernel-body 'scalar-info!) huge values)]
+      (is (= {:lower Long/MAX_VALUE :upper Long/MAX_VALUE} (:range actual-upper)))
+      (is (nil? (body/entered-for-loop-info (wide 0) actual-upper 1 :inclusive))
+          "a representable upper MAX cannot certify the inclusive exiting increment")
+      (let [max-compute (body/->ScalarCompute (body/value 'inclusive-max :long) huge)
+            unsafe-loop (assoc header :upper 'inclusive-max
+                               :operations [(body/->ScalarLoad (body/value 'past-max :float) 'x
+                                              [(body/expression :add 'inclusive-index (wide 1))]
+                                              nil nil :cached)
+                                            (body/->Yield [])])]
+        (is (= :kernel-body-index-precondition
+               (try (body/validate! (assoc kernel :operations
+                                     [(assoc guard :operations [upper max-compute unsafe-loop])])) :accepted
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+            "final actual ForLoop cannot borrow a bounded inclusive fact at MAX")))
+    (let [negative ((ns-resolve 'raster.compiler.ir.kernel-body 'scalar-info!) (body/cast-expression (body/literal -1 :long) :long :exact :exact)
+                                     (:values replay))]
+      (is (nil? (body/entered-for-loop-info (wide 0) negative 1 :inclusive))))
+    (let [outside (:values (body/initial-scheduled-index-info
+                            {:parameters parameters :indices (conj indices upper) :launch (:launch region)}))]
+      (is (nil? (body/entered-for-loop-info (wide 0)
+                   (body/conditional-index-info 'inclusive-upper outside) 1 :inclusive))
+          "ordinary remainder range alone does not recreate the lost active conditional domain"))
+    (is (body/kernel-body? (body/validate! (assoc-in kernel [:attributes :required-preconditions] [])))
+        "modulo one remains independently bounded even without activation obligations")
+    (let [dynamic-parameters (conj parameters (body/->KernelParameter 'D :scalar :long [] nil nil :parameter))
+          dynamic-upper (assoc upper :expression (body/expression :mod 'inclusive-flat 'D))
+          dynamic-conditions (body/quotient-domain-preconditions 'N 'D)
+          dynamic-header (assoc header :operations
+                                [(body/->ScalarLoad (body/value 'dynamic-loaded :float) 'x
+                                                    [(body/expression :add 'inclusive-index (wide 1))]
+                                                    nil nil :cached)
+                                 (body/->Yield [])])
+          dynamic-guard (assoc guard :operations [dynamic-upper dynamic-header])
+          dynamic-kernel (body/make (assoc kernel :parameters dynamic-parameters :operations [dynamic-guard]
+                                          :attributes {:required-preconditions dynamic-conditions}))]
+      (is (= dynamic-kernel (body/validate! dynamic-kernel)))
+      (let [dynamic-replay (body/scheduled-index-region-info
+                            (assoc region :parameters dynamic-parameters
+                                   :guard dynamic-guard :inner-loop dynamic-header
+                                   :index-definitions [dynamic-upper]
+                                   :required-preconditions dynamic-conditions))
+            remainder (body/scalar-expression :rem :long ['inclusive-flat 'D])
+            remainder-info ((ns-resolve 'raster.compiler.ir.kernel-body 'scalar-info!)
+                            remainder (:values dynamic-replay))
+            scalar-upper (body/->ScalarCompute (body/value 'scalar-inclusive-upper :long) remainder)
+            scalar-header (assoc dynamic-header :upper 'scalar-inclusive-upper)
+            scalar-kernel (assoc dynamic-kernel :operations
+                                 [(assoc dynamic-guard :operations [scalar-upper scalar-header])])]
+        (is (= {:lower 0 :upper (dec Long/MAX_VALUE)} (:range remainder-info)))
+        (is (= (set dynamic-conditions)
+               (set (get-in remainder-info [:conditional-integer :requirements]))))
+        (is (some? (body/entered-for-loop-info (wide 0) remainder-info 1 :inclusive)))
+        (let [scalar-info (ns-resolve 'raster.compiler.ir.kernel-body 'scalar-info!)
+              maximum (scalar-info (body/scalar-expression :quot :long
+                                      [(body/literal Long/MAX_VALUE :long) (body/literal 1 :long)])
+                                   (:values dynamic-replay))
+              signed (scalar-info (body/scalar-expression :quot :long
+                                     [(body/literal -1 :long) (body/literal 1 :long)])
+                                  (:values dynamic-replay))
+              outside (:values (body/initial-scheduled-index-info
+                                {:parameters dynamic-parameters :indices indices :launch (:launch region)}))
+              unknown (scalar-info (body/scalar-expression :quot :long ['N 'D]) outside)]
+          (is (= {:lower Long/MAX_VALUE :upper Long/MAX_VALUE} (:range maximum)))
+          (is (nil? (body/entered-for-loop-info (wide 0) maximum 1 :inclusive)))
+          (is (= {:lower -1 :upper -1} (:range signed)))
+          (is (nil? (body/entered-for-loop-info (wide 0) signed 1 :inclusive)))
+          (is (nil? (:conditional-integer unknown)))
+          (is (nil? (body/entered-for-loop-info (wide 0) unknown 1 :inclusive))))
+        (is (= scalar-kernel (body/validate! scalar-kernel))
+            "actual ScalarCompute remainder certifies the inclusive exiting increment")
+        (let [quotient-expression (body/scalar-expression :quot :long ['scalar-inclusive-upper 'D])
+              values (assoc (:values dynamic-replay) 'scalar-inclusive-upper remainder-info)
+              quotient-info ((ns-resolve 'raster.compiler.ir.kernel-body 'scalar-info!) quotient-expression values)
+              quotient-compute (body/->ScalarCompute (body/value 'scalar-quotient-upper :long) quotient-expression)
+              quotient-kernel (assoc dynamic-kernel :operations
+                                    [(assoc dynamic-guard :operations
+                                            [scalar-upper quotient-compute
+                                             (assoc dynamic-header :upper 'scalar-quotient-upper)])])]
+          (is (= {:lower 0 :upper (dec Long/MAX_VALUE)} (:range quotient-info)))
+          (is (= (set dynamic-conditions)
+                 (set (get-in quotient-info [:conditional-integer :requirements]))))
+          (is (some? (body/entered-for-loop-info (wide 0) quotient-info 1 :inclusive)))
+          (is (= quotient-kernel (body/validate! quotient-kernel)))
+          (doseq [condition dynamic-conditions]
+            (is (= :kernel-body-index-precondition
+                   (try (body/validate! (assoc-in quotient-kernel [:attributes :required-preconditions]
+                                                 (vec (remove #{condition} dynamic-conditions)))) :accepted
+                        (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+        (doseq [condition dynamic-conditions]
+          (is (= :kernel-body-index-precondition
+                 (try (body/validate! (assoc-in scalar-kernel [:attributes :required-preconditions]
+                                               (vec (remove #{condition} dynamic-conditions)))) :accepted
+                      (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+              "numeric refinement never removes an executed child/domain requirement")))
+      (is (precondition/check! dynamic-conditions {'N 1 'D 1}))
+      (doseq [divisor [0 -1]]
+        (is (precondition/check! dynamic-conditions {'N 0 'D divisor}))
+        (is (thrown? clojure.lang.ExceptionInfo
+              (precondition/check! dynamic-conditions {'N 1 'D divisor}))))
+      (doseq [condition dynamic-conditions]
+        (is (= :kernel-body-index-precondition
+               (try (body/validate! (assoc-in dynamic-kernel [:attributes :required-preconditions]
+                                             (vec (remove #{condition} dynamic-conditions)))) :accepted
+                    (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
+            "actual dynamic division needs its independently enforced child/domain conditions")))))

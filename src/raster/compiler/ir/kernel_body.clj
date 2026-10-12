@@ -1068,7 +1068,7 @@
       (throw (ex-info (str owner " references a value before it is defined")
                       {:reason :kernel-body-use-before-definition :value id}))))
 
-(declare scalar-info!)
+(declare scalar-info! address-expression-safe? conditional-address-ancestry-closed?)
 
 (defn- literal-info!
   [literal]
@@ -1199,9 +1199,25 @@
           divisor (second args)
           make-transfer
           (fn [fact requirements]
-            (let [conditional-range {:lower 0 :upper Long/MAX_VALUE}
+            (let [;; An executed conditional remainder has a positive Long divisor.
+                  ;; Its value is strictly below that divisor, including when the
+                  ;; divisor is MAX. Keep every activation/child obligation below.
+                  conditional-range {:lower 0 :upper (if (= :rem op)
+                                                       (dec Long/MAX_VALUE)
+                                                       Long/MAX_VALUE)}
                   ordinary-range (case op
                                    :cast (:range (first infos))
+                                   :quot
+                                   (let [[numerator divisor-info] infos
+                                         nr (:range numerator) dr (:range divisor-info)]
+                                     (when (and (= :long (:type numerator) (:type divisor-info))
+                                                (conditional-address-ancestry-closed? (first args) values numerator)
+                                                (conditional-address-ancestry-closed? (second args) values divisor-info)
+                                                (<= 0 (:lower nr)))
+                                       ;; Selected quotient domains retain executed positivity.
+                                       ;; A positive divisor cannot increase a nonnegative
+                                       ;; numerator; MAX/1 must still retain MAX.
+                                       {:lower 0 :upper (quot (:upper nr) (max 1 (:lower dr)))}))
                                    (:+ :*) (scalar-range/arithmetic op (mapv :range infos))
                                    nil)
                   ;; Both bounds come from independently reconstructed operand facts. The
@@ -1226,9 +1242,18 @@
         ;; inner extent must not become an unconditional ABI restriction.
         entered-affine-pair
         (let [[index-value _ index factor] entered-affine-pair
-              bound (or (get-in index-value [:entered-loop-index :upper])
-                        (:active-upper index-value)
-                        (get-in index-value [:conditional-integer :bound]))
+              entered-upper (get-in index-value [:entered-loop-index :upper])
+              ;; Raw identities remain in entered-loop-domains for lexical matching.
+              ;; Owners that actually enforce the existing nonnegative raw cohort
+              ;; retain its exact expressions. Signed zero-trip owners instead use
+              ;; zero activation consistently for every derived host cap.
+              raw-upper-enforced? (and entered-upper
+                                        (some #{ {:expression entered-upper :op :>= :value 0}}
+                                              (:required-preconditions (meta values))))
+              bound (if entered-upper
+                      (if raw-upper-enforced? entered-upper (launch/maximum entered-upper 0))
+                      (or (:active-upper index-value)
+                          (get-in index-value [:conditional-integer :bound])))
               active (launch/minimum bound 1)
               extent (launch/maximum factor 0)]
           (make-transfer {:kind :affine-product :origin index :bound bound
@@ -1376,7 +1401,7 @@
 
         (and (contains? #{:+ :*} op) (= 2 (count args))
              (some identity domains))
-        (let [mixed-nonnegative? (and (= :+ op)
+        (let [mixed-nonnegative? (and (contains? #{:+ :*} op)
                                       (every? #(and (:bound %) (:upper %)) domains)
                                       (= (:bound (first domains)) (:bound (second domains)))
                                       (every? #(let [lower (get-in % [:range :lower])]
@@ -1409,10 +1434,18 @@
                         ;; Only the actual current Guard can deactivate this
                         ;; factor obligation. Evaluated prefixes keep raw bounds.
                         scoped? (some #(= (:bound domain) (:active-upper %)) (vals values))]
-                    (assoc domain :kind :parameter
-                                  :upper (launch/product active factor)
-                                  :requirements [{:expression (if scoped? (launch/product active factor) factor)
-                                                  :op :>= :value 0}]))
+                    (if (and (integer? (get-in value [:range :lower]))
+                             (<= 0 (get-in value [:range :lower])))
+                      ;; The actual lexical comparison has already proved this ABI
+                      ;; factor nonnegative. Totalize its dormant branch extension,
+                      ;; rather than imposing positivity on an unexecuted factor.
+                      (assoc domain :kind :parameter
+                                    :upper (launch/product active (launch/maximum factor 0))
+                                    :requirements [])
+                      (assoc domain :kind :parameter
+                                    :upper (launch/product active factor)
+                                    :requirements [{:expression (if scoped? (launch/product active factor) factor)
+                                                    :op :>= :value 0}])))
                   :else nil))
               operands (mapv operand-bound args infos domains)]
           (when (every? identity operands)
@@ -1426,9 +1459,13 @@
   "Refine only the selected branch of an already checked integral comparison.
    The operand identities and literal come from the actual ScalarExpr, never attributes."
   [expression values truth?]
-  (let [[left right] (:arguments expression)
+  (let [[raw-left raw-right] (:arguments expression)
+        raw-op (intrinsics/canonical (:op expression))
+        literal-left? (and (record-kind? "raster.compiler.ir.kernel_body.Literal" raw-left)
+                           (value-id? raw-right) (contains? #{:gt :ge :lt :le} raw-op))
+        [left right] (if literal-left? [raw-right raw-left] [raw-left raw-right])
         info (get values left)
-        op (intrinsics/canonical (:op expression))
+        op (if literal-left? ({:gt :lt :ge :le :lt :gt :le :ge} raw-op) raw-op)
         exact-id (fn [argument]
                    (cond
                      (value-id? argument) argument
@@ -1478,6 +1515,26 @@
           (assoc-in values [left :range] refined) values))
       values))))
 
+(declare conditional-address-ancestry-closed? nonnegative-index-expression?)
+
+(defn- abi-additive-index-expression
+  ;; Preserve the actual checked host spelling, including exact casts. Only ABI
+  ;; leaves and additions are projected; hardware/local aliases are never divisors.
+  [expression values]
+  (cond
+    (integer? expression) expression
+    (value-id? expression)
+    (when-let [identity (:abi-scalar-identity (get values expression))]
+      (launch/runtime-value identity))
+    (record-kind? "raster.compiler.ir.kernel_body.IndexCast" expression)
+    (when (and (= :exact (:overflow expression)) (contains? #{:int :long} (:dtype expression)))
+      (when-let [argument (abi-additive-index-expression (:argument expression) values)]
+        (index-cast argument (:dtype expression) :exact)))
+    (and (record-kind? "raster.compiler.ir.kernel_body.IndexExpr" expression)
+         (= :add (:op expression)) (<= 2 (count (:arguments expression))))
+    (let [arguments (mapv #(abi-additive-index-expression % values) (:arguments expression))]
+      (when (every? some? arguments) (apply launch/sum arguments)))))
+
 (defn conditional-index-info
   "Reconstruct conditional bounds from actual index nodes and checked operand facts.
    Exact casts preserve facts only when their complete source arithmetic is representable."
@@ -1513,10 +1570,15 @@
                      (when (:active-upper numerator-info) (:identity numerator-info))
                      (get-in numerator-info [:conditional-integer :domain-index]))
           divisor (or (:abi-scalar-identity divisor-info)
+                      (when (and (record-kind? "raster.compiler.ir.kernel_body.IndexExpr" divisor-expression)
+                                 (= :add (:op divisor-expression)) (= :long (:type divisor-info))
+                                 (scalar-range/contained-in-dtype? (:range divisor-info) :long)
+                                 (conditional-address-ancestry-closed? divisor-expression values divisor-info))
+                        (abi-additive-index-expression divisor-expression values))
                       (let [range (:range divisor-info)]
                         (when (and range (integer? (:lower range))
                                    (= (:lower range) (:upper range))) (:lower range))))]
-      (when (and (= :long (:type numerator-info) (:type divisor-info))
+      (or (when (and (= :long (:type numerator-info) (:type divisor-info))
                  bound origin divisor
                  (some #(and (= origin (:index %)) (= bound (:upper %)))
                        (concat (:entered-loop-domains (meta values))
@@ -1529,18 +1591,71 @@
                     :bound bound :divisor divisor
                     :upper ((if (= :mod (:op expression)) :remainder :quotient)
                             (quotient-domain-bounds bound divisor))
-                    :requirements requirements}]
+                    :requirements requirements}
+              numerator-range (:range numerator-info)
+              numerator-cap (when (and numerator-range
+                                       (<= (:lower numerator-range) (:upper numerator-range))
+                                       (<= 0 (:upper numerator-range))
+                                       (scalar-range/contained-in-dtype? numerator-range (:type numerator-info))
+                                       (conditional-address-ancestry-closed? numerator values numerator-info))
+                              (bigint (:upper numerator-range)))
+              divisor-range (:range divisor-info)
+              divisor-min (if (and divisor-range
+                                   (<= (:lower divisor-range) (:upper divisor-range))
+                                   (pos? (:lower divisor-range))
+                                   (scalar-range/contained-in-dtype? divisor-range (:type divisor-info)))
+                            (bigint (:lower divisor-range))
+                            1)
+              ;; The real entered domain supplies nonnegativity and active divisor positivity.
+              ;; Retain its requirements while preserving an independently checked hardware or
+              ;; prior quotient interval instead of replacing it by the full Long domain.
+              upper (if (= :mod (:op expression))
+                      (max 0 (min (dec Long/MAX_VALUE)
+                                  (dec (bigint (get-in divisor-info [:range :upper] Long/MAX_VALUE)))))
+                      (dec Long/MAX_VALUE))
+              upper (if numerator-cap
+                      (min upper (if (= :mod (:op expression)) numerator-cap
+                                   (quot numerator-cap divisor-min)))
+                      upper)]
           {:type :long
-           :range {:lower 0
-                   :upper (if (= :mod (:op expression))
-                            ;; Positivity is an inherited, active-domain obligation. A typed
-                            ;; divisor upper bounds every remainder even when its ABI is narrower.
-                            (max 0 (min (dec Long/MAX_VALUE)
-                                        (dec (bigint (get-in divisor-info [:range :upper]
-                                                            Long/MAX_VALUE)))))
-                            (dec Long/MAX_VALUE))}
+           :range {:lower 0 :upper upper}
            :conditional-integer fact :quotient-address-origin? true
-           :required-preconditions requirements})))
+           :required-preconditions requirements}))
+          ;; Discovery of a real positive-domain division does not enforce the
+          ;; child obligations before the producer has collected them.
+          (let [type (:type numerator-info)
+                n (:range numerator-info) d (:range divisor-info)
+                closed? (and (= type (:type divisor-info)) (contains? #{:int :long} type)
+                             n d (<= (:lower n) (:upper n)) (<= 0 (:upper n))
+                             (<= 1 (:lower d) (:upper d))
+                             (scalar-range/contained-in-dtype? n type)
+                             (scalar-range/contained-in-dtype? d type)
+                             (or (<= 0 (:lower n)) (nonnegative-index-expression? numerator values))
+                             (conditional-address-ancestry-closed? numerator values numerator-info)
+                             (conditional-address-ancestry-closed? divisor-expression values divisor-info))
+                n (when closed? (assoc n :lower (max 0 (:lower n))))]
+            (when closed?
+              {:type type
+               :range (if (= (:lower d) (:upper d))
+                        (or ((if (= :mod (:op expression)) scalar-range/remainder scalar-range/quotient) [n d])
+                            (scalar-range/for-dtype type))
+                        (if (= :mod (:op expression))
+                          {:lower 0 :upper (min (:upper n) (dec (bigint (:upper d))))}
+                          {:lower (quot (bigint (:lower n)) (:upper d))
+                           :upper (quot (bigint (:upper n)) (:lower d))}))
+               :quotient-address-origin? true
+               :required-preconditions (vec (distinct (concat (:required-preconditions numerator-info)
+                                                              (:required-preconditions divisor-info))))
+               :conditional-integer
+               (when (and (= :mod (:op expression)) (:abi-scalar-identity divisor-info))
+                 ;; Modulo itself establishes the exact positive divisor bound;
+                 ;; no relation between the hardware numerator and that bound is invented.
+                 {:kind :positive-divisor-remainder :origin nil :divisor nil
+                  :bound (launch/maximum (:abi-scalar-identity divisor-info) 0)
+                  :upper (launch/minimum (:upper n)
+                                         (launch/sum (launch/maximum (:abi-scalar-identity divisor-info) 1) -1))
+                  :requirements (vec (distinct (concat (:required-preconditions numerator-info)
+                                                       (:required-preconditions divisor-info))))})}))))
 
     (record-kind? "raster.compiler.ir.kernel_body.IndexExpr" expression)
     (let [infos (mapv #(conditional-index-info % values) (:arguments expression))
@@ -1557,36 +1672,92 @@
               step (fn [left [argument right]]
                      (when left
                        (let [left-id (:identity left)
-                             transfer (when op
+                             ordinary-range (case (:op expression)
+                                              :add (scalar-range/arithmetic :+ [(:range left) (:range right)])
+                                              :sub (scalar-range/arithmetic :- [(:range left) (:range right)])
+                                              :mul (scalar-range/arithmetic :* [(:range left) (:range right)])
+                                              :min (scalar-range/minmax :min [(:range left) (:range right)])
+                                              :max (scalar-range/minmax :max [(:range left) (:range right)])
+                                              nil)
+                             ordinary-closed? (and (:ordinary-address-closed? left)
+                                                   (conditional-address-ancestry-closed? argument values right)
+                                                   ordinary-range
+                                                   (<= (:lower ordinary-range) (:upper ordinary-range))
+                                                   (scalar-range/contained-in-dtype? ordinary-range type))
+                             ;; Child/domain obligations still apply. An independently closed
+                             ;; machine interval needs no new symbolic cap for this intermediate.
+                             transfer (when (and op (not ordinary-closed?))
                                         (conditional-integer-transfer
                                          (scalar-expression op type [left-id argument] {})
                                          (assoc values left-id left argument right)))
-                             range (if transfer (:range transfer)
-                                     (case (:op expression)
-                                       :add (scalar-range/arithmetic :+ [(:range left) (:range right)])
-                                       :sub (scalar-range/arithmetic :- [(:range left) (:range right)])
-                                       :mul (scalar-range/arithmetic :* [(:range left) (:range right)])
-                                       :min (scalar-range/minmax :min [(:range left) (:range right)])
-                                       :max (scalar-range/minmax :max [(:range left) (:range right)])
-                                       nil))]
+                             ordinary-domain
+                             (when (and ordinary-closed? (= :+ op) (<= 0 (:lower ordinary-range)))
+                               (let [domains (mapv :conditional-integer [left right])
+                                     domain (first (filter #(and (:bound %) (:upper %)) domains))
+                                     active (when domain (launch/minimum (launch/maximum (:bound domain) 0) 1))
+                                     upper-of (fn [info fact]
+                                                (let [range (:range info)]
+                                                  (when (and range (<= 0 (:lower range)))
+                                                    (cond
+                                                      (and fact (= (:bound domain) (:bound fact)) (:upper fact))
+                                                      (launch/minimum (:upper fact) (:upper range))
+                                                      (and (= (:lower range) (:upper range)) (integer? (:lower range)))
+                                                      (launch/product active (:lower range))
+                                                      :else nil))))
+                                     uppers (when domain (mapv upper-of [left right] domains))]
+                                 (when (and domain (every? some? uppers))
+                                   ;; Preserve the actual activation relation for a computed
+                                   ;; header, while each child maximum is capped BEFORE addition.
+                                   ;; The independently closed numeric prefix needs no new cap.
+                                   {:kind :ordinary-derived :origin nil :divisor nil
+                                    :bound (:bound domain) :upper (apply launch/sum uppers)
+                                    :requirements (vec (distinct (concat (:required-preconditions left)
+                                                                         (:required-preconditions right))))})))
+                             range (if transfer (:range transfer) ordinary-range)]
                          (when (scalar-range/contained-in-dtype? range type)
                            (cond-> {:type type :range range :identity (Object.)
+                                    :ordinary-address-closed? (boolean ordinary-closed?)
                                     :quotient-address-origin? (boolean (or (:quotient-address-origin? left)
                                                                          (:quotient-address-origin? right)))
                                     :required-preconditions
                                     (vec (distinct (concat (:required-preconditions left)
                                                            (:required-preconditions right)
                                                            (:required-preconditions transfer))))}
-                             transfer (assoc :conditional-integer (:fact transfer)))))))
+                             (or transfer ordinary-domain)
+                             (assoc :conditional-integer (or (:fact transfer) ordinary-domain)))))))
               initial (when-let [first-info (first infos)]
-                        (assoc first-info :identity (first identities)))]
+                        (assoc first-info :identity (first identities)
+                                          :ordinary-address-closed?
+                                          (conditional-address-ancestry-closed? (first arguments) values first-info)))]
           (some-> (reduce step initial (map vector (rest identities) (rest infos)))
-                  (dissoc :identity)))))
+                  (dissoc :identity :ordinary-address-closed?)))))
     :else nil))
 
+(defn- conditional-address-ancestry-closed?
+  "Close discovery-time children without enforcing their collected host obligations.
+   Final verification still checks every inherited requirement in the actual body."
+  ([expression values]
+   (conditional-address-ancestry-closed? expression values
+                                        (conditional-index-info expression values)))
+  ([expression values info]
+   (let [range (:range info)]
+    (and info range
+         (integer? (:lower range)) (integer? (:upper range))
+         (<= (:lower range) (:upper range))
+         (scalar-range/contained-in-dtype? range (:type info))
+         (not (:unresolved-index-address-origin? info))
+         (cond
+           (value-id? expression) (contains? values expression)
+           (record-kind? "raster.compiler.ir.kernel_body.IndexCast" expression)
+           (conditional-address-ancestry-closed? (:argument expression) values)
+           (record-kind? "raster.compiler.ir.kernel_body.IndexExpr" expression)
+           (every? #(conditional-address-ancestry-closed? % values) (:arguments expression))
+           :else true)))))
+
 (defn entered-for-loop-info
-  "A checked exclusive Long loop starting at literal zero and stepping by one has
-   a nonnegative entered index. Host bounds use only its actual ABI upper identity."
+  "A checked zero-start unit-step Long loop has a nonnegative entered index.
+   Inclusive reconstruction is limited to actual computed domains whose numeric upper
+   proves the exiting increment. Local SSA identities never become host ABI bounds."
   [lower upper-info step upper-bound]
   (letfn [(zero-bound? [expression]
             (cond
@@ -1599,18 +1770,37 @@
                    (zero-bound? (:argument expression)))
               :else false))]
     (when (and (= :long (:type upper-info)) (zero-bound? lower)
-               (= 1 step) (= :exclusive upper-bound)
+               (= 1 step) (contains? #{:exclusive :inclusive} upper-bound)
                (integer? (get-in upper-info [:range :lower]))
                (integer? (get-in upper-info [:range :upper])))
-      (let [upper (or (:abi-scalar-identity upper-info)
-                      (when (= (get-in upper-info [:range :lower]) (get-in upper-info [:range :upper]))
-                        (get-in upper-info [:range :upper])))
-            maximum (get-in upper-info [:range :upper])]
-        (cond-> {:type :long :range {:lower 0 :upper (max 0 (dec (bigint maximum)))}}
-          upper (assoc :entered-loop-index
-                       {:upper upper
-                        :active (launch/minimum (launch/maximum upper 0) 1)
-                        :maximum (launch/sum (launch/maximum upper 1) -1)}))))))
+      (let [inclusive? (= :inclusive upper-bound)
+            upper (when-not inclusive?
+                    (or (:abi-scalar-identity upper-info)
+                        (when (= (get-in upper-info [:range :lower]) (get-in upper-info [:range :upper]))
+                          (get-in upper-info [:range :upper]))))
+            maximum (get-in upper-info [:range :upper])
+            domain (:conditional-integer upper-info)
+            computed-domain (when (and (nil? upper) (:bound domain) (:upper domain)
+                                       (not (:unresolved-index-address-origin? upper-info))
+                                       (scalar-range/contained-in-dtype? (:range upper-info) :long)
+                                       (<= (get-in upper-info [:range :lower])
+                                           (get-in upper-info [:range :upper]))
+                                       (not (:unresolved-index-precondition? upper-info))
+                                       (<= 0 (get-in upper-info [:range :lower]))
+                                       (or (not inclusive?) (< maximum Long/MAX_VALUE)))
+                              {:kind :computed-loop-index :origin nil :divisor nil
+                               :bound (:bound domain)
+                               :upper (if inclusive? (:upper domain)
+                                        (launch/maximum (launch/sum (:upper domain) -1) 0))
+                               :requirements (vec (distinct (concat (:requirements domain)
+                                                                    (:required-preconditions upper-info))))})]
+        (when (or (not inclusive?) computed-domain)
+          (cond-> {:type :long :range {:lower 0 :upper (if inclusive? maximum (max 0 (dec (bigint maximum))))}}
+            upper (assoc :entered-loop-index
+                         {:upper upper
+                          :active (launch/minimum (launch/maximum upper 0) 1)
+                          :maximum (launch/sum (launch/maximum upper 1) -1)})
+            computed-domain (assoc :conditional-integer computed-domain)))))))
 
 (declare address-expression-safe?)
 
@@ -2139,13 +2329,22 @@
                                                      ordinary-numerator)
                                          ranges [numerator divisor]]
                          (if (and (= 2 (count infos)) numerator divisor
-                                  (<= 0 (:lower numerator))
-                                  (= (:lower divisor) (:upper divisor))
-                                  (pos? (:lower divisor)))
-                           (or (if (= :mod op)
-                                 (scalar-range/remainder ranges)
-                                 (scalar-range/quotient ranges))
-                               (scalar-range/for-dtype result-type))
+                                  (<= 0 (:lower numerator) (:upper numerator))
+                                  (<= 1 (:lower divisor) (:upper divisor))
+                                  (scalar-range/contained-in-dtype? numerator result-type)
+                                  (scalar-range/contained-in-dtype? divisor result-type)
+                                  (address-expression-safe? (first (:arguments expression)) values)
+                                  (address-expression-safe? (second (:arguments expression)) values))
+                           ;; These are index-only nonnegative/positive C division facts.
+                           ;; An actual lexical comparison may narrow a dynamic divisor;
+                           ;; neither signed scalar quotient semantics nor ABI identities change.
+                           (if (= (:lower divisor) (:upper divisor))
+                             (or ((if (= :mod op) scalar-range/remainder scalar-range/quotient) ranges)
+                                 (scalar-range/for-dtype result-type))
+                             (if (= :mod op)
+                               {:lower 0 :upper (min (:upper numerator) (dec (bigint (:upper divisor))))}
+                               {:lower (quot (bigint (:lower numerator)) (:upper divisor))
+                                :upper (quot (bigint (:upper numerator)) (:lower divisor))}))
                            (scalar-range/for-dtype result-type)))
                   (scalar-range/for-dtype result-type)))}
              (select-keys (verified-conditional-index-info expression values)
@@ -2403,7 +2602,8 @@
                 initial (scalar-value-info! (:initial (first args)) proof-values)
                 prefix-values (validate-dataflow-operations!
                                prefix proof-values
-                               (assoc context :claimed (atom @(:claimed context))))
+                               (assoc context :claimed (atom @(:claimed context))
+                                              :additive-address-values loop-values))
                 term-info (scalar-value-info! term prefix-values)
                 ranges (when (= type (:type term-info))
                          (scalar-range/additive-loop-ranges (:range initial) (:range term-info) trips))]
@@ -2456,11 +2656,17 @@
           buffer (get storage (:buffer operation))
           result-type (canonical-type (:type result))
           buffer-type (canonical-type (:dtype buffer))
+          ;; The optional recurrence proof keeps external numeric ranges conservative.
+          ;; Its loads still validate actual coordinates/masks in the independently
+          ;; reconstructed header scope; newly computed prefix values remain checked.
+          address-values (if-let [scoped (:additive-address-values context)]
+                           (with-meta (merge scoped (apply dissoc values (keys scoped))) (meta scoped))
+                           values)
           coordinate-uniformity
           (join-uniformity
-           (map #(hash-map :uniformity (address-expression-uniformity % values))
+           (map #(hash-map :uniformity (address-expression-uniformity % address-values))
                 (:coordinates operation)))
-          predicate-uniformity (mask-uniformity (:predicate operation) masks values)
+          predicate-uniformity (mask-uniformity (:predicate operation) masks address-values)
           other-info (when (:predicate operation)
                        (scalar-value-info! (:other operation) values))]
       (when-not (= result-type buffer-type)
@@ -2624,6 +2830,9 @@
                                          {:lower (max (:lower range) (:lower lattice-range))
                                           :upper (min (:upper range) (:upper lattice-range))}
                                          lattice-range)))
+                          loop-values)
+            loop-values (if (:conditional-integer entered-info)
+                          (assoc-in loop-values [(:id index) :conditional-integer :domain-index] (:id index))
                           loop-values)
             loop-values (if (get-in entered-info [:entered-loop-index :upper])
                           (assoc-in loop-values [(:id index) :entered-loop-index :index] (:id index))
@@ -3317,11 +3526,36 @@
                         (filter #(= :scalar (:kind %)) parameters)))
              indices))
 
+(defn initial-scheduled-index-info
+  "Reconstruct actual initial scheduling records without adding a lexical control domain.
+   Producer lowering may use these facts; full body validation independently replays them."
+  [{:keys [parameters indices launch]}]
+  (launch/validate-spec! launch)
+  (let [dimensions (launch/dimensions launch)]
+    (reduce
+     (fn [scope index]
+       (cond
+         (record-kind? "raster.compiler.ir.kernel_body.IndexBinding" index)
+         (when-not (and (contains? index-sources (:source index))
+                        (integer? (:axis index))
+                        (case (:source index)
+                          (:group :group-count :local) (< -1 (:axis index) dimensions)
+                          (:subgroup :lane) (zero? (:axis index))))
+           (throw (ex-info "initial schedule has an invalid hardware index" {:index index})))
+         (record-kind? "raster.compiler.ir.kernel_body.IndexCompute" index)
+         (when-not (and (expression? (:expression index))
+                        (every? scope (expression-references (:expression index))))
+           (throw (ex-info "initial schedule references an undefined index" {:index index})))
+         :else (throw (ex-info "initial schedule has an unsupported index" {:index index})))
+       (conj scope (:id index)))
+     (set (map :id (filter #(= :scalar (:kind %)) parameters))) indices))
+  {:values (initial-index-values parameters indices launch) :requirements []})
+
 (defn- reconstruct-scheduled-index-region
   "Reconstruct an owner's actual lexical index region for provisional scalar lowering.
    Actual loop/guard records are replayed; supplied fact maps are never accepted."
   [{:keys [parameters indices launch loop guard masks inner-loop index-definitions required-preconditions
-           condition-definition if-region]} require-workgroup?]
+           condition-definition if-region enclosing-if-regions]} require-workgroup?]
   (launch/validate-spec! launch)
   (when-not (and (or (record-kind? "raster.compiler.ir.kernel_body.ForLoop" loop)
                     (record-kind? "raster.compiler.ir.kernel_body.Guard" guard)
@@ -3334,8 +3568,29 @@
                  (every? #(record-kind? "raster.compiler.ir.kernel_body.IndexCompute" %) index-definitions))
     (throw (ex-info "scheduled index scope requires actual loop/guard and index records"
                     {:reason :kernel-body-index-region})))
+  (when (and (seq enclosing-if-regions) (or (nil? if-region) loop guard))
+    (throw (ex-info "enclosing true branches require an actual innermost IfRegion"
+                    {:reason :kernel-body-index-region-condition})))
+  (doseq [[position enclosing] (map-indexed vector enclosing-if-regions)]
+    (let [definition (:condition-definition enclosing)
+          outer (:if-region enclosing)
+          child (if (< (inc position) (count enclosing-if-regions))
+                  (:if-region (nth enclosing-if-regions (inc position))) if-region)]
+      (when-not (and (record-kind? "raster.compiler.ir.kernel_body.ScalarCompute" definition)
+                     (record-kind? "raster.compiler.ir.kernel_body.IfRegion" outer)
+                     (= (:condition outer) (get-in definition [:result :id]))
+                     (= :predicate (get-in definition [:result :type]))
+                     child (some #{child} (:then-operations outer)))
+        (throw (ex-info "enclosing scheduling branch must contain its actual true-branch child"
+                        {:reason :kernel-body-index-region-condition})))))
   (letfn [(enter [values operation]
-            (let [lower (expression-info! (:lower operation) values)
+            (let [lower-derived (conditional-index-info (:lower operation) values)
+                  upper-derived (conditional-index-info (:upper operation) values)
+                  header-requirements (vec (distinct (concat (:required-preconditions lower-derived)
+                                                             (:required-preconditions upper-derived))))
+                  values (with-meta values (update (meta values) :required-preconditions
+                                                   #(vec (distinct (concat % header-requirements)))))
+                  lower (expression-info! (:lower operation) values)
                   upper (expression-info! (:upper operation) values)
                   step (if (integer? (:step operation))
                          {:type (:type (:index operation))
@@ -3348,7 +3603,9 @@
                                 {:reason :kernel-body-index-region-controls})))
               (let [index (:id (:index operation))
                     entered (if (= :long (:type (:index operation)))
-                              (entered-positive-loop-info operation lower upper values)
+                              (or (entered-for-loop-info (:lower operation) upper (:step operation)
+                                                        (get-in operation [:attributes :upper-bound] :exclusive))
+                                  (entered-positive-loop-info operation lower upper values))
                               (when (and (= :exclusive (get-in operation [:attributes :upper-bound] :exclusive))
                                          (integer? (:step operation)))
                                 (when-let [range (scalar-range/exclusive-positive-loop-entry-range
@@ -3358,13 +3615,21 @@
                                       :range (scalar-range/hull [(:range lower) (:range upper)])})
                     lexical-upper (get-in entered [:entered-loop-index :upper])]
                 (with-meta (assoc values index
-                                 (cond-> info lexical-upper
-                                   (assoc-in [:entered-loop-index :index] index)))
+                                 (cond-> info
+                                   (:entered-loop-index entered) (assoc-in [:entered-loop-index :index] index)
+                                   (:conditional-integer entered) (assoc-in [:conditional-integer :domain-index] index)))
                   (cond-> (meta values)
                     lexical-upper (update :entered-loop-domains (fnil conj [])
                                           {:index index :upper lexical-upper}))))))]
     (let [initial (with-meta (initial-index-values parameters indices launch)
                     {:required-preconditions required-preconditions})
+          initial (reduce (fn [values {:keys [condition-definition]}]
+                            (let [info (scalar-info! (:expression condition-definition) values)]
+                              (when-not (= :predicate (:type info))
+                                (throw (ex-info "enclosing schedule requires an actual checked comparison"
+                                                {:reason :kernel-body-index-region-condition})))
+                              (refine-comparison-values (:expression condition-definition) values true)))
+                          initial enclosing-if-regions)
           mask-map (into {} (map (juxt :id identity)) masks)
           values (cond
                    if-region
@@ -3392,7 +3657,9 @@
                        {:values (assoc values (:id definition) (assoc info :identity (:id definition)))
                         :requirements (vec (distinct (into requirements (:required-preconditions info))))}))
                    {:values values :requirements []} index-definitions)]
-      (if inner-loop (update result :values enter inner-loop) result))))
+      (let [result (if inner-loop (update result :values enter inner-loop) result)]
+        (update result :requirements
+                #(vec (distinct (concat % (:required-preconditions (meta (:values result)))))))))))
 
 (defn scheduled-index-region-info
   "Replay actual loop/branch records; Guard owners retain their uniform collective contract."

@@ -1,6 +1,9 @@
 (ns raster.compiler.backend.gpu.layout-transform
   "Lower target-neutral affine layout-transform schedules to C-family kernel artifacts."
   (:require [raster.compiler.backend.gpu.kernel-body-opencl :as emitter]
+            [raster.compiler.backend.gpu.kernel-body-target :as target]
+            [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.scheduled-kernel-body :as scheduled]
             [raster.compiler.passes.parallel.layout-transform-schedule :as schedule]))
 
 (defn cast-body
@@ -47,9 +50,27 @@
                      {:kernel-name kernel-name :input input :output output
                       :element-dtype element-dtype
                       :row-extent-dtype row-extent-dtype :column-extent-dtype column-extent-dtype})]
-    {:source (emitter/emit-scalar-kernel
-              kernel-name kernel-body
-              {:target-dialect target-dialect
-               :parameter-names {input "in" output "out"
-                                 :layout-rows "rows" :layout-cols "cols"}})
-     :kernel-body kernel-body}))
+    (assoc (emitter/emit-scalar-module
+            kernel-name kernel-body
+            {:target-dialect target-dialect
+             :parameter-names {input "in" output "out"
+                               :layout-rows "rows" :layout-cols "cols"}})
+           :kernel-body kernel-body)))
+
+(defn emit-transpose-artifact
+  "Close transpose shape conditions through the checked invocation artifact boundary."
+  [{:keys [kernel-name input output target-dialect] :or {target-dialect :opencl-intel} :as options}]
+  (let [kernel-body (transpose-body options)
+        arguments [input output :layout-rows :layout-cols]
+        scheduled (scheduled/make
+                   {:source (assoc options :operation :transpose)
+                    :body kernel-body :arguments arguments
+                    :preconditions (body/required-preconditions kernel-body)
+                    :scalar-bindings (scheduled/derive-scalar-bindings kernel-body arguments)
+                    :effects {:kind :layout-transform
+                              :uses (scheduled/derive-uses kernel-body arguments)}
+                    :legality {:kind :dense-affine-transpose}
+                    :numerics {:mode :exact :policy :layout-permutation}})]
+    (target/emit-artifact kernel-name scheduled target-dialect
+                          {:parameter-names {input "input_data" output "output_data"
+                                             :layout-rows "rows" :layout-cols "cols"}})))

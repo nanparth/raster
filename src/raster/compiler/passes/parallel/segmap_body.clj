@@ -236,6 +236,12 @@
                                     :group-count [(launch/maximum 1 (launch/ceil-div '_n_bound workgroup-size))]}))
         extent-preconditions (if sequential-effects? [] [{:expression '_n_bound :op :>= :value 0}])
         scalar-guard (body/->Guard :map-active [])
+        sequential-header (when sequential-effects?
+                            (body/->ForLoop
+                             (body/value index :long)
+                             (body/index-cast 0 :long :exact)
+                             (body/index-cast '_n_bound :long :exact)
+                             1 [] [] [] {:association :ordered :source-order true}))
         strict-effects? (soac-dialect/strict-effect-scalar-policy? effects)
         lowerer (scalar-expression/make-lowerer
                  (cond-> {:array-types array-types :scalar-types scalar-types
@@ -271,7 +277,16 @@
          {:substitutions {} :operations [] :environment base-environment}
          locals))
         lowered-state
-        ((if sequential-effects? (fn [_ f] (f)) (:with-varying-index-region lowerer))
+        ((if sequential-effects?
+           (fn [region f]
+             ;; The sequential owner executes a real outer ForLoop, not an active
+             ;; hardware-index guard. Reconstruct its actual ABI/header before source
+             ;; lowering; collected nested obligations survive lexical restoration.
+             ((:with-initial-index-region lowerer)
+              (select-keys region [:parameters :indices :launch :required-preconditions])
+              #((:with-loop-index lowerer) index (:lower sequential-header)
+                (:upper sequential-header) :exclusive f)))
+           (:with-varying-index-region lowerer))
          {:parameters parameters :indices indices :launch launch-spec :masks base-masks
           :guard scalar-guard :index-definitions [] :required-preconditions extent-preconditions}
          (fn []
@@ -653,15 +668,8 @@
         scalar-operations (:scalar-operations lowered-state)
         scheduled-operations
         (if sequential-effects?
-          [(body/->ForLoop
-            (body/value index :long)
-            (body/index-cast 0 :long :exact)
-            (body/index-cast '_n_bound :long :exact)
-            1
-            []
-            (conj scalar-operations (body/->Yield []))
-            []
-            {:association :ordered :source-order true})]
+          [(assoc sequential-header :operations
+                  (conj scalar-operations (body/->Yield [])))]
           ;; The physical launch is padded to a workgroup multiple. Guard the complete logical
           ;; iteration, not only its loads/stores: checked casts and arithmetic in ScalarCompute
           ;; also carry observable exceptional control and must not run for padding lanes.

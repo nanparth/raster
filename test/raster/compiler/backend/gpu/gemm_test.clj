@@ -712,3 +712,55 @@
     (is (re-find #"long mn" (:source combine)))
     (is (every? #(= :identity (:conversion %))
                 (get-in combine [:attributes :scheduled-kernel-body :scalar-bindings])))))
+
+
+(deftest scalar-matrix-schedules-transport-the-actual-body-contract
+  (doseq [variant [:nn :nt :tn :tt]]
+    (let [g (dispatch/alternative (emitted variant) :f32-scalar)
+          artifact (get-in g [:nodes 0 :operation])
+          scheduled (artifact/attribute artifact :scheduled-kernel-body)
+          required (body/required-preconditions (:body scheduled))]
+      (is (seq required) "this is a conditional portable body, not an empty contract fixture")
+      (is (= required (:preconditions scheduled)))
+      (is (= required (:preconditions artifact)))
+      (is (= artifact (scheduled-body/validate-artifact-projection! scheduled artifact)))
+      (doseq [i (range (count required))]
+        (let [omitted (vec (concat (take i required) (drop (inc i) required)))]
+          (try
+            (scheduled-body/validate! (assoc scheduled :preconditions omitted))
+            (is false "each actual body requirement remains mandatory")
+            (catch clojure.lang.ExceptionInfo e
+              (is (= :scheduled-kernel-body-required-preconditions (:reason (ex-data e))))))))
+      (try
+        (scheduled-body/validate!
+         (assoc-in scheduled [:preconditions 0 :value] -1))
+        (is false "a same-length contradictory schedule does not replace the body contract")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :scheduled-kernel-body-required-preconditions (:reason (ex-data e))))))
+      (is (true? (precondition/check! required {'m 3 'n 2 'k 4 '_nseg 6})))
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (precondition/check! required {'m 0 'n 2 'k 4 '_nseg 6})))
+      (let [{:keys [buffers scalar-values]}
+            (executable/graph-bindings g (arguments 3 2 -1))]
+        (let [checked (graph-call/make g buffers scalar-values)
+              reduction-artifact (first (keep (fn [node]
+                                                (let [operation (:operation node)
+                                                      kernel (get-in operation [:attributes :scheduled-kernel-body :body])]
+                                                  (when (some #(and (instance? raster.compiler.ir.kernel_body.ForLoop %)
+                                                                    (= 'l (get-in % [:index :id])))
+                                                              (tree-seq coll? seq kernel)) operation)))
+                                              (:nodes g)))
+              reduction-body (get-in reduction-artifact [:attributes :scheduled-kernel-body :body])
+              k-slot (first (keep-indexed #(when (= 'k (:name %2)) %1) (:abi reduction-artifact)))
+              column-loop (first (filter #(and (instance? raster.compiler.ir.kernel_body.ForLoop %)
+                                               (= 'l (get-in % [:index :id])))
+                                         (tree-seq coll? seq reduction-body)))]
+          (is (some? reduction-artifact))
+          (is (some? checked) "opaque graph handles preserve the neutral empty-reduction arithmetic contract")
+          (is (= {:type :int :value -1} (get scalar-values :k)))
+          (is (integer? k-slot))
+          (when (integer? k-slot) (is (= :k (nth (:arguments reduction-artifact) k-slot))))
+          (is (some? column-loop))
+          ;; Physical input realization is a separate shape/capacity contract. The
+          ;; actual retained k remains negative here; it is not replaced or clamped.
+          (is (some #{'k} (tree-seq coll? seq (:upper column-loop)))))))))

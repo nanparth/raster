@@ -261,6 +261,7 @@
         (scheduled-body/make
          {:source source
           :body body
+          :preconditions (kbody/required-preconditions body)
           :arguments arguments
           :scalar-bindings (scheduled-body/derive-scalar-bindings body arguments scalar-types)
           :effects (assoc effects :uses uses)

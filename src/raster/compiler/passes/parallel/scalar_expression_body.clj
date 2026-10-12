@@ -365,14 +365,27 @@
                     ;; Collect every actual child/prefix obligation before installing the binder.
                     _ (require-index! lower-bound)
                     _ (require-index! upper-bound)
-                    info (body/entered-for-loop-info
-                          lower-bound (body/conditional-index-info upper-bound saved-values) 1 mode)]
+                    header-values (with-meta saved-values
+                                    (assoc (meta saved-values) :required-preconditions
+                                           (vec (distinct (concat (:required-preconditions (meta saved-values))
+                                                                  @required)))))
+                    lower-info (body/conditional-index-info lower-bound header-values)
+                    upper-info (body/conditional-index-info upper-bound header-values)
+                    info (or (body/entered-for-loop-info lower-bound upper-info 1 mode)
+                             ;; Nonzero static starts have the same checked exclusive entry
+                             ;; range as the final ForLoop, without an invented ABI identity.
+                             (when (= :exclusive mode)
+                               (when-let [range (scalar-range/exclusive-positive-loop-entry-range
+                                                  (:range lower-info) (:range upper-info) 1 :long)]
+                                 {:type :long :range range})))]
                 (when info
                   (swap! conditional-values
                          (fn [values]
                            (let [upper (get-in info [:entered-loop-index :upper])]
                              (with-meta (assoc values index
-                                          (cond-> info upper (assoc-in [:entered-loop-index :index] index)))
+                                          (cond-> info
+                                            (:entered-loop-index info) (assoc-in [:entered-loop-index :index] index)
+                                            (:conditional-integer info) (assoc-in [:conditional-integer :domain-index] index)))
                                (cond-> (meta values)
                                  upper (update :entered-loop-domains (fnil conj [])
                                          {:index index :upper upper}))))))
@@ -394,6 +407,9 @@
                 (try (f)
                      (finally (reset! conditional-values saved-values)
                               (reset! value-ranges saved-ranges)))))
+
+            (with-initial-index-region [region f]
+              (with-reconstructed-index-region body/initial-scheduled-index-info region f))
 
             (with-index-region [region f]
               (with-reconstructed-index-region body/scheduled-index-region-info region f))
@@ -968,7 +984,13 @@
                                                     (map vector carries dtypes))
                                   substitutions (into {index loop-index}
                                                       (map vector accumulators carries))
-                                  local-state
+                                  lower-bound (lower-index (:lower attributes 0) (set (keys env)))
+                                  upper-bound (lower-index (:extent attributes) (set (keys env)))
+                                  loop-body
+                                  (with-loop-index loop-index lower-bound upper-bound
+                                    (:upper-bound attributes :exclusive)
+                                    (fn []
+                                      (let [local-state
                                   (reduce
                                    (fn [{:keys [operations substitutions environment]} local]
                                      (let [local-type (canon-type (:dtype local))
@@ -991,12 +1013,15 @@
                                   (lower-product-results
                                    (mapv #(util/subst-syms (:substitutions local-state) %)
                                          body-results)
-                                   dtypes (:environment local-state))
+                                   dtypes (:environment local-state))]
+                                        {:local-state local-state :updates updates})))
+                                  local-state (:local-state loop-body)
+                                  updates (:updates loop-body)
                                   loop-operation
                                   (body/->ForLoop
                                    (body/value loop-index :long)
-                                   (lower-index (:lower attributes 0) (set (keys env)))
-                                   (lower-index (:extent attributes) (set (keys env)))
+                                   lower-bound
+                                   upper-bound
                                    1
                                    (mapv (fn [carry initial]
                                            (body/->LoopArg (body/value carry (:type initial))
@@ -1419,6 +1444,7 @@
        ;; Store and atomic destinations use the same private coordinate facts as loads.
        :require-index require-index!
        :with-loop-index with-loop-index
+       :with-initial-index-region with-initial-index-region
        :with-index-region with-index-region
        :with-varying-index-region with-varying-index-region
        :compute (fn [operator result-type arguments options]

@@ -176,13 +176,19 @@
                                        (contains? #{:int :long} (:dtype %)))
                                  (get-in original [:body :parameters])))
         condition {:expression (:id parameter) :op :> :value 0}
+        conditions (vec (distinct (conj (kernel-body/required-preconditions (:body original)) condition)))
+        conditioned-body (assoc-in (:body original) [:attributes :required-preconditions] conditions)
         conditioned (scheduled-body/validate!
-                     (assoc original :preconditions [condition]))
+                     (assoc original :body conditioned-body :preconditions conditions))
         restored (compiler-record-round-trip conditioned)]
     (is (some? parameter) "the fixture must retain its integral launch bound")
     (is (= conditioned restored))
-    (is (= [condition] (:preconditions restored)))
-    (is (= restored (scheduled-body/validate! restored)))))
+    (is (= conditions (:preconditions restored)))
+    (is (= conditions (kernel-body/required-preconditions (:body restored))))
+    (is (= restored (scheduled-body/validate! restored)))
+    (is (= :scheduled-kernel-body-required-preconditions
+           (reason-of #(scheduled-body/validate!
+                        (assoc conditioned :preconditions [condition])))))))
 
 (deftest envelope-authentication-fails-before-record-reconstruction
   (let [envelope (artifact/seal identity @compilation)]

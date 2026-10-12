@@ -4,6 +4,7 @@
             [raster.compiler.backend.gpu.paged-kv-append :as emit]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-graph :as graph]
             [raster.compiler.ir.paged-kv-append :as append]
             [raster.compiler.passes.parallel.paged-kv-append-route :as route]))
@@ -89,3 +90,34 @@
       (is (= target (get-in artifact [:attributes :target-dialect])))
       (is (str/includes? (:source artifact) "extern \"C\" __global__ void"))
       (is (str/includes? (:source artifact) "rstr_append_slot_bounded")))))
+
+
+(deftest append-generated-component-prefix-widens-before-arithmetic
+  (let [{:keys [artifact]} (route/route! (problem))
+        kernel (get-in artifact [:attributes :kernel-body])
+        definition (first (filter #(= :append-component (:id %)) (:indices kernel)))
+        expression (:expression definition)
+        width (first (get-in kernel [:launch :workgroup-size]))]
+    (is (= :add (:op expression)))
+    (is (every? #(and (instance? raster.compiler.ir.kernel_body.IndexCast %)
+                     (= :long (:dtype %)) (= :exact (:overflow %)))
+                [(get-in expression [:arguments 0 :arguments 0])
+                 (get-in expression [:arguments 0 :arguments 1])
+                 (get-in expression [:arguments 1])]))
+    (is (= [:float :float :int :half :half] (mapv :dtype (:abi artifact))))
+    (is (= kernel (body/validate! kernel)))
+    (is (= :kernel-body-index-precondition
+           (reason #(body/validate!
+                     (update kernel :indices
+                             (fn [indices]
+                               (mapv (fn [index]
+                                       (if (= :append-component (:id index))
+                                         (assoc index :expression
+                                                (body/index-cast
+                                                 (body/expression :add
+                                                   (body/expression :mul :append-group-x width)
+                                                   :append-lane-x) :long :exact)) index)) indices)))))))
+    (is (= :kernel-launch-index-range
+           (reason #(body/validate-launch-index-ranges!
+                     kernel (launch/geometry {:workgroup-size [width 1]
+                                              :group-count [(+ 2 (long Integer/MAX_VALUE)) 3]})))))))

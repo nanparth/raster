@@ -424,7 +424,8 @@
     [(load-value 'attention-offset-zero :int (:row-offsets visibility) [0])
      (load-value 'raw-attention-begin :int (:row-offsets visibility) ['query-token])
      (load-value 'raw-attention-end :int (:row-offsets visibility)
-                 [(body/expression :add 'query-token 1)])
+                 [(body/expression :add (body/index-cast 'query-token :long :exact)
+                                        (body/index-cast 1 :long :exact))])
      (compute 'attention-zero-valid :predicate
               (expr :eq :predicate 'attention-offset-zero (lit 0 :int)))
      (compute 'attention-begin-nonnegative :predicate
@@ -1331,15 +1332,16 @@
                  'value-component
                  (body/expression :add
                                   (body/expression :mul
-                                                   'value-component-tile workgroup-size)
-                                  'lane))
+                                                   (body/index-cast 'value-component-tile :long :exact)
+                                                   (body/index-cast workgroup-size :long :exact))
+                                  (body/index-cast 'lane :long :exact)))
                 (body/->IndexCompute
                  'safe-value-component
                  (body/expression :min 'value-component
-                                  (dec (:value-head-dim problem))))]
+                                  (body/index-cast (dec (:value-head-dim problem)) :long :exact)))]
       :masks [(body/->Mask :active-value-component
                            [(body/predicate :lt 'value-component
-                                            (:value-head-dim problem))])]
+                                            (body/index-cast (:value-head-dim problem) :long :exact))])]
       :operations operations
       :schedule {:strategy :one-work-item-per-output-component
                  :score-reduction :sequential

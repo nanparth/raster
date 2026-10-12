@@ -100,13 +100,23 @@
                                    (update :results #(util/subst-syms replacements %)))
                         env (into {} (concat (map vector left types) (map vector right types)))]
                     ((:lower-region lowerer) region types combine-types env)))]
-    {:element ((:lower-region lowerer) element-region types element-types index-types)
+    {:lower-element (fn [region]
+                      (let [lower #((:lower-region lowerer) element-region types element-types index-types)]
+                        (if region ((:with-index-region lowerer) region lower) (lower))))
+     :required-preconditions (:required-preconditions lowerer)
      :combine combine :lower-index lower-index :index-types index-types
      :axes (conj (mapv (juxt :name :bound) segments) [column width])}))
 
 (defn lower
   "Lower the exact typed element into production instructions. Storage admission
    independently derives original structural reads from the same private inputs."
+  [segred options decline!]
+  (let [prepared (lower-regions false segred options decline!)]
+    (assoc prepared :element ((:lower-element prepared) nil))))
+
+(defn prepare-production
+  "Prepare the original typed region, deferring its element until the owner has
+   constructed the actual lexical scheduling records. Combine lowering stays outside it."
   [segred options decline!]
   (lower-regions false segred options decline!))
 
@@ -120,7 +130,8 @@
    not an independent execution certificate; the segment guard and lane loop establish the active
    domains when the body is scheduled."
   [segred options decline!]
-  (let [{:keys [element combine index-types axes]} (lower-regions true segred options decline!)
+  (let [{:keys [lower-element combine index-types axes]} (lower-regions true segred options decline!)
+        element (lower-element nil)
         _ (when (> (count axes) 6)
             (decline! :indexing-map-rank
                       "product indexing-map search is bounded to six semantic axes"

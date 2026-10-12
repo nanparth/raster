@@ -599,7 +599,8 @@
                                       (launch/maximum 0 (launch/sum '_nseg -1)))
                       (launch/product (launch/minimum '_nseg 1) 16))
                      :op :<= :value Long/MAX_VALUE}]
-      (is (some #{redundant} requirements))
+      (is (not-any? #{redundant} requirements)
+          "the independently bounded prefix does not require this loose symbolic cap")
       ;; For integer N>=0, 0<=min(N,1)<=1 and 0<=min(3,max(0,N-1))<=3,
       ;; so this exact earlier source-prefix cap is <=48 without the condition.
       (doseq [n [0 1 2 32 Long/MAX_VALUE]]
@@ -612,10 +613,6 @@
             ;; Closed positive constant divisions independently bound i<=3,j<=7,l<=15.
             ;; Every address prefix fits Long even without this outer activation condition.
             (is (body/kernel-body? (body/validate! changed)))
-            (= redundant condition)
-            (is (= :kernel-body-index-precondition
-                   (try (body/validate! changed) :accepted
-                        (catch clojure.lang.ExceptionInfo exception (:reason (ex-data exception))))))
             :else (is (thrown? clojure.lang.ExceptionInfo (body/validate! changed)))))))
     (is (artifact/kernel-artifact? (:artifact (route/validate-descriptor routed))))
     (doseq [changed [(assoc-in kernel [:operations 1]
@@ -631,12 +628,15 @@
                     (select-keys (ex-data exception) [:reason :field]))))))))
 
 (deftest scoped-remainder-ranges-retain-the-actual-divisor-width
-  (doseq [[m-type expected] [[:int (dec Integer/MAX_VALUE)] [:long (dec Long/MAX_VALUE)]]]
+  (doseq [m-type [:int :long]]
     (let [verified (facts/contraction-facts matvec :dtype :double)
           operation (lower/contract-form->segred matvec :dtype :double :facts verified)
           plan (schedule/plan-portable-body verified operation nil
                                            {:scalar-types {'m m-type 'k :int}})
           kernel (:body plan)
+          workgroup (first (get-in kernel [:launch :workgroup-size]))
+          hardware-cap (+ (* (bigint Integer/MAX_VALUE) workgroup) (dec workgroup))
+          expected (min (dec (if (= :int m-type) Integer/MAX_VALUE Long/MAX_VALUE)) hardware-cap)
           branch (get-in kernel [:operations 1])
           definitions (vec (take-while #(instance? raster.compiler.ir.kernel_body.IndexCompute %)
                                        (:then-operations branch)))

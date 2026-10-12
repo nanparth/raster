@@ -19,6 +19,7 @@
    operation with no alternate emitter."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.kernel-graph :as kernel-graph]
+            [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.passes.parallel.segop-lower-pass :as slp]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
@@ -125,9 +126,21 @@
     (is (= :typed-soac (get-in operation [:algorithm-dialect])))
     (is (= :unique (:write-conflict operation)))
     (let [kernel (first (:kernels emitted))
-          kernel-source (:source kernel)]
+          kernel-source (:source kernel)
+          kernel-body (get-in kernel [:attributes :kernel-body])
+          operations (tree-seq coll? seq (:operations kernel-body))
+          addition (first (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarCompute %)
+                                       (= :+ (get-in % [:expression :op]))
+                                       (= #{'base 'i} (set (get-in % [:expression :arguments])))) operations))
+          stores (filter #(and (instance? raster.compiler.ir.kernel_body.ScalarStore %)
+                               (= 'out (:buffer %))) operations)]
       (is (= :kernel-body (get-in kernel [:attributes :emission-route])))
-      (is (re-find #"out_\[.*base.*rstr_i" kernel-source))
+      (is (body/kernel-body? kernel-body))
+      (is (some? addition) "the actual typed base+i SSA computation is retained")
+      (is (= :trap (get-in addition [:expression :options :overflow])))
+      (is (= 1 (count stores)))
+      (is (= [(get-in addition [:result :id])] (:coordinates (first stores))))
+      (is (re-find #"rstr_trap_add_i64" kernel-source))
       (is (not (re-find #"inout_result\[idx\] =" kernel-source))
           "a unique scatter must not acquire a second implicit dense store"))))
 

@@ -162,7 +162,7 @@
                          (filter #(= :read (:access %)) uses))}))
 
 (defn- element-operations
-  [operation context]
+  [operation context initial-region]
   (let [{:keys [result-type pointer-ids scalar-ids scalar-type scan-algebra]} context
         source-index (:name (segop/seg-space-reduced-dim (:space operation)))
         ;; Algebra owns reassociation evidence; the scheduled operator owns the concrete typed
@@ -188,8 +188,9 @@
                   :arrays (set pointer-ids) :index-scope index-scope
                   :lower-index lower-index :predicate nil
                   :id-prefix "scan-element" :decline! decline!})
-        lowered ((:lower lowerer) expression result-type
-                                    (assoc scalar-types 'scan-index :long))]
+        lowered ((:with-initial-index-region lowerer) initial-region
+                 #((:lower lowerer) expression result-type
+                    (assoc scalar-types 'scan-index :long)))]
     [(body/->ScalarCompute
       (body/value 'scan-element-active :predicate)
       (body/scalar-expression :lt :predicate
@@ -238,7 +239,13 @@
                       (body/expression :min (global-index workgroup-size)
                                        (body/expression :sub (global-index '_n_bound)
                                                         'scan-block-base)))])))
-        initial (element-operations operation context)
+        group-count (if (= :single phase) 1 (get-in operation [:grid :num-blocks]))
+        launch-spec (launch/spec
+                     {:workgroup-size [workgroup-size]
+                      :group-count [group-count]
+                      :shared-memory-bytes (* workgroup-size (dtype/bytes-of result-type))})
+        initial (element-operations operation context
+                                    {:parameters parameters :indices indices :launch launch-spec})
         stages (scan-stages scratch result-type scan-algebra identity workgroup-size)
         tail (vec
               (concat
@@ -255,7 +262,7 @@
                  [(body/->ScalarStore output [0]
                                       identity
                                       :scan-first-lane)])))
-        group-count (if (= :single phase) 1 (get-in operation [:grid :num-blocks]))]
+]
     (body/make
      {:id [:segscan (:id operation) phase :portable-workgroup]
       :parameters parameters :stable-reads stable-reads
@@ -271,10 +278,7 @@
                                stages tail))
       :schedule {:strategy :workgroup-hillis-steele :association :certified
                  :phase phase :workgroup-size workgroup-size :operator operator}
-      :launch (launch/spec
-               {:workgroup-size [workgroup-size]
-                :group-count [group-count]
-                :shared-memory-bytes (* workgroup-size (dtype/bytes-of result-type))})
+      :launch launch-spec
       :provenance {:dialect :kernel-body :source-dialect :segscan
                    :segop-id (:id operation)}
       :attributes {:kind :portable-segscan :phase phase :scan-mode scan-mode

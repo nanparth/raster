@@ -8,6 +8,7 @@
             [raster.compiler.ir.contraction-facts :as facts]
             [raster.compiler.ir.kernel-call :as call]
             [raster.compiler.ir.kernel-body :as kernel-body]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.contraction-closure :as closure]
             [raster.compiler.ir.soac-dialect :as soac]
@@ -21,11 +22,13 @@
             [raster.gpu.link :as link]
             [raster.compiler.passes.parallel.staged-scalar-body :as staged]))
 
-(defn three-stage-facts []
-  (let [a-map (am/of-axes '[[i 2] [blk 2] [sub 3] [t 4]])
+(defn three-stage-facts
+  ([] (three-stage-facts 2))
+  ([rows]
+  (let [a-map (am/of-axes [['i rows] ['blk 2] ['sub 3] ['t 4]])
         b-map (am/of-axes '[[j 3] [blk 2] [sub 3] [t 4]])]
     (facts/from-components
-     {:out 'out :free-axes '[[i 2] [j 3]] :contract-axes '[[blk 2] [sub 3] [t 4]]
+     {:out 'out :free-axes [['i rows] ['j 3]] :contract-axes '[[blk 2] [sub 3] [t 4]]
       :dtype :float
       :body (list 'raster.numeric/* (list 'aget 'a (am/index-expr a-map))
                   (list 'aget 'b (am/index-expr b-map)))
@@ -36,7 +39,7 @@
                        :lift '(* inner (aget weights _))
                        :operands [{:sym 'weights :dtype :float
                                    :map (am/of-axes '[[j 3] [blk 2] [sub 3]])}]}
-                      {:axis 't :extent 4 :dtype :float :init 0.0}]}})))
+                      {:axis 't :extent 4 :dtype :float :init 0.0}]}}))))
 
 (deftest public-stages-retain-checked-integer-arithmetic
   ;; Compile only: deliberately overflowing a device trap would poison the shared device context.
@@ -335,3 +338,62 @@
                    (finally ((op 'destroy-prepared!) prepared))))
             (is (= (reference a b weights scale) (vec ((op 'buffer->array) (peek buffers)))))
             (finally (doseq [buffer (reverse buffers)] ((op 'free-buffer!) buffer)))))))))
+
+
+(deftest staged-generated-geometry-preserves-admitted-source-widths
+  (let [scheduled (staged/lower (three-stage-facts) :scalar-types {'scale :float})
+        kernel (:body scheduled)
+        segment (get-in kernel [:indices 2 :expression])
+        wide-axes (drop 3 (:indices kernel))
+        projections (take 2 (:operations kernel))
+        initial-values (:values (kernel-body/initial-scheduled-index-info kernel))
+        scalar-info (ns-resolve 'raster.compiler.ir.kernel-body 'scalar-info!)
+        loops (filter #(instance? raster.compiler.ir.kernel_body.ForLoop %)
+                      (tree-seq coll? seq (:operations kernel)))]
+    (is (= :add (:op segment)))
+    (is (every? #(and (instance? raster.compiler.ir.kernel_body.IndexCast %)
+                     (= :long (:dtype %)) (= :exact (:overflow %)))
+                [(get-in segment [:arguments 0 :arguments 0])
+                 (get-in segment [:arguments 0 :arguments 1])
+                 (get-in segment [:arguments 1])]))
+    (is (= '[i j] (mapv #(get-in % [:result :id]) projections)))
+    (doseq [[definition projection extent] (map vector wide-axes projections [2 3])]
+      (is (= :mod (get-in definition [:expression :op])))
+      (is (= extent (get-in definition [:expression :arguments 1 :argument])))
+      (is (= :int (get-in projection [:result :type])))
+      (is (= :cast (get-in projection [:expression :op])))
+      (is (= [(:id definition)] (get-in projection [:expression :arguments])))
+      (is (= {:rounding :exact :overflow :wrap} (get-in projection [:expression :options])))
+      (let [wide-info (get initial-values (:id definition))
+            projected-info (scalar-info (:expression projection) initial-values)]
+        (is (= :long (:type wide-info)))
+        (is (= [0 (dec extent)] ((juxt :lower :upper) (:range wide-info))))
+        (is (= :int (:type projected-info)))
+        (is (= (:range wide-info) (:range projected-info)))
+        (is (not (:unresolved-index-address-origin? projected-info)))))
+    (is (= '#{blk sub t} (set (map #(get-in % [:index :id]) loops))))
+    (is (every? #(= :int (get-in % [:index :type])) loops))
+    (is (every? #(= :float (get-in % [:iter-args 0 :binding :type])) loops))
+    (is (= kernel (kernel-body/validate! kernel)))
+    (is (= {'a 48 'b 72 'weights 18} (select-keys (get-in scheduled [:legality :storage-elements]) '[a b weights])))
+    (is (= 6 (get-in scheduled [:legality :output-elements])))
+    (is (= :kernel-launch-index-range
+           (try (kernel-body/validate-launch-index-ranges!
+                 kernel (launch/geometry {:workgroup-size [64]
+                                          :group-count [(+ 2 (long Integer/MAX_VALUE))]}))
+                nil
+                (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+
+(deftest staged-axis-projections-require-the-real-static-admission-bound
+  ;; Rebuild the actual operand map together with the free extent: a stale map
+  ;; would test lexical closure instead of the schedule's representability limit.
+  (doseq [[extent expected] [[0 :static-domain] [-1 :static-domain]
+                            [(inc (long Integer/MAX_VALUE)) :static-floating-domain]
+                            [Integer/MAX_VALUE :static-floating-domain]]]
+    (let [failure (try (staged/analyze! (if (pos? extent) (three-stage-facts extent)
+                                         (assoc (three-stage-facts) :free-axes [['i extent] ['j 3]]))
+                                   :scalar-types {'scale :float})
+                       nil
+                       (catch clojure.lang.ExceptionInfo error (ex-data error)))]
+      (is (= :staged-scalar-body-declined (:reason failure)))
+      (is (= expected (:missing-rule failure)) (pr-str failure)))))

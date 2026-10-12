@@ -99,7 +99,8 @@
               (map #(body/->KernelParameter % :scalar (get scalar-types %) [] nil nil :parameter)
                    scalars)
               [(body/->KernelParameter '_n_bound :scalar rows-type [] nil nil :bound)]))
-        {:keys [element combine lower-index]} (regions/lower segred options decline!)
+        {:keys [lower-element combine lower-index required-preconditions]}
+        (regions/prepare-production segred options decline!)
         row-factors (when-not single-segment?
                       (mapv #(index-expression/to-launch-expression
                               (lower-index (:bound %) #{}) decline!)
@@ -144,6 +145,28 @@
         carries (ids "product-carry")
         lane-results (ids "product-lane-result")
         scratches (ids "product-scratch")
+        indices [(body/->IndexBinding segment-index :group 0)
+                 (body/->IndexBinding 'product-lane :local 0)]
+        launch-spec (launch/spec {:workgroup-size [wg]
+                                  :group-count [(launch/maximum 1 (launch/runtime-value '_n_bound))]
+                                  :shared-memory-bytes scratch-bytes})
+        active-condition (body/->ScalarCompute
+                          (body/value :product-active :predicate)
+                          (body/scalar-expression :lt :predicate
+                            [(body/cast-expression segment-index :long :exact :exact)
+                             (body/cast-expression '_n_bound :long :exact :exact)]))
+        lane-loop (body/->ForLoop
+                   (body/value column :long) (body/index-cast 'product-lane :long :exact)
+                   (lower-index width #{}) wg
+                   (mapv #(body/->LoopArg (body/value %1 %2) %3) carries types neutrals)
+                   [] (mapv body/value lane-results types) {})
+        active-branch (body/->IfRegion :product-active
+                        (conj (vec segment-axis-computes) lane-loop)
+                        [(body/->Yield [])] [])
+        element (lower-element {:parameters parameters :indices indices :launch launch-spec
+                                :condition-definition active-condition :if-region active-branch
+                                :index-definitions segment-axis-computes :inner-loop lane-loop
+                                :required-preconditions axis-domain-preconditions})
         lane-update (combine carries (:results element))
         barrier #(body/->WorkgroupBarrier :workgroup #{:workgroup} :acquire-release
                                           (body/full-participation))
@@ -182,25 +205,15 @@
           :allocations (mapv #(body/->WorkgroupAllocation %1 %2 [wg]
                                                          (layout/row-major [wg] %2)
                                                          (dtype/bytes-of %2)) scratches types)
-          :indices [(body/->IndexBinding segment-index :group 0)
-                    (body/->IndexBinding 'product-lane :local 0)]
+          :indices indices
           :operations
-          [(body/->ScalarCompute
-            (body/value :product-active :predicate)
-            (body/scalar-expression :lt :predicate
-                                    [(body/cast-expression segment-index :long :exact :exact)
-                                     (body/cast-expression '_n_bound :long :exact :exact)]))
-           (body/->IfRegion
-            :product-active
+          [active-condition
+           (assoc active-branch :then-operations
             (conj (vec (concat
                 segment-axis-computes
-                [(body/->ForLoop
-                  (body/value column :long) (body/index-cast 'product-lane :long :exact)
-                  (lower-index width #{}) wg
-                  (mapv #(body/->LoopArg (body/value %1 %2) %3) carries types neutrals)
-                  (vec (concat (:operations element) (:operations lane-update)
-                               [(body/->Yield (:results lane-update))]))
-                  (mapv body/value lane-results types) {})]
+                [(assoc lane-loop :operations
+                   (vec (concat (:operations element) (:operations lane-update)
+                                [(body/->Yield (:results lane-update))])))]
                 (map #(body/->ScalarStore %1 ['product-lane] %2 nil) scratches lane-results)
                 [(barrier)] tree
                 [(body/->ScalarCompute (body/value :product-writer :predicate)
@@ -215,15 +228,14 @@
                              (body/->ScalarStore result [segment-index] value nil)]))
                         components scratches (ids "product-final"))) (body/->Yield []))
                   [(body/->Yield [])] [])])) (body/->Yield []))
-            [(body/->Yield [])] [])]
+            )]
           :schedule {:strategy :product-workgroup-tree :workgroup-size wg}
-          :launch (launch/spec {:workgroup-size [wg]
-                                :group-count [(launch/maximum 1 (launch/runtime-value '_n_bound))]
-                                :shared-memory-bytes scratch-bytes})
+          :launch launch-spec
           :provenance {:dialect :kernel-body :source-dialect :segred :segop-id (:id segred)}
-          :attributes (cond-> {:kind :product-reduction :component-dtypes types}
-                        (seq axis-domain-preconditions)
-                        (assoc :required-preconditions axis-domain-preconditions))})]
+          :attributes {:kind :product-reduction :component-dtypes types
+                       :required-preconditions
+                       (vec (distinct (concat axis-domain-preconditions
+                                              (required-preconditions))))}})]
     {:kernel-body kernel-body :rows rows-argument
      :inputs inputs :outputs outputs :scalars scalars}))
 

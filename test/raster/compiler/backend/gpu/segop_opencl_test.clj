@@ -14,6 +14,7 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-body :as kernel-body]
+            [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.scalar-range :as scalar-range]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
@@ -3259,3 +3260,189 @@
     (is (= :kernel-body-index-precondition
            (reason-of #(kernel-body/validate! (assoc checked :operations (:operations guard)))))
         "an unguarded evaluated modulo cannot borrow the later lexical domain")))
+
+
+(deftest initial-schedule-scalar-proofs-replay-real-geometry-and-restore-scope
+  (let [launch (klaunch/spec {:workgroup-size [256] :group-count [1]})
+        indices [(kernel-body/->IndexBinding 'g :group 0)
+                 (kernel-body/->IndexBinding 'lane :local 0)
+                 (kernel-body/->IndexCompute
+                  'idx (kernel-body/expression :add
+                         (kernel-body/expression :mul
+                           (kernel-body/index-cast 'g :long :exact)
+                           (kernel-body/index-cast 256 :long :exact))
+                         (kernel-body/index-cast 'lane :long :exact)))]
+        lowerer (scalar-body/make-lowerer
+                 {:arrays #{} :array-types {} :scalar-types {'idx :long}
+                  :index-scope #{'idx} :lower-index (fn [x _] x)
+                  :decline! (fn [r m d] (throw (ex-info m (assoc d :missing-rule r))))})
+        compute #((:lower lowerer) '(+ idx (long 1)) :long {'idx :long})
+        inside ((:with-initial-index-region lowerer)
+                {:parameters [] :indices indices :launch launch} compute)
+        outside (compute)
+        expression (fn [lowered]
+                     (:expression (first (filter #(= (:result lowered) (get-in % [:result :id]))
+                                                 (:operations lowered)))))
+        checked (kernel-body/make
+                 {:id :real-initial-scope :indices indices :launch launch
+                  :operations (:operations inside)})]
+    (is (= :no-overflow (get-in (expression inside) [:options :overflow])))
+    (is (= :trap (get-in (expression outside) [:options :overflow]))
+        "initial facts cannot escape into later source lowering")
+    (is (= checked (kernel-body/validate! checked)))
+    (let [opaque ((:with-initial-index-region lowerer)
+                  {:parameters [(kernel-body/->KernelParameter 'idx :scalar :long [] nil nil :parameter)]
+                   :indices [] :launch launch} compute)]
+      (is (= :trap (get-in (expression opaque) [:options :overflow]))
+          "a full Long ABI scalar is not a hardware-coordinate proof"))
+    (doseq [bad [[(kernel-body/->IndexBinding 'g :unknown 0)]
+                 [(kernel-body/->IndexCompute 'idx (kernel-body/expression :add 'undefined 1))]]]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (kernel-body/initial-scheduled-index-info
+                    {:parameters [] :indices bad :launch launch}))))))
+
+
+(deftest initial-schedule-keeps-unsafe-prefix-ancestry-and-restores-after-throw
+  (let [launch (klaunch/spec {:workgroup-size [256] :group-count [1]})
+        bad-indices [(kernel-body/->IndexBinding 'g :group 0)
+                     (kernel-body/->IndexCompute
+                      'idx (kernel-body/index-cast
+                            (kernel-body/expression :mul 'g 256) :long :exact))]
+        info (kernel-body/initial-scheduled-index-info
+              {:parameters [] :indices bad-indices :launch launch})
+        lowerer (scalar-body/make-lowerer
+                 {:arrays #{} :array-types {} :scalar-types {'idx :long}
+                  :index-scope #{'idx} :lower-index (fn [x _] x)
+                  :decline! (fn [r m d] (throw (ex-info m (assoc d :missing-rule r))))})
+        lowered ((:with-initial-index-region lowerer)
+                 {:parameters [] :indices bad-indices :launch launch}
+                 #((:lower lowerer) '(+ idx (long 1)) :long {'idx :long}))]
+    (is (true? (get-in info [:values 'idx :unresolved-index-address-origin?])))
+    (try
+      (kernel-body/make
+       {:id :unsafe-initial-prefix :indices bad-indices :launch launch
+        :parameters [(kernel-body/->KernelParameter 'x :input :float [1] :global (layout/row-major [1] :float) :operand)]
+        :operations (conj (vec (:operations lowered))
+                          (kernel-body/->ScalarLoad (kernel-body/value 'loaded :float)
+                                                    'x [(:result lowered)] nil nil :cached))})
+      (is false "a final Long cast cannot certify an already unsafe Int address prefix")
+      (catch clojure.lang.ExceptionInfo e
+        (is (= :kernel-body-index-precondition (:reason (ex-data e)))))))
+  (let [launch (klaunch/spec {:workgroup-size [256] :group-count [1]})
+        indices [(kernel-body/->IndexBinding 'lane :local 0)
+                 (kernel-body/->IndexCompute 'idx (kernel-body/index-cast 'lane :long :exact))]
+        lowerer (scalar-body/make-lowerer
+                 {:arrays #{} :array-types {} :scalar-types {'idx :long}
+                  :index-scope #{'idx} :lower-index (fn [x _] x)
+                  :decline! (fn [r m d] (throw (ex-info m (assoc d :missing-rule r))))})]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scope callback"
+          ((:with-initial-index-region lowerer)
+           {:parameters [] :indices indices :launch launch}
+           #(throw (ex-info "scope callback" {})))))
+    (let [outside ((:lower lowerer) '(+ idx (long 1)) :long {'idx :long})]
+      (let [operation (first (filter #(= (:result outside) (get-in % [:result :id]))
+                                     (:operations outside)))]
+        (is (= :+ (get-in operation [:expression :op])))
+        (is (= :trap (get-in operation [:expression :options :overflow])))))))
+
+(deftest independently-bounded-products-retain-every-executed-child-cap
+  (let [parameters (mapv #(kernel-body/->KernelParameter % :scalar :long [] nil nil :parameter)
+                         '[N rows head-dim n-q])
+        indices [(kernel-body/->IndexBinding 'raw-group :group 0)
+                 (kernel-body/->IndexCompute 'idx (kernel-body/index-cast 'raw-group :long :exact))]
+        launch (klaunch/spec {:workgroup-size [8] :group-count [1]})
+        condition (kernel-body/->ScalarCompute (kernel-body/value 'active :predicate)
+                    (kernel-body/scalar-expression :lt :predicate ['idx 'N]))
+        definitions [(kernel-body/->IndexCompute 'remainder
+                        (kernel-body/expression :mod
+                          (kernel-body/expression :floor-div 'idx 'head-dim) 'rows))]
+        branch (kernel-body/->IfRegion 'active definitions [(kernel-body/->Yield [])] [])
+        domains (vec (distinct (concat (kernel-body/quotient-domain-preconditions 'N 'head-dim)
+                                      (kernel-body/quotient-domain-preconditions 'N 'rows))))
+        region {:parameters parameters :indices indices :launch launch
+                :condition-definition condition :if-region branch :index-definitions definitions
+                :required-preconditions domains}
+        lowerer (scalar-body/make-lowerer
+                 {:arrays #{} :lower-index (fn [expression _] expression)
+                  :scalar-types (zipmap '[N rows head-dim n-q idx remainder] (repeat :long))
+                  :id-prefix "independent-product" :decline! (fn [rule message data]
+                                                              (throw (ex-info message (assoc data :rule rule))))})
+        lowered ((:with-index-region lowerer) region
+                 #((:lower lowerer) '(* remainder (* n-q head-dim)) :long {}))
+        requirements ((:required-preconditions lowerer))
+        kernel (kernel-body/make {:id :independent-nonnegative-product :parameters parameters
+                          :indices indices :launch launch :attributes {:required-preconditions requirements}
+                          :operations [condition (assoc branch :then-operations
+                                                  (into definitions (concat (:operations lowered)
+                                                                            [(kernel-body/->Yield [])])))]})
+        product (first (filter #(= (:result lowered) (get-in % [:result :id]))
+                               (:operations lowered)))]
+    (is (= :* (get-in product [:expression :op])))
+    (is (= :no-overflow (get-in product [:expression :options :overflow])))
+    (is (kernel-body/kernel-body? (kernel-body/validate! kernel)))
+    (is (some? (:source (scalar-emitter/emit-scalar-module "independent_product" kernel :opencl-portable))))
+    (is (true? (precondition/check! requirements {'N 3 'rows 3 'head-dim 1 'n-q 2})))
+    ;; Child n-q*head-dim fits at MAX, but the actual remainder may be two.
+    ;; The separately transported parent cap must reject 2*MAX before execution.
+    (is (thrown? ArithmeticException
+                 (precondition/check! requirements {'N 3 'rows 3 'head-dim 1 'n-q Long/MAX_VALUE})))
+    (is (thrown? ArithmeticException
+                 (precondition/check! requirements {'N 1 'rows 1 'head-dim 2 'n-q Long/MAX_VALUE}))
+        "a zero parent remainder cannot erase the executed overflowing child product")
+    (is (true? (precondition/check! requirements
+                                  {'N 0 'rows Long/MIN_VALUE 'head-dim 0 'n-q Long/MIN_VALUE})))
+    (doseq [binding [{'N 3 'rows 0 'head-dim 1 'n-q 2}
+                     {'N 3 'rows 3 'head-dim 0 'n-q 2}
+                     {'N 3 'rows 3 'head-dim 1 'n-q -1}]]
+      (is (thrown? clojure.lang.ExceptionInfo (precondition/check! requirements binding))))
+    (doseq [requirement requirements]
+      (let [outcome (try
+                      (kernel-body/validate! (assoc-in kernel [:attributes :required-preconditions]
+                                               (vec (remove #{requirement} requirements))))
+                      {:outcome :accepted}
+                      (catch clojure.lang.ExceptionInfo error
+                        {:outcome :rejected :data (ex-data error)}))]
+        (is (= :rejected (:outcome outcome)) (pr-str outcome))
+        (is (contains? #{:kernel-body-index-precondition :kernel-body-intrinsic-overflow
+                         :kernel-body-intrinsic-overflow-proof} (get-in outcome [:data :reason]))
+            (pr-str outcome))))
+    (let [checked-branch (second (:operations kernel))
+          reject-proof (fn [changed]
+                         (let [outcome (try (kernel-body/validate! changed) {:outcome :accepted}
+                                           (catch clojure.lang.ExceptionInfo error
+                                             {:outcome :rejected :data (ex-data error)}))]
+                           (is (= :rejected (:outcome outcome)) (pr-str outcome))
+                           (is (contains? #{:kernel-body-index-precondition :kernel-body-intrinsic-overflow
+                                            :kernel-body-intrinsic-overflow-proof}
+                                          (get-in outcome [:data :reason])) (pr-str outcome))))]
+      (reject-proof (assoc kernel :operations (vec (butlast (:then-operations checked-branch)))))
+      (reject-proof (assoc-in kernel [:operations 1]
+                             (assoc checked-branch :then-operations [(kernel-body/->Yield [])]
+                                                   :else-operations (:then-operations checked-branch))))
+      (reject-proof (assoc-in kernel [:indices 1 :expression]
+                             (kernel-body/index-cast
+                              (kernel-body/expression :mul 'raw-group 256) :long :exact))))
+    ;; The mixed-product rule must not equate separately reconstructed domains.
+    ;; This tests the rule only; neither synthetic environment is an executable certificate.
+    (let [values (:values (kernel-body/scheduled-index-region-info region))
+          scalar-info (ns-resolve 'raster.compiler.ir.kernel-body 'scalar-info!)
+          uniform (first (filter #(= #{'n-q 'head-dim} (set (get-in % [:expression :arguments])))
+                                 (:operations lowered)))
+          other-domains (mapv #(update % :expression (fn [expression]
+                                                       (walk/postwalk-replace {'N 'M} expression))) domains)
+          other-region (-> region
+                           (update :parameters conj (kernel-body/->KernelParameter 'M :scalar :long [] nil nil :parameter))
+                           (assoc :required-preconditions other-domains)
+                           (assoc-in [:condition-definition :expression :arguments] ['idx 'M]))
+          other-values (:values (kernel-body/scheduled-index-region-info other-region))
+          child-transfer (kernel-body/conditional-integer-transfer (:expression uniform) other-values)
+          other-values (with-meta other-values
+                         (assoc (meta other-values) :required-preconditions
+                                (vec (distinct (concat other-domains (:required-preconditions child-transfer))))))
+          other-factor (scalar-info (:expression uniform) other-values)
+          negative (scalar-info (kernel-body/cast-expression (kernel-body/literal -1 :long) :long :exact :exact) values)
+          expression (kernel-body/scalar-expression :* :long ['remainder 'other-factor] {})]
+      (is (some? uniform))
+      (is (= 'M (get-in other-factor [:conditional-integer :bound])))
+      (is (nil? (kernel-body/conditional-integer-transfer expression (assoc values 'other-factor other-factor))))
+      (is (nil? (kernel-body/conditional-integer-transfer expression (assoc values 'other-factor negative)))))))
