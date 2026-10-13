@@ -171,6 +171,38 @@ evaluation is not hoisted. Independent materialized-source/JVM controls check bo
 and caller writes completed before NegativeArraySizeException. The existing three-layout SDPA
 integration retains its fused schedule rather than introducing a workload-specific rule.
 
+### Post-emission host cleanup has a conservative submission boundary
+
+Final resident DCE now uses its existing root predicate to retain bindings whose heads are in the
+existing GPU submission inventory. It does not infer purity from marker names or metadata and does
+not grant admission: extraction still verifies arity, registered artifacts and ordered ABI. DCE
+retains initializer/argument dependencies in source order, other observable effects and source
+metadata. Dead numerical work must be eliminated while semantic evidence is available, not by
+reanalyzing physical driver bodies or discarding an unproved external effect.
+
+On one already captured 962-binding GSDM input, unrestricted final DCE exceeded 32 seconds after
+39 root analyses; several physical submission analyses individually cost about five seconds.
+Conservatively rooting 427 submissions completed the same bounded diagnostic in 1.54 seconds,
+with 535 ordinary analyses and two dead host bindings removed. This is not a full-model compile,
+training, resident-execution or throughput acceptance result. Tests deny malformed-marker admission
+and independently check once-only argument effects, checked casts and metadata preservation.
+
+The subsequent bounded full GSDM resident compile completed all numerical/backend passes in
+279 seconds and explicitly refused `:scalar-let-reads-device-buffer` on a converted reduction
+result. No resident execution or training acceptance follows from this receipt. SOAC fusion still
+cost about 112 seconds and backend emission about 48 seconds on this loaded laptop.
+
+The next composition slice uses the existing explicit `:compiler :equation-first` vertical,
+EmittedParallelProgram, invocation preparation and LinkPlan semantic outputs—not a new exception
+in legacy scalar-let extraction. Keep device-produced scalar conversions/continuations in typed
+device computation and project scalar/tensor results through existing resident views. Aggregate
+parameter/moment leaves must acquire existing donation, mutable-sharing, alias, initialization
+and output-lease contracts; the current read-only aggregate guard must not simply be removed.
+Small gates are reduction → typed scalar conversion/sqrt → tensor update with scalar/tensor
+outputs; mixed-storage frozen/parameter/moment leaves; and repeated invocation retaining old
+outputs. Device-dependent host control remains an explicit refusal. Only after these contracts
+compose should another bounded full training program be attempted.
+
 ### Independent distributed math intent reconciliation
 
 Distributed planning, readiness (including retained-output readiness), resident root/scratch
