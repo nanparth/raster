@@ -344,17 +344,22 @@
                [(dense-route) (csr-visibility)]
                [(csr-route) (attention/visibility)]
                [(csr-route) (csr-visibility)]]]
-        (let [source (get-in
-                      (route/route!
-                       (problem :route physical-route :visibility visibility
-                                :qk-head-dim 256 :value-head-dim 256)
-                       {:device-type :gpu :vendor "Intel"
-                        :subgroup-size 16 :max-workgroup-size 256})
-                      [:artifact :source])
+        (let [artifact (:artifact
+                        (route/route!
+                         (problem :route physical-route :visibility visibility
+                                  :qk-head-dim 256 :value-head-dim 256)
+                         {:device-type :gpu :vendor "Intel"
+                          :subgroup-size 16 :max-workgroup-size 256}))
+              source (:source artifact)
+              kernel (get-in artifact [:attributes :kernel-body])
+              component (first (filter #(= 'value-component-15 (:id %)) (:indices kernel)))
               result (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
                                "-fsyntax-only" "-" :in source)]
-          (is (str/includes? source
-                             "int rstr_value_component_15 = (rstr_lane + 240);"))
+          (is (= :add (get-in component [:expression :op])))
+          (is (= ['lane 240] (mapv :argument (get-in component [:expression :arguments]))))
+          (is (every? #(and (= :long (:dtype %)) (= :exact (:overflow %)))
+                      (get-in component [:expression :arguments])))
+          (is (str/includes? source "long rstr_value_component_15 ="))
           (is (str/includes? source
                              "float rstr_weighted_value_result_15 = 0.0f;"))
           (is (not (str/includes? source "rstr_value_component_16")))
@@ -876,3 +881,39 @@
                   kernel))
                 nil
                 (catch clojure.lang.ExceptionInfo error (:reason (ex-data error))))))))
+
+
+(deftest cooperative-value-slots-close-the-generated-prefix-before-clamping
+  (let [routed (route/route! (problem :qk-head-dim 256 :value-head-dim 256) intel-desc)
+        kernel (get-in routed [:artifact :attributes :kernel-body])
+        values (:values (kbody/initial-scheduled-index-info kernel))
+        component (first (filter #(= 'value-component-1 (:id %)) (:indices kernel)))
+        safe-component (first (filter #(= 'safe-value-component-1 (:id %)) (:indices kernel)))
+        mask (first (filter #(= :active-value-component-1 (:id %)) (:masks kernel)))]
+    (is (= :int (get-in values ['lane :type])) "the physical lane binding retains its ABI width")
+    (is (= :long (get-in values ['value-component-1 :type])))
+    (is (= :long (get-in values ['safe-value-component-1 :type])))
+    (is (= ['lane 16] (mapv :argument (get-in component [:expression :arguments]))))
+    (is (every? #(and (= :long (:dtype %)) (= :exact (:overflow %)))
+                (get-in component [:expression :arguments])))
+    (is (= 255 (get-in safe-component [:expression :arguments 1 :argument])))
+    (is (= :long (get-in safe-component [:expression :arguments 1 :dtype])))
+    (is (= :long (get-in mask [:predicates 0 :arguments 1 :dtype])))
+    (is (= 255 (get-in values ['safe-value-component-1 :range :upper])))
+    (is (false? (get-in values ['safe-value-component-1 :unresolved-index-address-origin?])))
+    (is (= kernel (kbody/validate! kernel)))
+    (is (= :kernel-body-index-precondition
+           (try (kbody/validate!
+                 (update kernel :indices
+                         #(mapv (fn [definition]
+                                  (if (= 'value-component-1 (:id definition))
+                                    (assoc definition :expression
+                                           (kbody/index-cast (kbody/expression :add 'lane 16) :long :exact))
+                                    definition)) %))) :accepted
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+        "a later Long cast and clamp cannot erase the original Int addition overflow")
+    (is (= :kernel-launch-index-range
+           (try (kbody/validate-launch-index-ranges!
+                 kernel (launch/geometry {:workgroup-size [16 1]
+                                          :group-count [(+ 2 (long Integer/MAX_VALUE)) 4]})) :accepted
+                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))

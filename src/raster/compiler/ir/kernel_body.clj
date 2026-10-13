@@ -1068,7 +1068,8 @@
       (throw (ex-info (str owner " references a value before it is defined")
                       {:reason :kernel-body-use-before-definition :value id}))))
 
-(declare scalar-info! address-expression-safe? conditional-address-ancestry-closed?)
+(declare scalar-info! address-expression-safe? conditional-address-ancestry-closed?
+         nonnegative-index-expression?)
 
 (defn- literal-info!
   [literal]
@@ -1416,6 +1417,20 @@
                        (or mixed-nonnegative?
                            (and (= (:origin domain) (:origin existing))
                                 (= (:divisor domain) (:divisor existing))))) existing
+                  (and (= :long (:type value)) (value-id? argument)
+                       (= (:bound domain) (:active-upper value))
+                       (some #(and (= argument (:index %)) (= (:bound domain) (:upper %)))
+                             (:guarded-index-domains (meta values)))
+                       (conditional-address-ancestry-closed? argument values value)
+                       (nonnegative-index-expression? argument values))
+                  ;; This is the actual current guarded index, not an ABI alias or
+                  ;; a correlated quotient. Its hardware arithmetic stays unchanged.
+                  (assoc domain :kind :guarded-index-operand :origin nil :divisor nil
+                                :upper (launch/sum (:bound domain) (launch/product -1 active))
+                                :requirements (vec (distinct
+                                                     (concat (:required-preconditions value)
+                                                             (:requirements existing)
+                                                             [{:expression (:bound domain) :op :>= :value 0}]))))
                   (and (= :long (:type value)) (:entered-loop-index value))
                   (assoc domain :kind :entered-loop-operand
                                 :upper (launch/product active
@@ -1452,7 +1467,9 @@
             (let [upper (apply (if (= :+ op) launch/sum launch/product) (map :upper operands))
                   requirements (concat (mapcat :requirements operands)
                                        [{:expression upper :op :<= :value Long/MAX_VALUE}])]
-              (make-transfer (assoc domain :kind :derived :upper upper) requirements))))
+              (make-transfer (cond-> (assoc domain :kind :derived :upper upper)
+                               (some #(= :guarded-index-operand (:kind %)) operands)
+                               (assoc :origin nil :divisor nil)) requirements))))
         :else nil))))
 
 (defn refine-comparison-values

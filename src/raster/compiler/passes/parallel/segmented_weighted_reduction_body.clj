@@ -738,15 +738,17 @@
   [problem scheduled slots]
   (mapcat (fn [{:keys [slot id safe-id]}]
             [(body/->IndexCompute
-              id (body/expression :add 'lane (* slot (:workgroup-size scheduled))))
+              id (body/expression :add (body/index-cast 'lane :long :exact)
+                                      (body/index-cast (* slot (:workgroup-size scheduled)) :long :exact)))
              (body/->IndexCompute
-              safe-id (body/expression :min id (dec (:value-head-dim problem))))])
+              safe-id (body/expression :min id
+                                      (body/index-cast (dec (:value-head-dim problem)) :long :exact)))])
           slots))
 
 (defn- slot-masks
   [problem slots]
   (mapv (fn [{:keys [id mask-id]}]
-          (body/->Mask mask-id [(body/predicate :lt id (:value-head-dim problem))]))
+          (body/->Mask mask-id [(body/predicate :lt id (body/index-cast (:value-head-dim problem) :long :exact))]))
         slots))
 
 (defn- lane-zero-mask []

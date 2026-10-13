@@ -1974,3 +1974,108 @@
                                              (vec (remove #{condition} dynamic-conditions)))) :accepted
                     (catch clojure.lang.ExceptionInfo error (:reason (ex-data error)))))
             "actual dynamic division needs its independently enforced child/domain conditions")))))
+
+(deftest guarded-hardware-index-composes-with-a-real-entered-product
+  (let [wide #(body/index-cast % :long :exact)
+        parameters [(body/->KernelParameter 'N :scalar :long [] nil nil :bound)
+                    (body/->KernelParameter 'R :scalar :long [] nil nil :parameter)
+                    (body/->KernelParameter 'C :scalar :long [] nil nil :parameter)
+                    (body/->KernelParameter 'x :input :float [1] :global
+                                           (layout/row-major [1] :float) :operand)]
+        indices [(body/->IndexBinding 'g :group 0) (body/->IndexBinding 'lane :local 0)
+                 (body/->IndexCompute 'j (body/expression :add
+                                          (body/expression :mul (wide 'g) (wide 256)) (wide 'lane)))
+                 (body/->IndexCompute 'other (body/expression :add
+                                              (body/expression :mul (wide 'g) (wide 256)) (wide 'lane)))]
+        masks [(body/->Mask :active [(body/predicate :lt 'j (wide 'N))])]
+        header (body/->ForLoop (body/value 'i :long) (wide 0) 'R 1 [] [(body/->Yield [])] [] {})
+        guard (body/->Guard :active [header])
+        launch-spec (launch/spec {:workgroup-size [256] :group-count [1]})
+        base [{:expression 'N :op :>= :value 0}]
+        guarded (:values (body/varying-guard-index-region-info
+                          {:parameters parameters :indices indices :masks masks :launch launch-spec
+                           :guard guard :required-preconditions base}))
+        upper-info ((ns-resolve 'raster.compiler.ir.kernel-body 'expression-info!) (:upper header) guarded)
+        entered (body/entered-for-loop-info (:lower header) upper-info (:step header) :exclusive)
+        values (with-meta (assoc guarded 'i (assoc entered :uniformity #{}))
+                 (update (meta guarded) :entered-loop-domains (fnil conj [])
+                         {:index 'i :upper (get-in entered [:entered-loop-index :upper])}))
+        product (body/scalar-expression :* :long ['i 'C]
+                                       {:overflow :no-overflow
+                                        :proof {:kind :typed-scalar-range :lower 0 :upper Long/MAX_VALUE}})
+        product-transfer (body/conditional-integer-transfer product values)
+        product-conditions (:required-preconditions product-transfer)
+        product-values (with-meta values (assoc (meta values) :required-preconditions product-conditions))
+        product-info ((ns-resolve 'raster.compiler.ir.kernel-body 'scalar-info!) product product-values)
+        sum-values (assoc product-values 'product product-info)
+        sum (body/scalar-expression :+ :long ['product 'j]
+                                   {:overflow :no-overflow
+                                    :proof {:kind :typed-scalar-range :lower 0 :upper Long/MAX_VALUE}})
+        transfer (body/conditional-integer-transfer sum sum-values)
+        conditions (:required-preconditions transfer)
+        actual-header (assoc header :operations
+                             [(body/->ScalarCompute (body/value 'product :long) product)
+                              (body/->ScalarCompute (body/value 'address :long) sum)
+                              (body/->ScalarLoad (body/value 'loaded :float) 'x ['address] nil nil :cached)
+                              (body/->Yield [])])
+        spec {:id :guarded-index-product :parameters parameters :indices indices :masks masks
+              :launch launch-spec :operations [(assoc guard :operations [actual-header])]
+              :attributes {:required-preconditions conditions}}
+        kernel (body/make spec)
+        rejection #(try (body/make %) :accepted
+                        (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))]
+    ;; x[1] checks arithmetic/ancestry, not the allocation's capacity.
+    (is (some? transfer))
+    (is (= kernel (body/validate! kernel)))
+    (is (nil? (get-in transfer [:fact :origin])))
+    (is (nil? (get-in transfer [:fact :divisor])))
+    (is (every? (set conditions) product-conditions))
+    (let [value-child {:expression 'value-child-divisor :op :>= :value 1}
+          fact-child {:expression 'fact-child-divisor :op :>= :value 1}
+          seeded (update sum-values 'j assoc
+                         :required-preconditions [value-child]
+                         :conditional-integer {:kind :remainder :bound 'N :upper 1
+                                               :origin 'different-origin :divisor 'fact-child-divisor
+                                               :requirements [fact-child]})
+          inherited (body/conditional-integer-transfer sum seeded)]
+      ;; Private-info mechanism check only; seeded maps are not an owning proof.
+      ;; The independent full KernelBody above replays the actual hardware case.
+      (is (every? (set (:required-preconditions inherited)) [value-child fact-child]))
+      (is (nil? (get-in inherited [:fact :origin])))
+      (is (nil? (get-in inherited [:fact :divisor]))))
+    (is (precondition/check! conditions {'N 3 'R 2 'C 4}))
+    (is (precondition/check! product-conditions {'N 3 'R 2 'C Long/MAX_VALUE}))
+    (is (thrown? ArithmeticException
+          (precondition/check! conditions {'N 3 'R 2 'C Long/MAX_VALUE})))
+    (doseq [bindings [{'N 0 'R Long/MIN_VALUE 'C Long/MIN_VALUE}
+                     {'N 1 'R -1 'C Long/MIN_VALUE}]]
+      (is (precondition/check! conditions bindings)))
+    (doseq [condition conditions]
+      (is (= :kernel-body-intrinsic-overflow
+             (rejection (assoc-in spec [:attributes :required-preconditions]
+                                   (vec (remove #{condition} conditions)))))))
+    (is (nil? (body/conditional-integer-transfer
+               (assoc sum :arguments ['product 'other]) sum-values))
+        "equal current hardware values cannot substitute for the actual guarded ID")
+    (is (= :kernel-body-intrinsic-overflow
+           (rejection (assoc spec :operations [actual-header])))
+        "escaping the actual Guard loses its relation")
+    (is (= :kernel-body-intrinsic-overflow
+           (rejection (assoc spec :operations [(assoc guard :operations []) actual-header])))
+        "a preceding sibling Guard does not refine the later loop")
+    (is (= :kernel-body-intrinsic-overflow
+           (rejection (assoc-in spec [:masks 0 :predicates 0 :arguments 0] 'other))))
+    (is (= :kernel-body-intrinsic-overflow
+           (rejection (assoc spec :parameters
+                              (conj parameters (body/->KernelParameter 'OtherN :scalar :long [] nil nil :bound))
+                              :masks [(body/->Mask :active [(body/predicate :lt 'j (wide 'OtherN))])]))))
+    (let [predicate (body/->ScalarCompute (body/value 'selected :predicate)
+                                        (body/scalar-expression :lt :predicate ['j 'N]))]
+      (is (= :kernel-body-intrinsic-overflow
+             (rejection (assoc spec :operations
+                               [predicate (body/->IfRegion 'selected [(body/->Yield [])]
+                                                         [actual-header (body/->Yield [])] [])])))))
+    (let [unsafe (body/->IndexCompute 'j
+                  (wide (body/expression :add (body/expression :mul 'g 256) 'lane)))]
+      (is (= :kernel-body-intrinsic-overflow
+             (rejection (assoc spec :indices (assoc indices 2 unsafe))))))))
