@@ -25,6 +25,41 @@
                                    :array-types array-types
                                    :scalar-types scalar-types})))
 
+(deftest fusion-placement-belongs-only-to-the-surviving-boundary
+  (doseq [left [{:source-binding-id 2}
+                {:legacy-soac-id 2}
+                {}]]
+    (let [merged (#'typed-fusion/merge-provenance
+                  (assoc left :fused-equations [2])
+                  {:source-binding-id 5 :legacy-soac-id 5 :fused-equations [5]}
+                  :horizontal-map)]
+      (is (= left (select-keys merged [:source-binding-id :legacy-soac-id])))
+      (is (= [2 5] (:fused-equations merged)))
+      (is (= :horizontal-map (:fusion merged))))))
+
+(deftest horizontal-motion-declines-missing-local-allocation-origin
+  (let [source '(let* [out-a (clojure.core/float-array n)
+                       u (raster.par/map! out-a i n float (aget a i))
+                       out-b (clojure.core/float-array n)
+                       v (raster.par/map! out-b j n float (aget b j))]
+                      [u v])
+        program (source-program source {'a :float 'b :float})]
+    (doseq [alter [(fn [allocations] (filterv #(not= 'out-b (:destination %)) allocations))
+                  (fn [allocations] (mapv #(if (= 'out-b (:destination %))
+                                            (dissoc % :source-binding-id) %) allocations))]]
+      (let [facts (update-in (dialect/facts program) [:attributes :allocations] alter)
+            incomplete (dialect/make facts (dialect/equations program) (dialect/outputs program))
+            [_ stats] (typed-fusion/fusion-fixpoint incomplete)
+            infos (mapv #'typed-fusion/equation-info (dialect/equations incomplete))]
+        (is (zero? (:horizontal stats)))
+        ;; Exercise the availability guard directly with conflicting input evidence. Do not
+        ;; weaken the dialect validator to admit an inconsistent whole-program input boundary.
+        (with-redefs [dialect/facts (constantly (update facts :inputs conj 'out-b))]
+          (is (nil? (#'typed-fusion/horizontal-placement-index
+                     incomplete infos 0 1
+                     (#'typed-fusion/horizontal-boundary incomplete (nth infos 0))
+                     (#'typed-fusion/horizontal-boundary incomplete (nth infos 1))))))))))
+
 (deftest map-map-fusion-has-the-certified-functional-result
   (let [typed-input (source-program map-map-source {'x :float})
         [typed-result typed-stats] (typed-fusion/fusion-fixpoint typed-input)
