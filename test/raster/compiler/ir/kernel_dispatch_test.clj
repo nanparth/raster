@@ -477,7 +477,7 @@
                                 step {} identity {:schedule schedule}))]
     (with-redefs-fn
       {#'raster.gpu.core/bind-selected-executable
-       (fn [_ executable & _]
+       (fn [_ _arena-id executable & _]
          (swap! selected conj (kexec/strategy executable))
          (gpu/->BoundExecutableStep [] {} []))}
       (fn []
